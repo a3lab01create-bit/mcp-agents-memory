@@ -1,7 +1,9 @@
+import dotenv from 'dotenv';
+dotenv.config(); // Load environment variables BEFORE importing db
+
 import inquirer from 'inquirer';
 import fs from 'fs';
 import { db } from './db.js';
-import dotenv from 'dotenv';
 
 async function setup() {
   console.log("🚀 mcp-agents-memory Setup Wizard starting...");
@@ -42,13 +44,16 @@ DB_NAME=${answers.dbName}${sshConfig}
 `;
 
   fs.writeFileSync('.env', envContent.trim());
-  console.log("✅ .env file created.");
+  console.log("✅ .env file generated successfully.");
 
+  // Re-load dotenv to ensure db instance sees the new values
   dotenv.config();
 
   try {
-    console.log("🛠 Creating database functions and schema...");
+    console.log("📡 Connecting to Database to apply schema...");
     
+    // Step 1: Utility Functions
+    console.log("🛠️ Creating utility functions...");
     await db.query(`
       CREATE OR REPLACE FUNCTION set_updated_at()
       RETURNS TRIGGER AS $$
@@ -57,7 +62,11 @@ DB_NAME=${answers.dbName}${sshConfig}
           RETURN NEW;
       END;
       $$ LANGUAGE plpgsql;
+    `);
 
+    // Step 2: Core Tables
+    console.log("📁 Creating tables...");
+    await db.query(`
       CREATE TABLE IF NOT EXISTS subjects (
           id SERIAL PRIMARY KEY,
           subject_type VARCHAR(20) NOT NULL CHECK (subject_type IN ('person', 'agent', 'project', 'team', 'system')),
@@ -71,79 +80,64 @@ DB_NAME=${answers.dbName}${sshConfig}
 
       CREATE TABLE IF NOT EXISTS tasks (
           id SERIAL PRIMARY KEY,
-          task_type VARCHAR(50) NOT NULL,
           title VARCHAR(200) NOT NULL,
+          task_type VARCHAR(50) NOT NULL,
+          owner_subject_id INTEGER NOT NULL REFERENCES subjects(id),
+          project_subject_id INTEGER NOT NULL REFERENCES subjects(id),
+          status VARCHAR(20) NOT NULL DEFAULT 'todo' CHECK (status IN ('todo', 'doing', 'done', 'failed', 'canceled')),
           description TEXT,
-          owner_subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL,
-          project_subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL,
-          status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'done', 'failed', 'cancelled')),
-          started_at TIMESTAMPTZ,
-          ended_at TIMESTAMPTZ,
           outcome_summary TEXT,
           success_score INTEGER CHECK (success_score BETWEEN 1 AND 10),
           metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+          started_at TIMESTAMPTZ,
+          ended_at TIMESTAMPTZ,
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          CONSTRAINT chk_task_time_order CHECK (ended_at IS NULL OR started_at IS NULL OR ended_at >= started_at)
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
 
       CREATE TABLE IF NOT EXISTS sessions (
           id SERIAL PRIMARY KEY,
-          task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
-          orchestrator_subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL,
+          task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          orchestrator_subject_id INTEGER REFERENCES subjects(id),
           started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           ended_at TIMESTAMPTZ,
-          final_outcome VARCHAR(20) CHECK (final_outcome IN ('success', 'failure', 'partial')),
+          final_outcome VARCHAR(20),
           summary TEXT,
           model_name VARCHAR(100),
-          provider VARCHAR(50),
+          provider VARCHAR(100),
           token_usage INTEGER,
           metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          CONSTRAINT chk_session_time_order CHECK (ended_at IS NULL OR ended_at >= started_at)
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
 
       CREATE TABLE IF NOT EXISTS memories (
           id SERIAL PRIMARY KEY,
           subject_id INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
-          project_subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL,
-          memory_scope VARCHAR(20) NOT NULL DEFAULT 'global' CHECK (memory_scope IN ('global', 'project', 'local')),
-          memory_type VARCHAR(20) NOT NULL CHECK (memory_type IN ('preference', 'profile', 'constraint', 'state', 'relationship')),
+          project_subject_id INTEGER REFERENCES subjects(id),
           content TEXT NOT NULL,
           summary TEXT,
-          confidence_score INTEGER NOT NULL DEFAULT 5 CHECK (confidence_score BETWEEN 1 AND 10),
-          importance_score INTEGER NOT NULL DEFAULT 5 CHECK (importance_score BETWEEN 1 AND 10),
+          memory_type VARCHAR(20) NOT NULL CHECK (memory_type IN ('preference', 'profile', 'constraint', 'state', 'relationship')),
+          memory_scope VARCHAR(20) NOT NULL DEFAULT 'global' CHECK (memory_scope IN ('global', 'project', 'local')),
           source_type VARCHAR(20) NOT NULL CHECK (source_type IN ('user', 'agent', 'inferred', 'session', 'task', 'system')),
-          source_session_id INTEGER REFERENCES sessions(id) DEFERRABLE INITIALLY DEFERRED,
-          source_task_id INTEGER REFERENCES tasks(id) DEFERRABLE INITIALLY DEFERRED,
-          tags TEXT[] NOT NULL DEFAULT '{}',
-          access_count INTEGER NOT NULL DEFAULT 0 CHECK (access_count >= 0),
+          importance_score INTEGER NOT NULL DEFAULT 5 CHECK (importance_score BETWEEN 1 AND 10),
+          access_count INTEGER NOT NULL DEFAULT 0,
           last_accessed_at TIMESTAMPTZ,
-          expires_at TIMESTAMPTZ,
-          embedding_model VARCHAR(50),
+          tags TEXT[] DEFAULT '{}',
           metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          CONSTRAINT chk_project_scope_requires_project CHECK (memory_scope <> 'project' OR project_subject_id IS NOT NULL)
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
 
       CREATE TABLE IF NOT EXISTS task_learnings (
           id SERIAL PRIMARY KEY,
           task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
-          task_type VARCHAR(50),
-          learning_type VARCHAR(30) NOT NULL CHECK (learning_type IN ('success_pattern', 'failure_pattern', 'heuristic', 'routing_rule')),
+          task_type VARCHAR(50) NOT NULL,
+          learning_type VARCHAR(20) NOT NULL CHECK (learning_type IN ('success_pattern', 'failure_pattern', 'heuristic', 'routing_rule')),
           content TEXT NOT NULL,
           summary TEXT,
-          applicable_when TEXT,
-          avoid_when TEXT,
-          preferred_owner_subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL,
-          confidence_score INTEGER NOT NULL DEFAULT 5 CHECK (confidence_score BETWEEN 1 AND 10),
-          impact_score INTEGER NOT NULL DEFAULT 5 CHECK (impact_score BETWEEN 1 AND 10),
-          usage_count INTEGER NOT NULL DEFAULT 0 CHECK (usage_count >= 0),
+          usage_count INTEGER NOT NULL DEFAULT 0,
           last_used_at TIMESTAMPTZ,
-          embedding_model VARCHAR(50),
-          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
@@ -158,8 +152,11 @@ DB_NAME=${answers.dbName}${sshConfig}
           CONSTRAINT chk_no_self_relationship CHECK (from_subject_id <> to_subject_id),
           CONSTRAINT uq_subject_relationship UNIQUE (from_subject_id, to_subject_id, relationship_type)
       );
+    `);
 
-      -- Project Type Validation Trigger
+    // Step 3: Trigger Logic
+    console.log("⚙️ Setting up triggers and validation...");
+    await db.query(`
       CREATE OR REPLACE FUNCTION validate_project_subject_type()
       RETURNS TRIGGER AS $$
       BEGIN
@@ -177,23 +174,30 @@ DB_NAME=${answers.dbName}${sshConfig}
       BEFORE INSERT OR UPDATE ON memories
       FOR EACH ROW
       EXECUTE FUNCTION validate_project_subject_type();
+
+      -- Auto updated_at triggers
+      DO $$
+      DECLARE
+          t text;
+      BEGIN
+          FOR t IN SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('subjects', 'tasks', 'sessions', 'memories', 'task_learnings')
+          LOOP
+              EXECUTE format('DROP TRIGGER IF EXISTS trg_updated_at ON %I', t);
+              EXECUTE format('CREATE TRIGGER trg_updated_at BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION set_updated_at()', t);
+          END LOOP;
+      END $$;
     `);
 
-    console.log("⚙️ Setting up triggers...");
-    const tables = ['subjects', 'tasks', 'sessions', 'memories', 'task_learnings'];
-    for (const table of tables) {
-      await db.query(`DROP TRIGGER IF EXISTS trg_${table}_updated_at ON ${table}`);
-      await db.query(`CREATE TRIGGER trg_${table}_updated_at BEFORE UPDATE ON ${table} FOR EACH ROW EXECUTE FUNCTION set_updated_at()`);
-    }
-
-    console.log("🗂 Creating indexes...");
+    // Step 4: Indices
+    console.log("🔍 Creating indices...");
     await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_subjects_type ON subjects(subject_type);
-      CREATE INDEX IF NOT EXISTS idx_subjects_key ON subjects(subject_key);
       CREATE INDEX IF NOT EXISTS idx_memories_subject_id ON memories(subject_id);
       CREATE INDEX IF NOT EXISTS idx_memories_memory_type ON memories(memory_type);
+      CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+      CREATE INDEX IF NOT EXISTS idx_task_learnings_type ON task_learnings(task_type);
     `);
 
+    // Step 5: Seed Data
     console.log("🌱 Seeding initial data...");
     await db.query(`
       INSERT INTO subjects (subject_type, subject_key, display_name, metadata) VALUES
@@ -208,11 +212,12 @@ DB_NAME=${answers.dbName}${sshConfig}
       ON CONFLICT (subject_key) DO NOTHING;
     `);
 
-    console.log("✨ Final Schema Setup Complete!");
-  } catch (error) {
-    console.error("❌ Error during setup:", error);
+    console.log("✅ Database setup completed successfully!");
+  } catch (err) {
+    console.error("❌ Error during database setup:", err);
   } finally {
     await db.close();
+    process.exit(0);
   }
 }
 

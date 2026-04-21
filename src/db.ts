@@ -30,7 +30,7 @@ export class DatabaseManager {
       console.error("🔑 Establishing SSH Tunnel...");
       
       const tunnelOptions = {
-        autoClose: true
+        autoClose: false // GPT 제안: 안정성을 위해 터널 자동 종료 비활성화
       };
 
       const serverOptions = {
@@ -55,7 +55,7 @@ export class DatabaseManager {
       return new Promise((resolve, reject) => {
         // @ts-ignore
         createTunnel(tunnelOptions, serverOptions, sshOptions, forwardOptions)
-          .then(([server, conn]: any) => {
+          .then(async ([server, conn]: any) => {
             this.tunnelServer = server;
             
             const addr = server.address();
@@ -71,7 +71,17 @@ export class DatabaseManager {
               database: process.env.DB_NAME,
             });
 
-            resolve(this.pool);
+            // 🔥 GPT 제안: 연결 즉시 검증 (Probe Query)
+            try {
+              await this.pool.query('SELECT 1');
+              console.error("✅ Database connection verified.");
+              resolve(this.pool);
+            } catch (err) {
+              console.error("❌ Database connection probe failed:", err);
+              this.pool = null;
+              server.close();
+              reject(err);
+            }
           })
           .catch((err: any) => {
             console.error("❌ Failed to create SSH tunnel:", err);
@@ -86,7 +96,16 @@ export class DatabaseManager {
         password: process.env.DB_PASS,
         database: process.env.DB_NAME,
       });
-      return this.pool;
+
+      // 🔥 연결 즉시 검증
+      try {
+        await this.pool.query('SELECT 1');
+        return this.pool;
+      } catch (err) {
+        console.error("❌ Database connection failed:", err);
+        this.pool = null;
+        throw err;
+      }
     }
   }
 
