@@ -3,19 +3,21 @@ import { z } from "zod";
 import { db } from "./db.js";
 
 export function registerTools(server: McpServer) {
-  server.tool(
+  server.registerTool(
     "memory_remember",
-    "Store persistent long-term memory about the user, project, or task context. Use this whenever you learn important information that should remain useful across future conversations, such as user profile, preferences, constraints, or project-specific rules. Do not use for temporary or one-off information.",
     {
-      subject_key: z.string(),
-      project_key: z.string().optional(),
-      content: z.string(),
-      memory_type: z.enum(['preference', 'profile', 'constraint', 'state', 'relationship']),
-      memory_scope: z.enum(['global', 'project', 'local']).default('global'),
-      source_type: z.enum(['user', 'agent', 'inferred', 'session', 'task', 'system']),
-      importance_score: z.number().min(1).max(10).optional().default(5),
-      summary: z.string().optional(),
-      tags: z.array(z.string()).optional().default([]),
+      description: "Store persistent long-term memory about the user, project, or task context. Use this whenever you learn important information that should remain useful across future conversations, such as user profile, preferences, constraints, or project-specific rules. Do not use for temporary or one-off information.",
+      inputSchema: {
+        subject_key: z.string(),
+        project_key: z.string().optional(),
+        content: z.string(),
+        memory_type: z.enum(['preference', 'profile', 'constraint', 'state', 'relationship']),
+        memory_scope: z.enum(['global', 'project', 'local']).default('global'),
+        source_type: z.enum(['user', 'agent', 'inferred', 'session', 'task', 'system']),
+        importance_score: z.number().min(1).max(10).optional().default(5),
+        summary: z.string().optional(),
+        tags: z.array(z.string()).optional().default([]),
+      }
     },
     async (args) => {
       const subRes = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.subject_key]);
@@ -37,13 +39,15 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "memory_recall",
-    "Recall relevant long-term memories before or during a task. Use this to retrieve prior context about the current user, project, or topic so responses remain consistent and informed.",
     {
-      subject_key: z.string(),
-      query: z.string(),
-      limit: z.number().optional().default(5),
+      description: "Recall relevant long-term memories before or during a task. Use this to retrieve prior context about the current user, project, or topic so responses remain consistent and informed.",
+      inputSchema: {
+        subject_key: z.string(),
+        query: z.string(),
+        limit: z.number().optional().default(5),
+      }
     },
     async (args) => {
       const subRes = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.subject_key]);
@@ -82,15 +86,17 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "memory_log_task",
-    "Create a new task record. Use this to track major work items or goals for the user, a project, or a specific agent.",
     {
-      title: z.string(),
-      task_type: z.string(),
-      owner_key: z.string(),
-      project_key: z.string(),
-      description: z.string().optional(),
+      description: "Create a new task record. Use this to track major work items or goals for the user, a project, or a specific agent.",
+      inputSchema: {
+        title: z.string(),
+        task_type: z.string(),
+        owner_key: z.string(),
+        project_key: z.string(),
+        description: z.string().optional(),
+      }
     },
     async (args) => {
       const owner = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.owner_key]);
@@ -108,13 +114,15 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "memory_complete_task",
-    "Mark a task as completed. Use this to record the outcome, success score, and final summary of a tracked task.",
     {
-      task_id: z.number(),
-      outcome_summary: z.string(),
-      success_score: z.number().min(1).max(10),
+      description: "Mark a task as completed. Use this to record the outcome, success score, and final summary of a tracked task.",
+      inputSchema: {
+        task_id: z.number(),
+        outcome_summary: z.string(),
+        success_score: z.number().min(1).max(10),
+      }
     },
     async (args) => {
       const res = await db.query(
@@ -126,15 +134,17 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "memory_log_session",
-    "Log the start of an AI session linked to a specific task. Use this to track which agent is working on a task and when they started.",
     {
-      task_id: z.number(),
-      orchestrator_key: z.string(),
-      model_name: z.string(),
-      provider: z.string(),
-      started_at: z.string().optional(),
+      description: "Log the start of an AI session linked to a specific task. Use this to track which agent is working on a task and when they started.",
+      inputSchema: {
+        task_id: z.number(),
+        orchestrator_key: z.string(),
+        model_name: z.string(),
+        provider: z.string(),
+        started_at: z.string().optional(),
+      }
     },
     async (args) => {
       const orch = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.orchestrator_key]);
@@ -150,15 +160,17 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "memory_complete_session",
-    "Log the completion of an AI session. Use this to record token usage, final outcome, and summary after an agent finishes a block of work.",
     {
-      session_id: z.number(),
-      ended_at: z.string().optional(),
-      final_outcome: z.enum(['success', 'failure', 'partial']),
-      summary: z.string().optional(),
-      token_usage: z.number().optional(),
+      description: "Log the completion of an AI session. Use this to record token usage, final outcome, and summary after an agent finishes a block of work.",
+      inputSchema: {
+        session_id: z.number(),
+        ended_at: z.string().optional(),
+        final_outcome: z.enum(['success', 'failure', 'partial']),
+        summary: z.string().optional(),
+        token_usage: z.number().optional(),
+      }
     },
     async (args) => {
       const res = await db.query(
@@ -171,15 +183,17 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "memory_learn",
-    "Store reusable learnings from completed work, such as success patterns, failure patterns, heuristics, or routing rules. Use this after meaningful tasks when a lesson could improve future performance.",
     {
-      task_id: z.number().optional(),
-      task_type: z.string(),
-      learning_type: z.enum(['success_pattern', 'failure_pattern', 'heuristic', 'routing_rule']),
-      content: z.string(),
-      summary: z.string().optional(),
+      description: "Store reusable learnings from completed work, such as success patterns, failure patterns, heuristics, or routing rules. Use this after meaningful tasks when a lesson could improve future performance.",
+      inputSchema: {
+        task_id: z.number().optional(),
+        task_type: z.string(),
+        learning_type: z.enum(['success_pattern', 'failure_pattern', 'heuristic', 'routing_rule']),
+        content: z.string(),
+        summary: z.string().optional(),
+      }
     },
     async (args) => {
       await db.query(
@@ -191,12 +205,14 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "memory_get_learnings",
-    "Retrieve past learning patterns. Use this before starting a new task of a specific type to discover known best practices, previous mistakes to avoid, and proven heuristics.",
     {
-      task_type: z.string(),
-      limit: z.number().optional().default(5),
+      description: "Retrieve past learning patterns. Use this before starting a new task of a specific type to discover known best practices, previous mistakes to avoid, and proven heuristics.",
+      inputSchema: {
+        task_type: z.string(),
+        limit: z.number().optional().default(5),
+      }
     },
     async (args) => {
       const learnings = await db.query(
@@ -228,11 +244,13 @@ export function registerTools(server: McpServer) {
     }
   );
 
-  server.tool(
+  server.registerTool(
     "memory_get_subject",
-    "Fetch detailed subject information by key. Use this to look up metadata about a person, agent, project, team, or system in the memory ecosystem.",
     {
-      subject_key: z.string(),
+      description: "Fetch detailed subject information by key. Use this to look up metadata about a person, agent, project, team, or system in the memory ecosystem.",
+      inputSchema: {
+        subject_key: z.string(),
+      }
     },
     async (args) => {
       const subject = await db.query("SELECT * FROM subjects WHERE subject_key = $1", [args.subject_key]);
