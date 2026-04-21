@@ -35,7 +35,7 @@ Multi-agent Shared Long-term Memory MCP Server. This server allows different AI 
 
 4. **Run with your MCP Client**:
    ```bash
-   npx @modelcontextprotocol/server-cli @modelcontextprotocol/server-stdio mcp-agents-memory
+   node build/index.js
    ```
 
 5. **Claude MCP**:
@@ -45,12 +45,13 @@ Multi-agent Shared Long-term Memory MCP Server. This server allows different AI 
 
 
 ## Tools
-- `remember(subject_key, content, memory_type, scope)`
+- `remember(subject_key, content, memory_type, source_type)`
 - `recall(subject_key, query, limit)`
 - `log_task(title, task_type, owner_key, project_key)`
-- `complete_task(task_id, outcome, success_score)`
+- `complete_task(task_id, outcome_summary, success_score)`
 - `log_session(task_id, orchestrator_key, model_name, provider)`
-- `learn(task_id, task_type, learning_type, content)`
+- `complete_session(session_id, final_outcome, summary, token_usage)`
+- `learn(task_type, learning_type, content)`
 - `get_learnings(task_type, limit)`
 - `get_subject(subject_key)`
 
