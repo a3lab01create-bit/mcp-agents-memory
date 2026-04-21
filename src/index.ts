@@ -6,6 +6,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { db } from "./db.js";
+import fs from 'fs';
 
 // Tool Schemas
 const RememberSchema = z.object({
@@ -246,7 +247,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           `SELECT m.id, m.content, m.summary, m.memory_type, m.memory_scope, m.created_at, s.display_name as project_name
            FROM memories m
            LEFT JOIN subjects s ON m.project_subject_id = s.id
-           WHERE m.subject_id = $1 AND (m.content ILIKE $2 OR m.summary ILIKE $2)
+           WHERE m.subject_id = $1 AND (m.content ILIKE $2 OR COALESCE(m.summary, '') ILIKE $2)
            ORDER BY m.importance_score DESC, m.created_at DESC LIMIT $3`,
           [subRes.rows[0].id, `%${query}%`, limit]
         );
@@ -345,17 +346,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       default:
-        throw new Error("Unknown tool");
+        throw new Error(`Unknown tool: ${name}`);
     }
   } catch (error: any) {
-    return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    console.error(`🔥 [TOOL ERROR] ${request.params.name}:`, error);
+    return { 
+      content: [{ 
+        type: "text", 
+        text: `Error in ${request.params.name}: ${error.message || 'Unknown error'}` 
+      }], 
+      isError: true 
+    };
   }
 });
 
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("Memory MCP Server (v1.2 Full) running on stdio");
+  console.error("🚀 Starting Memory MCP Server...");
+
+  // ENV CHECK
+  if (process.env.SSH_ENABLED === 'true' && !process.env.SSH_KEY_PATH) {
+    throw new Error("❌ SSH_KEY_PATH is required when SSH is enabled");
+  }
+  if (process.env.SSH_KEY_PATH && !fs.existsSync(process.env.SSH_KEY_PATH)) {
+    console.error(`⚠️ [WARNING] SSH key not found at: ${process.env.SSH_KEY_PATH}`);
+  }
+
+  try {
+    console.error("📡 Pre-connecting to Database...");
+    await db.connect();
+    console.error("✅ Database ready.");
+
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error("🧠 Memory MCP Server (v1.3 Robust) running on stdio");
+  } catch (err) {
+    console.error("❌ Fatal error during startup:", err);
+    process.exit(1);
+  }
 }
 
 main().catch(console.error);
