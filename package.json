@@ -8,7 +8,7 @@
     "build": "tsc",
     "start": "node build/index.js",
     "dev": "ts-node --esm src/index.ts",
-    "setup": "ts-node --esm src/setup.ts"
+    "setup": "tsc && node build/setup.js"
   },
   "keywords": [
     "mcp",
