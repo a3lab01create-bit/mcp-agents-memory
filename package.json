@@ -14,7 +14,7 @@
   "author": "triplealab",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "dotenv": "^16.4.5",
     "inquirer": "^9.2.16",
     "pg": "^8.11.3",

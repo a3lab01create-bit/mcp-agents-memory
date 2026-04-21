@@ -7,7 +7,7 @@ import {
 import { z } from "zod";
 import { db } from "./db.js";
 
-// Tool Schemas updated for new DB columns
+// Tool Schemas
 const RememberSchema = z.object({
   subject_key: z.string(),
   project_key: z.string().optional(),
@@ -38,6 +38,32 @@ const CompleteTaskSchema = z.object({
   task_id: z.number(),
   outcome_summary: z.string(),
   success_score: z.number().min(1).max(10),
+});
+
+const LogSessionSchema = z.object({
+  task_id: z.number(),
+  orchestrator_key: z.string(),
+  model_name: z.string(),
+  provider: z.string(),
+  token_usage: z.number().optional(),
+  summary: z.string().optional(),
+});
+
+const LearnSchema = z.object({
+  task_id: z.number().optional(),
+  task_type: z.string(),
+  learning_type: z.enum(['success_pattern', 'failure_pattern', 'heuristic', 'routing_rule']),
+  content: z.string(),
+  summary: z.string().optional(),
+});
+
+const GetLearningsSchema = z.object({
+  task_type: z.string(),
+  limit: z.number().optional().default(5),
+});
+
+const GetSubjectSchema = z.object({
+  subject_key: z.string(),
 });
 
 const server = new Server(
@@ -107,6 +133,60 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ["task_id", "outcome_summary", "success_score"]
         }
+      },
+      {
+        name: "log_session",
+        description: "Log an AI session linked to a task",
+        inputSchema: {
+          type: "object",
+          properties: {
+            task_id: { type: "number" },
+            orchestrator_key: { type: "string" },
+            model_name: { type: "string" },
+            provider: { type: "string" },
+            token_usage: { type: "number" },
+            summary: { type: "string" }
+          },
+          required: ["task_id", "orchestrator_key", "model_name", "provider"]
+        }
+      },
+      {
+        name: "learn",
+        description: "Capture learning patterns/heuristics",
+        inputSchema: {
+          type: "object",
+          properties: {
+            task_id: { type: "number" },
+            task_type: { type: "string" },
+            learning_type: { type: "string", enum: ['success_pattern', 'failure_pattern', 'heuristic', 'routing_rule'] },
+            content: { type: "string" },
+            summary: { type: "string" }
+          },
+          required: ["task_type", "learning_type", "content"]
+        }
+      },
+      {
+        name: "get_learnings",
+        description: "Retrieve past learning patterns",
+        inputSchema: {
+          type: "object",
+          properties: {
+            task_type: { type: "string" },
+            limit: { type: "number" }
+          },
+          required: ["task_type"]
+        }
+      },
+      {
+        name: "get_subject",
+        description: "Fetch subject information by key",
+        inputSchema: {
+          type: "object",
+          properties: {
+            subject_key: { type: "string" }
+          },
+          required: ["subject_key"]
+        }
       }
     ]
   };
@@ -119,7 +199,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "remember": {
         const parsed = RememberSchema.parse(args);
-        
         const subRes = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [parsed.subject_key]);
         if (subRes.rows.length === 0) throw new Error(`Subject ${parsed.subject_key} not found`);
         
@@ -143,13 +222,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (subRes.rows.length === 0) throw new Error(`Subject ${subject_key} not found`);
 
         const memories = await db.query(
-          `SELECT m.content, m.summary, m.memory_type, m.memory_scope, m.created_at, s.display_name as project_name
+          `SELECT m.id, m.content, m.summary, m.memory_type, m.memory_scope, m.created_at, s.display_name as project_name
            FROM memories m
            LEFT JOIN subjects s ON m.project_subject_id = s.id
            WHERE m.subject_id = $1 AND (m.content ILIKE $2 OR m.summary ILIKE $2)
            ORDER BY m.importance_score DESC, m.created_at DESC LIMIT $3`,
           [subRes.rows[0].id, `%${query}%`, limit]
         );
+
+        // Update access count for recalled memories
+        if (memories.rows.length > 0) {
+          const ids = memories.rows.map(m => m.id);
+          await db.query(
+            `UPDATE memories SET access_count = access_count + 1, last_accessed_at = NOW() WHERE id = ANY($1::int[])`,
+            [ids]
+          );
+        }
+
         return { content: [{ type: "text", text: JSON.stringify(memories.rows, null, 2) }] };
       }
 
@@ -177,6 +266,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: `Task ${task_id} marked as done.` }] };
       }
 
+      case "log_session": {
+        const parsed = LogSessionSchema.parse(args);
+        const orch = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [parsed.orchestrator_key]);
+        const orchId = orch.rows[0]?.id || null;
+
+        await db.query(
+          `INSERT INTO sessions (task_id, orchestrator_subject_id, model_name, provider, token_usage, summary) 
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [parsed.task_id, orchId, parsed.model_name, parsed.provider, parsed.token_usage, parsed.summary]
+        );
+        return { content: [{ type: "text", text: "Session logged successfully." }] };
+      }
+
+      case "learn": {
+        const parsed = LearnSchema.parse(args);
+        await db.query(
+          `INSERT INTO task_learnings (task_id, task_type, learning_type, content, summary) 
+           VALUES ($1, $2, $3, $4, $5)`,
+          [parsed.task_id, parsed.task_type, parsed.learning_type, parsed.content, parsed.summary]
+        );
+        return { content: [{ type: "text", text: "Learning pattern recorded." }] };
+      }
+
+      case "get_learnings": {
+        const { task_type, limit } = GetLearningsSchema.parse(args);
+        const learnings = await db.query(
+          `SELECT content, summary, learning_type, created_at FROM task_learnings 
+           WHERE task_type = $1 OR content ILIKE $2 ORDER BY created_at DESC LIMIT $3`,
+          [task_type, `%${task_type}%`, limit]
+        );
+        return { content: [{ type: "text", text: JSON.stringify(learnings.rows, null, 2) }] };
+      }
+
+      case "get_subject": {
+        const { subject_key } = GetSubjectSchema.parse(args);
+        const subject = await db.query("SELECT * FROM subjects WHERE subject_key = $1", [subject_key]);
+        return { content: [{ type: "text", text: JSON.stringify(subject.rows[0] || {}, null, 2) }] };
+      }
+
       default:
         throw new Error("Unknown tool");
     }
@@ -188,7 +316,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Memory MCP Server (v1 Clean) running on stdio");
+  console.error("Memory MCP Server (v1.1 Advanced) running on stdio");
 }
 
 main().catch(console.error);

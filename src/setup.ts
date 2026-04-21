@@ -158,6 +158,25 @@ DB_NAME=${answers.dbName}${sshConfig}
           CONSTRAINT chk_no_self_relationship CHECK (from_subject_id <> to_subject_id),
           CONSTRAINT uq_subject_relationship UNIQUE (from_subject_id, to_subject_id, relationship_type)
       );
+
+      -- Project Type Validation Trigger
+      CREATE OR REPLACE FUNCTION validate_project_subject_type()
+      RETURNS TRIGGER AS $$
+      BEGIN
+          IF NEW.project_subject_id IS NOT NULL THEN
+              IF (SELECT subject_type FROM subjects WHERE id = NEW.project_subject_id) != 'project' THEN
+                  RAISE EXCEPTION 'project_subject_id must reference a subject with type "project"';
+              END IF;
+          END IF;
+          RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS trg_validate_project_type ON memories;
+      CREATE TRIGGER trg_validate_project_type
+      BEFORE INSERT OR UPDATE ON memories
+      FOR EACH ROW
+      EXECUTE FUNCTION validate_project_subject_type();
     `);
 
     console.log("⚙️ Setting up triggers...");
@@ -184,6 +203,7 @@ DB_NAME=${answers.dbName}${sshConfig}
       ('agent',   'agent_gpt',             'GPT',    '{"provider": "openai"}'),
       ('project', 'project_centragens',    '센트라젠', '{}'),
       ('project', 'project_yoontube',      'YoonTube', '{}'),
+      ('team',    'team_triplealab',       'TripleA Lab', '{}'),
       ('system',  'system_orchestrator',   'Harness-Main', '{"version": "1.0.0"}')
       ON CONFLICT (subject_key) DO NOTHING;
     `);
