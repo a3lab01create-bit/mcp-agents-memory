@@ -33,6 +33,17 @@ Multi-agent Shared Long-term Memory MCP Server. This server allows different AI 
    npm run build
    ```
 
+4. **Run with your MCP Client**:
+   ```bash
+   npx @modelcontextprotocol/server-cli @modelcontextprotocol/server-stdio mcp-agents-memory
+   ```
+
+5. **Claude MCP**:
+   ```bash
+   claude mcp add mcp-agents-memory node /path/to/build/index.js
+   ```
+
+
 ## Tools
 - `remember(subject_key, content, memory_type, scope)`
 - `recall(subject_key, query, limit)`
