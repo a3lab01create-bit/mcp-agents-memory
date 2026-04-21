@@ -45,8 +45,15 @@ const LogSessionSchema = z.object({
   orchestrator_key: z.string(),
   model_name: z.string(),
   provider: z.string(),
-  token_usage: z.number().optional(),
+  started_at: z.string().optional(),
+});
+
+const CompleteSessionSchema = z.object({
+  session_id: z.number(),
+  ended_at: z.string().optional(),
+  final_outcome: z.enum(['success', 'failure', 'partial']),
   summary: z.string().optional(),
+  token_usage: z.number().optional(),
 });
 
 const LearnSchema = z.object({
@@ -136,7 +143,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "log_session",
-        description: "Log an AI session linked to a task",
+        description: "Log the start of an AI session linked to a task",
         inputSchema: {
           type: "object",
           properties: {
@@ -144,10 +151,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             orchestrator_key: { type: "string" },
             model_name: { type: "string" },
             provider: { type: "string" },
-            token_usage: { type: "number" },
-            summary: { type: "string" }
+            started_at: { type: "string", description: "ISO8601 timestamp" }
           },
           required: ["task_id", "orchestrator_key", "model_name", "provider"]
+        }
+      },
+      {
+        name: "complete_session",
+        description: "Log the completion of an AI session",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: { type: "number" },
+            ended_at: { type: "string", description: "ISO8601 timestamp" },
+            final_outcome: { type: "string", enum: ['success', 'failure', 'partial'] },
+            summary: { type: "string" },
+            token_usage: { type: "number" }
+          },
+          required: ["session_id", "final_outcome"]
         }
       },
       {
@@ -167,7 +188,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_learnings",
-        description: "Retrieve past learning patterns",
+        description: "Retrieve past learning patterns and update usage stats",
         inputSchema: {
           type: "object",
           properties: {
@@ -230,7 +251,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           [subRes.rows[0].id, `%${query}%`, limit]
         );
 
-        // Update access count for recalled memories
         if (memories.rows.length > 0) {
           const ids = memories.rows.map(m => m.id);
           await db.query(
@@ -271,12 +291,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const orch = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [parsed.orchestrator_key]);
         const orchId = orch.rows[0]?.id || null;
 
-        await db.query(
-          `INSERT INTO sessions (task_id, orchestrator_subject_id, model_name, provider, token_usage, summary) 
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [parsed.task_id, orchId, parsed.model_name, parsed.provider, parsed.token_usage, parsed.summary]
+        const res = await db.query(
+          `INSERT INTO sessions (task_id, orchestrator_subject_id, model_name, provider, started_at) 
+           VALUES ($1, $2, $3, $4, COALESCE($5, NOW())) RETURNING id`,
+          [parsed.task_id, orchId, parsed.model_name, parsed.provider, parsed.started_at]
         );
-        return { content: [{ type: "text", text: "Session logged successfully." }] };
+        return { content: [{ type: "text", text: `Session started with ID: ${res.rows[0].id}` }] };
+      }
+
+      case "complete_session": {
+        const parsed = CompleteSessionSchema.parse(args);
+        await db.query(
+          `UPDATE sessions SET ended_at = COALESCE($2, NOW()), final_outcome = $3, summary = $4, token_usage = $5 
+           WHERE id = $1`,
+          [parsed.session_id, parsed.ended_at, parsed.final_outcome, parsed.summary, parsed.token_usage]
+        );
+        return { content: [{ type: "text", text: `Session ${parsed.session_id} completed.` }] };
       }
 
       case "learn": {
@@ -292,10 +322,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "get_learnings": {
         const { task_type, limit } = GetLearningsSchema.parse(args);
         const learnings = await db.query(
-          `SELECT content, summary, learning_type, created_at FROM task_learnings 
+          `SELECT id, content, summary, learning_type, created_at FROM task_learnings 
            WHERE task_type = $1 OR content ILIKE $2 ORDER BY created_at DESC LIMIT $3`,
           [task_type, `%${task_type}%`, limit]
         );
+
+        if (learnings.rows.length > 0) {
+          const ids = learnings.rows.map(l => l.id);
+          await db.query(
+            `UPDATE task_learnings SET usage_count = usage_count + 1, last_used_at = NOW() WHERE id = ANY($1::int[])`,
+            [ids]
+          );
+        }
+
         return { content: [{ type: "text", text: JSON.stringify(learnings.rows, null, 2) }] };
       }
 
@@ -316,7 +355,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Memory MCP Server (v1.1 Advanced) running on stdio");
+  console.error("Memory MCP Server (v1.2 Full) running on stdio");
 }
 
 main().catch(console.error);
