@@ -44,16 +44,17 @@ Multi-agent Shared Long-term Memory MCP Server. This server allows different AI 
    ```
 
 
-## Tools
-- `remember(subject_key, content, memory_type, source_type)`
-- `recall(subject_key, query, limit)`
-- `log_task(title, task_type, owner_key, project_key)`
-- `complete_task(task_id, outcome_summary, success_score)`
-- `log_session(task_id, orchestrator_key, model_name, provider)`
-- `complete_session(session_id, final_outcome, summary, token_usage)`
-- `learn(task_type, learning_type, content)`
-- `get_learnings(task_type, limit)`
-- `get_subject(subject_key)`
+## Tools (v2.0)
+All tools are prefixed with `memory_` to ensure clear intent when used in multi-agent environments.
+- `memory_remember(subject_key, content, memory_type, source_type)`: Store persistent long-term memory.
+- `memory_recall(subject_key, query, limit)`: Recall relevant long-term memories with human-readable formatting.
+- `memory_log_task(title, task_type, owner_key, project_key)`: Create a new task record.
+- `memory_complete_task(task_id, outcome_summary, success_score)`: Mark a task as completed.
+- `memory_log_session(task_id, orchestrator_key, model_name, provider)`: Log the start of an AI session.
+- `memory_complete_session(session_id, final_outcome, summary, token_usage)`: Log session completion.
+- `memory_learn(task_type, learning_type, content)`: Store reusable learnings and heuristics.
+- `memory_get_learnings(task_type, limit)`: Retrieve past learning patterns.
+- `memory_get_subject(subject_key)`: Fetch detailed metadata about a subject in the ecosystem.
 
 ## License
 MIT
