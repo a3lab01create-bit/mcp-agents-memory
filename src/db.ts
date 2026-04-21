@@ -1,5 +1,5 @@
 import pg from 'pg';
-import { Client as SSHClient } from 'ssh2';
+import { createTunnel } from 'tunnel-ssh';
 import fs from 'fs';
 import dotenv from 'dotenv';
 
@@ -10,7 +10,7 @@ const { Pool } = pg;
 export class DatabaseManager {
   private static instance: DatabaseManager;
   private pool: pg.Pool | null = null;
-  private sshClient: SSHClient | null = null;
+  private tunnelServer: any = null;
 
   private constructor() {}
 
@@ -27,43 +27,52 @@ export class DatabaseManager {
     const useSSH = process.env.SSH_ENABLED === 'true';
 
     if (useSSH) {
+      console.error("🔑 Establishing SSH Tunnel...");
+      
+      const tunnelOptions = {
+        autoClose: true
+      };
+
+      const serverOptions = {
+        port: 5433 
+      };
+
+      const sshOptions = {
+        host: process.env.SSH_HOST,
+        port: parseInt(process.env.SSH_PORT || '22'),
+        username: process.env.SSH_USER,
+        privateKey: fs.readFileSync(process.env.SSH_KEY_PATH || ''),
+        passphrase: process.env.SSH_PASS 
+      };
+
+      const forwardOptions = {
+        srcAddr: '127.0.0.1',
+        srcPort: 5433,
+        dstAddr: process.env.DB_HOST || 'localhost',
+        dstPort: parseInt(process.env.DB_PORT || '5432')
+      };
+
       return new Promise((resolve, reject) => {
-        this.sshClient = new SSHClient();
-        this.sshClient
-          .on('ready', () => {
-            const remotePort = parseInt(process.env.DB_PORT || '5432');
-            const localPort = 5433;
+        // @ts-ignore
+        createTunnel(tunnelOptions, serverOptions, sshOptions, forwardOptions)
+          .then(([server, conn]: any) => {
+            this.tunnelServer = server;
+            
+            console.error("✅ SSH Tunnel established on local port 5433");
 
-            this.sshClient?.forwardOut(
-              '127.0.0.1',
-              localPort,
-              process.env.DB_HOST || 'localhost',
-              remotePort,
-              (err, stream) => {
-                if (err) {
-                  this.sshClient?.end();
-                  return reject(err);
-                }
+            this.pool = new Pool({
+              host: '127.0.0.1',
+              port: 5433,
+              user: process.env.DB_USER,
+              password: process.env.DB_PASS,
+              database: process.env.DB_NAME,
+            });
 
-                this.pool = new Pool({
-                  host: '127.0.0.1',
-                  port: localPort,
-                  user: process.env.DB_USER,
-                  password: process.env.DB_PASS,
-                  database: process.env.DB_NAME,
-                  // @ts-ignore
-                  stream: stream,
-                });
-                resolve(this.pool);
-              }
-            );
+            resolve(this.pool);
           })
-          .on('error', (err: Error) => reject(err))
-          .connect({
-            host: process.env.SSH_HOST,
-            port: parseInt(process.env.SSH_PORT || '22'),
-            username: process.env.SSH_USER,
-            privateKey: fs.readFileSync(process.env.SSH_KEY_PATH || ''),
+          .catch((err: any) => {
+            console.error("❌ Failed to create SSH tunnel:", err);
+            reject(err);
           });
       });
     } else {
@@ -85,7 +94,10 @@ export class DatabaseManager {
 
   public async close() {
     if (this.pool) await this.pool.end();
-    if (this.sshClient) this.sshClient.end();
+    if (this.tunnelServer) {
+      this.tunnelServer.close();
+      console.error("🔒 SSH Tunnel closed.");
+    }
   }
 }
 
