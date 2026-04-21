@@ -2,8 +2,11 @@ import pg from 'pg';
 import { createTunnel } from 'tunnel-ssh';
 import fs from 'fs';
 import dotenv from 'dotenv';
+import path from 'path';
 
-dotenv.config();
+dotenv.config({
+  path: path.resolve('/Users/hoon/Documents/Playgrounds/mcp-agents-memory/.env')
+});
 
 const { Pool } = pg;
 
@@ -12,7 +15,7 @@ export class DatabaseManager {
   private pool: pg.Pool | null = null;
   private tunnelServer: any = null;
 
-  private constructor() {}
+  private constructor() { }
 
   public static getInstance(): DatabaseManager {
     if (!DatabaseManager.instance) {
@@ -28,13 +31,13 @@ export class DatabaseManager {
 
     if (useSSH) {
       console.error("🔑 Establishing SSH Tunnel...");
-      
+
       const tunnelOptions = {
         autoClose: false // GPT 제안: 안정성을 위해 터널 자동 종료 비활성화
       };
 
       const serverOptions = {
-        port: 0 
+        port: 0
       };
 
       const sshOptions = {
@@ -42,12 +45,12 @@ export class DatabaseManager {
         port: parseInt(process.env.SSH_PORT || '22'),
         username: process.env.SSH_USER,
         privateKey: fs.readFileSync(process.env.SSH_KEY_PATH || ''),
-        passphrase: process.env.SSH_PASS 
+        passphrase: process.env.SSH_PASS
       };
 
       const forwardOptions = {
         srcAddr: '127.0.0.1',
-        srcPort: 0, 
+        srcPort: 0,
         dstAddr: process.env.DB_HOST || 'localhost',
         dstPort: parseInt(process.env.DB_PORT || '5432')
       };
@@ -57,10 +60,10 @@ export class DatabaseManager {
         createTunnel(tunnelOptions, serverOptions, sshOptions, forwardOptions)
           .then(async ([server, conn]: any) => {
             this.tunnelServer = server;
-            
+
             const addr = server.address();
             const localPort = (addr && typeof addr === 'object') ? addr.port : 0;
-            
+
             console.error(`✅ SSH Tunnel established on local port ${localPort}`);
 
             this.pool = new Pool({
