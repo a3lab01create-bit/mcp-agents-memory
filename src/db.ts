@@ -34,7 +34,7 @@ export class DatabaseManager {
       };
 
       const serverOptions = {
-        port: 0 // Use dynamic port to avoid conflicts
+        port: 0 
       };
 
       const sshOptions = {
@@ -58,8 +58,9 @@ export class DatabaseManager {
           .then(([server, conn]: any) => {
             this.tunnelServer = server;
             
-            // Get the dynamically assigned port
-            const localPort = server.address().port;
+            const addr = server.address();
+            const localPort = (addr && typeof addr === 'object') ? addr.port : 0;
+            
             console.error(`✅ SSH Tunnel established on local port ${localPort}`);
 
             this.pool = new Pool({
