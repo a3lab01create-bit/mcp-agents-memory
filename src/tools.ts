@@ -117,10 +117,11 @@ export function registerTools(server: McpServer) {
       success_score: z.number().min(1).max(10),
     },
     async (args) => {
-      await db.query(
+      const res = await db.query(
         `UPDATE tasks SET status = 'done', outcome_summary = $2, success_score = $3, ended_at = NOW() WHERE id = $1`,
         [args.task_id, args.outcome_summary, args.success_score]
       );
+      if (res.rowCount === 0) throw new Error(`Task ${args.task_id} not found.`);
       return { content: [{ type: "text", text: `Task ${args.task_id} marked as done.` }] };
     }
   );
@@ -137,7 +138,8 @@ export function registerTools(server: McpServer) {
     },
     async (args) => {
       const orch = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.orchestrator_key]);
-      const orchId = orch.rows[0]?.id || null;
+      if (!orch.rows[0]) throw new Error(`Orchestrator ${args.orchestrator_key} not found`);
+      const orchId = orch.rows[0].id;
 
       const res = await db.query(
         `INSERT INTO sessions (task_id, orchestrator_subject_id, model_name, provider, started_at) 
@@ -159,11 +161,12 @@ export function registerTools(server: McpServer) {
       token_usage: z.number().optional(),
     },
     async (args) => {
-      await db.query(
+      const res = await db.query(
         `UPDATE sessions SET ended_at = COALESCE($2, NOW()), final_outcome = $3, summary = $4, token_usage = $5 
          WHERE id = $1`,
         [args.session_id, args.ended_at, args.final_outcome, args.summary, args.token_usage]
       );
+      if (res.rowCount === 0) throw new Error(`Session ${args.session_id} not found.`);
       return { content: [{ type: "text", text: `Session ${args.session_id} completed.` }] };
     }
   );
@@ -236,7 +239,18 @@ export function registerTools(server: McpServer) {
       if (subject.rows.length === 0) {
         throw new Error(`Subject ${args.subject_key} not found.`);
       }
-      return { content: [{ type: "text", text: JSON.stringify(subject.rows[0], null, 2) }] };
+      
+      const s = subject.rows[0];
+      let formatted = `🔎 Subject Info\n\n`;
+      formatted += `ID: ${s.id}\n`;
+      formatted += `Type: ${s.subject_type}\n`;
+      formatted += `Key: ${s.subject_key}\n`;
+      formatted += `Display Name: ${s.display_name}\n`;
+      formatted += `Active: ${s.is_active}\n`;
+      formatted += `Metadata: ${JSON.stringify(s.metadata, null, 2)}\n`;
+      formatted += `Created: ${new Date(s.created_at).toLocaleString()}\n`;
+      
+      return { content: [{ type: "text", text: formatted }] };
     }
   );
 }
