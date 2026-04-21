@@ -34,7 +34,7 @@ export class DatabaseManager {
       };
 
       const serverOptions = {
-        port: 5433 
+        port: 0 // Use dynamic port to avoid conflicts
       };
 
       const sshOptions = {
@@ -47,7 +47,7 @@ export class DatabaseManager {
 
       const forwardOptions = {
         srcAddr: '127.0.0.1',
-        srcPort: 5433,
+        srcPort: 0, 
         dstAddr: process.env.DB_HOST || 'localhost',
         dstPort: parseInt(process.env.DB_PORT || '5432')
       };
@@ -58,11 +58,13 @@ export class DatabaseManager {
           .then(([server, conn]: any) => {
             this.tunnelServer = server;
             
-            console.error("✅ SSH Tunnel established on local port 5433");
+            // Get the dynamically assigned port
+            const localPort = server.address().port;
+            console.error(`✅ SSH Tunnel established on local port ${localPort}`);
 
             this.pool = new Pool({
               host: '127.0.0.1',
-              port: 5433,
+              port: localPort,
               user: process.env.DB_USER,
               password: process.env.DB_PASS,
               database: process.env.DB_NAME,
