@@ -4,7 +4,7 @@ import { db } from "./db.js";
 
 export function registerTools(server: McpServer) {
   server.tool(
-    "remember",
+    "memory_remember",
     "Store persistent long-term memory about the user, project, or task context. Use this whenever you learn important information that should remain useful across future conversations, such as user profile, preferences, constraints, or project-specific rules. Do not use for temporary or one-off information.",
     {
       subject_key: z.string(),
@@ -23,8 +23,9 @@ export function registerTools(server: McpServer) {
       
       let projId = null;
       if (args.project_key) {
-        const projRes = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.project_key]);
-        projId = projRes.rows[0]?.id || null;
+        const projRes = await db.query("SELECT id FROM subjects WHERE subject_key = $1 AND subject_type = 'project'", [args.project_key]);
+        if (projRes.rows.length === 0) throw new Error(`Project ${args.project_key} not found or is not of type 'project'`);
+        projId = projRes.rows[0].id;
       }
 
       await db.query(
@@ -37,7 +38,7 @@ export function registerTools(server: McpServer) {
   );
 
   server.tool(
-    "recall",
+    "memory_recall",
     "Recall relevant long-term memories before or during a task. Use this to retrieve prior context about the current user, project, or topic so responses remain consistent and informed.",
     {
       subject_key: z.string(),
@@ -57,20 +58,32 @@ export function registerTools(server: McpServer) {
         [subRes.rows[0].id, `%${args.query}%`, args.limit]
       );
 
-      if (memories.rows.length > 0) {
-        const ids = memories.rows.map(m => m.id);
-        await db.query(
-          `UPDATE memories SET access_count = access_count + 1, last_accessed_at = NOW() WHERE id = ANY($1::int[])`,
-          [ids]
-        );
+      if (memories.rows.length === 0) {
+        return { content: [{ type: "text", text: "No relevant memories found." }] };
       }
 
-      return { content: [{ type: "text", text: JSON.stringify(memories.rows, null, 2) }] };
+      const ids = memories.rows.map(m => m.id);
+      await db.query(
+        `UPDATE memories SET access_count = access_count + 1, last_accessed_at = NOW() WHERE id = ANY($1::int[])`,
+        [ids]
+      );
+
+      let formatted = "🧠 Recalled Memories:\n\n";
+      memories.rows.forEach(m => {
+        formatted += `[ID: ${m.id}] Type: ${m.memory_type} | Scope: ${m.memory_scope}\n`;
+        if (m.project_name) formatted += `Project: ${m.project_name}\n`;
+        if (m.summary) formatted += `Summary: ${m.summary}\n`;
+        formatted += `Content: ${m.content}\n`;
+        formatted += `Date: ${new Date(m.created_at).toLocaleString()}\n`;
+        formatted += `---\n`;
+      });
+
+      return { content: [{ type: "text", text: formatted }] };
     }
   );
 
   server.tool(
-    "log_task",
+    "memory_log_task",
     "Create a new task record. Use this to track major work items or goals for the user, a project, or a specific agent.",
     {
       title: z.string(),
@@ -81,9 +94,10 @@ export function registerTools(server: McpServer) {
     },
     async (args) => {
       const owner = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.owner_key]);
-      const project = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.project_key]);
+      const project = await db.query("SELECT id FROM subjects WHERE subject_key = $1 AND subject_type = 'project'", [args.project_key]);
       
-      if (!owner.rows[0] || !project.rows[0]) throw new Error("Invalid owner_key or project_key");
+      if (!owner.rows[0]) throw new Error(`Owner ${args.owner_key} not found`);
+      if (!project.rows[0]) throw new Error(`Project ${args.project_key} not found or is not of type 'project'`);
 
       const res = await db.query(
         `INSERT INTO tasks (title, task_type, owner_subject_id, project_subject_id, description) 
@@ -95,7 +109,7 @@ export function registerTools(server: McpServer) {
   );
 
   server.tool(
-    "complete_task",
+    "memory_complete_task",
     "Mark a task as completed. Use this to record the outcome, success score, and final summary of a tracked task.",
     {
       task_id: z.number(),
@@ -112,7 +126,7 @@ export function registerTools(server: McpServer) {
   );
 
   server.tool(
-    "log_session",
+    "memory_log_session",
     "Log the start of an AI session linked to a specific task. Use this to track which agent is working on a task and when they started.",
     {
       task_id: z.number(),
@@ -135,7 +149,7 @@ export function registerTools(server: McpServer) {
   );
 
   server.tool(
-    "complete_session",
+    "memory_complete_session",
     "Log the completion of an AI session. Use this to record token usage, final outcome, and summary after an agent finishes a block of work.",
     {
       session_id: z.number(),
@@ -155,7 +169,7 @@ export function registerTools(server: McpServer) {
   );
 
   server.tool(
-    "learn",
+    "memory_learn",
     "Store reusable learnings from completed work, such as success patterns, failure patterns, heuristics, or routing rules. Use this after meaningful tasks when a lesson could improve future performance.",
     {
       task_id: z.number().optional(),
@@ -175,7 +189,7 @@ export function registerTools(server: McpServer) {
   );
 
   server.tool(
-    "get_learnings",
+    "memory_get_learnings",
     "Retrieve past learning patterns. Use this before starting a new task of a specific type to discover known best practices, previous mistakes to avoid, and proven heuristics.",
     {
       task_type: z.string(),
@@ -188,27 +202,41 @@ export function registerTools(server: McpServer) {
         [args.task_type, `%${args.task_type}%`, args.limit]
       );
 
-      if (learnings.rows.length > 0) {
-        const ids = learnings.rows.map(l => l.id);
-        await db.query(
-          `UPDATE task_learnings SET usage_count = usage_count + 1, last_used_at = NOW() WHERE id = ANY($1::int[])`,
-          [ids]
-        );
+      if (learnings.rows.length === 0) {
+        return { content: [{ type: "text", text: "No relevant learnings found." }] };
       }
 
-      return { content: [{ type: "text", text: JSON.stringify(learnings.rows, null, 2) }] };
+      const ids = learnings.rows.map(l => l.id);
+      await db.query(
+        `UPDATE task_learnings SET usage_count = usage_count + 1, last_used_at = NOW() WHERE id = ANY($1::int[])`,
+        [ids]
+      );
+
+      let formatted = "📚 Retrieved Learnings:\n\n";
+      learnings.rows.forEach(l => {
+        formatted += `[ID: ${l.id}] Type: ${l.learning_type}\n`;
+        if (l.summary) formatted += `Summary: ${l.summary}\n`;
+        formatted += `Content: ${l.content}\n`;
+        formatted += `Date: ${new Date(l.created_at).toLocaleString()}\n`;
+        formatted += `---\n`;
+      });
+
+      return { content: [{ type: "text", text: formatted }] };
     }
   );
 
   server.tool(
-    "get_subject",
+    "memory_get_subject",
     "Fetch detailed subject information by key. Use this to look up metadata about a person, agent, project, team, or system in the memory ecosystem.",
     {
       subject_key: z.string(),
     },
     async (args) => {
       const subject = await db.query("SELECT * FROM subjects WHERE subject_key = $1", [args.subject_key]);
-      return { content: [{ type: "text", text: JSON.stringify(subject.rows[0] || {}, null, 2) }] };
+      if (subject.rows.length === 0) {
+        throw new Error(`Subject ${args.subject_key} not found.`);
+      }
+      return { content: [{ type: "text", text: JSON.stringify(subject.rows[0], null, 2) }] };
     }
   );
 }
