@@ -25,19 +25,23 @@ async function main() {
   }
 
   try {
-    console.error("📡 Pre-connecting to Database...");
-    await db.connect();
-    console.error("✅ Database ready.");
-
-    // Auto-register agent if AGENT_KEY env is set (e.g. "agent_claude", "agent_gemini")
-    if (process.env.AGENT_KEY) {
-      await getOrCreateSubject(process.env.AGENT_KEY, 'agent');
-      console.error(`🤖 Agent registered: ${process.env.AGENT_KEY}`);
-    }
-
+    // 1. Connect stdio immediately so Claude Code does not fail SessionStart hook
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error("🧠 Memory MCP Server (v2.0) running on stdio");
+
+    // 2. Initialize DB asynchronously in the background
+    db.connect().then(() => {
+      console.error("✅ Database connected in background.");
+      if (process.env.AGENT_KEY) {
+        getOrCreateSubject(process.env.AGENT_KEY, 'agent').then(() => {
+          console.error(`🤖 Agent registered: ${process.env.AGENT_KEY}`);
+        }).catch(err => console.error("Failed to register agent:", err));
+      }
+    }).catch(err => {
+      console.error("❌ Background DB connection failed:", err);
+    });
+
   } catch (err) {
     console.error("❌ Fatal error during startup:", err);
     process.exit(1);
