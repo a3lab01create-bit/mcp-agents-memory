@@ -134,10 +134,10 @@ export async function onTaskStart(
 ): Promise<StructuredContext> {
   console.error(`[Hook] Initializing task: [${projectKey}] ${taskType}`);
 
-  // 1. Recall project-specific memories (Query project directly)
+  // 1. Recall project-specific memories
   const memoryRes = await client.callTool("memory_recall", {
     subject_key: projectKey,
-    query: "",
+    query: taskType,
     limit: 5
   });
 

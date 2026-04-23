@@ -23,6 +23,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "dotenv": "^16.4.5",
     "inquirer": "^9.2.16",
+    "openai": "^6.34.0",
     "pg": "^8.11.3",
     "ssh2": "^1.15.0",
     "tunnel-ssh": "^5.2.0",

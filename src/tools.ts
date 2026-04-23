@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { db } from "./db.js";
+import { generateEmbedding, vectorToSql } from "./embeddings.js";
 
 export async function getOrCreateSubject(subject_key: string | undefined | null, fallback_type: string = 'system'): Promise<number> {
   const finalKey = subject_key || 'system_global';
@@ -26,7 +27,7 @@ export function registerTools(server: McpServer) {
   server.registerTool(
     "memory_remember",
     {
-      description: "Store persistent long-term memory about the user, project, or task context. Use this whenever you learn important information that should remain useful across future conversations.\n\n[CRITICAL RULES]\n1. 'subject_key' MUST be a valid existing key.\n2. Common keys: 'user_hoon' (Main User), 'project_centragens', 'project_yoontube', 'agent_claude', 'category_marketing', 'category_development'.\n3. If you are unsure of the subject_key, ask the user before saving.\n4. Do not use for temporary or one-off information.",
+      description: "Store persistent long-term memory about the user, project, or task context. Use this whenever you learn important information that should remain useful across future conversations.\n\n[RULES]\n1. 'subject_key' is optional — if omitted or unknown, defaults to 'system_global' (auto-created if needed).\n2. Common keys: 'user_hoon' (Main User), 'project_centragens', 'project_yoontube', 'agent_claude', 'category_marketing'.\n3. New keys are auto-created using the prefix convention: user_, project_, agent_, team_, category_, system_.\n4. Do not use for temporary or one-off information.",
       inputSchema: {
         subject_key: z.string().optional().describe("Key of the subject (e.g., 'user_hoon'). If omitted, defaults to 'system_global'."),
         project_key: z.string().optional(),
@@ -49,10 +50,13 @@ export function registerTools(server: McpServer) {
         projId = await getOrCreateSubject(args.project_key, 'project');
       }
 
+      const embedText = [args.summary, args.content].filter(Boolean).join(" ");
+      const embedding = await generateEmbedding(embedText);
+
       await db.query(
-        `INSERT INTO memories (subject_id, project_subject_id, content, summary, memory_type, memory_scope, source_type, importance_score, confidence_score, tags, expires_at) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-        [subId, projId, args.content, args.summary, args.memory_type, args.memory_scope, args.source_type, args.importance_score, args.confidence_score, args.tags, args.expires_at]
+        `INSERT INTO memories (subject_id, project_subject_id, content, summary, memory_type, memory_scope, source_type, importance_score, confidence_score, tags, expires_at, embedding)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        [subId, projId, args.content, args.summary, args.memory_type, args.memory_scope, args.source_type, args.importance_score, args.confidence_score, args.tags, args.expires_at, vectorToSql(embedding)]
       );
       return { content: [{ type: "text", text: "Memory successfully recorded." }] };
     }
@@ -61,23 +65,56 @@ export function registerTools(server: McpServer) {
   server.registerTool(
     "memory_recall",
     {
-      description: "Recall relevant long-term memories before or during a task. Use this to retrieve prior context about the current user, project, or topic so responses remain consistent and informed.\n\n[CRITICAL RULES]\n1. 'subject_key' requires a valid key. Common keys: 'user_hoon' (Main User), 'project_centragens', 'project_yoontube'.\n2. If unsure, start by recalling from 'user_hoon' or ask the user.",
+      description: "Recall relevant long-term memories before or during a task. Use this to retrieve prior context about the current user, project, or topic so responses remain consistent and informed.\n\n[RULES]\n1. 'subject_key' is optional — if omitted, searches ALL subjects globally.\n2. Common keys: 'user_hoon' (Main User), 'project_centragens', 'project_yoontube'.\n3. 'tags' is optional — filter or boost results by specific tags (e.g. ['embedding', 'bugfix']).\n4. If unsure of the key, omit subject_key to do a global search across everything.",
       inputSchema: {
-        subject_key: z.string().optional().describe("Key of the subject to recall. Defaults to 'system_global' if omitted."),
+        subject_key: z.string().optional().describe("Key of the subject to recall. If omitted, searches across ALL subjects."),
         query: z.string(),
+        tags: z.array(z.string()).optional().describe("Optional tags to filter by (e.g. ['bugfix', 'embedding'])"),
         limit: z.number().optional().default(5),
       }
     },
     async (args) => {
-      const subId = await getOrCreateSubject(args.subject_key, 'system');
+      const queryEmbedding = await generateEmbedding(args.query);
+      const embeddingSql = vectorToSql(queryEmbedding);
 
+      const params: any[] = [embeddingSql, args.limit, `%${args.query}%`];
+      let subjectFilter = '';
+
+      if (args.subject_key) {
+        const subId = await getOrCreateSubject(args.subject_key, 'system');
+        params.push(subId);
+        subjectFilter = `AND m.subject_id = $${params.length}`;
+      }
+
+      let tagFilter = '';
+      if (args.tags && args.tags.length > 0) {
+        params.push(args.tags);
+        tagFilter = `AND m.tags && $${params.length}::text[]`;
+      }
+
+      // 벡터 유사도 검색 + ILIKE 폴백 + 태그 매칭 합산
       const memories = await db.query(
-        `SELECT m.id, m.content, m.summary, m.memory_type, m.memory_scope, m.created_at, m.confidence_score, m.importance_score, m.tags, s.display_name as project_name
+        `SELECT m.id, m.content, m.summary, m.memory_type, m.memory_scope, m.created_at,
+                m.confidence_score, m.importance_score, m.tags,
+                subj.display_name as subject_name,
+                s.display_name as project_name,
+                CASE WHEN m.embedding IS NOT NULL
+                     THEN 1 - (m.embedding <=> $1::vector)
+                     ELSE 0.0
+                END AS similarity
          FROM memories m
+         LEFT JOIN subjects subj ON m.subject_id = subj.id
          LEFT JOIN subjects s ON m.project_subject_id = s.id
-         WHERE m.subject_id = $1 AND (m.content ILIKE $2 OR COALESCE(m.summary, '') ILIKE $2 OR EXISTS (SELECT 1 FROM unnest(m.tags) t WHERE t ILIKE $3))
-         ORDER BY m.importance_score DESC, m.created_at DESC LIMIT $4`,
-        [subId, `%${args.query}%`, `%${args.query}%`, args.limit]
+         WHERE (
+             (m.embedding IS NOT NULL AND 1 - (m.embedding <=> $1::vector) > 0.3)
+             OR (m.embedding IS NULL AND (m.content ILIKE $3 OR COALESCE(m.summary,'') ILIKE $3))
+             OR (m.tags IS NOT NULL AND m.tags::text ILIKE $3)
+           )
+           ${subjectFilter}
+           ${tagFilter}
+         ORDER BY similarity DESC, m.importance_score DESC
+         LIMIT $2`,
+        params
       );
 
       if (memories.rows.length === 0) {
@@ -93,6 +130,7 @@ export function registerTools(server: McpServer) {
       let formatted = "🧠 Recalled Memories:\n\n";
       memories.rows.forEach(m => {
         formatted += `[ID: ${m.id}] Type: ${m.memory_type} | Scope: ${m.memory_scope} | Imp: ${m.importance_score} | Conf: ${m.confidence_score}\n`;
+        if (m.subject_name) formatted += `Subject: ${m.subject_name}\n`;
         if (m.project_name) formatted += `Project: ${m.project_name}\n`;
         if (m.tags && m.tags.length > 0) formatted += `Tags: ${m.tags.join(", ")}\n`;
         if (m.summary) formatted += `Summary: ${m.summary}\n`;
@@ -108,7 +146,7 @@ export function registerTools(server: McpServer) {
   server.registerTool(
     "memory_log_task",
     {
-      description: "Create a new task record. Use this to track major work items or goals for the user, a project, or a specific agent.\n\n[CRITICAL RULES]\n1. 'owner_key' and 'project_key' must be valid subject keys (e.g., owner_key: 'user_hoon', project_key: 'project_centragens').",
+      description: "Create a new task record. Use this to track major work items or goals for the user, a project, or a specific agent.\n\n[RULES]\n1. 'owner_key' defaults to 'user_hoon' if omitted.\n2. 'project_key' defaults to 'project_general' if omitted. New keys are auto-created using prefix convention.",
       inputSchema: {
         title: z.string(),
         task_type: z.string(),
@@ -119,7 +157,7 @@ export function registerTools(server: McpServer) {
     },
     async (args) => {
       const ownerId = await getOrCreateSubject(args.owner_key || 'user_hoon', 'person');
-      const projId = await getOrCreateSubject(args.project_key, 'project');
+      const projId = await getOrCreateSubject(args.project_key || 'project_general', 'project');
 
       const res = await db.query(
         `INSERT INTO tasks (title, task_type, owner_subject_id, project_subject_id, description) 
@@ -163,9 +201,7 @@ export function registerTools(server: McpServer) {
       }
     },
     async (args) => {
-      const orch = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.orchestrator_key]);
-      if (!orch.rows[0]) throw new Error(`Orchestrator ${args.orchestrator_key} not found`);
-      const orchId = orch.rows[0].id;
+      const orchId = await getOrCreateSubject(args.orchestrator_key, 'agent');
 
       const res = await db.query(
         `INSERT INTO sessions (task_id, orchestrator_subject_id, model_name, provider, started_at) 
@@ -215,10 +251,13 @@ export function registerTools(server: McpServer) {
       }
     },
     async (args) => {
+      const embedText = [args.summary, args.content].filter(Boolean).join(" ");
+      const embedding = await generateEmbedding(embedText);
+
       await db.query(
-        `INSERT INTO task_learnings (task_id, task_type, learning_type, content, summary, confidence_score, impact_score, tags) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [args.task_id, args.task_type, args.learning_type, args.content, args.summary, args.confidence_score, args.impact_score, args.tags]
+        `INSERT INTO task_learnings (task_id, task_type, learning_type, content, summary, confidence_score, impact_score, tags, embedding)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [args.task_id, args.task_type, args.learning_type, args.content, args.summary, args.confidence_score, args.impact_score, args.tags, vectorToSql(embedding)]
       );
       return { content: [{ type: "text", text: "Learning pattern recorded." }] };
     }
@@ -235,24 +274,50 @@ export function registerTools(server: McpServer) {
       }
     },
     async (args) => {
-      let queryStr = `SELECT id, content, summary, learning_type, created_at, confidence_score, impact_score, tags FROM task_learnings WHERE 1=1`;
-      let params: any[] = [];
-      let paramCount = 1;
+      let learnings;
 
       if (args.task_type) {
-        queryStr += ` AND (task_type = $${paramCount} OR content ILIKE $${paramCount+1} OR EXISTS (SELECT 1 FROM unnest(tags) t WHERE t ILIKE $${paramCount+1}))`;
-        params.push(args.task_type, `%${args.task_type}%`);
-        paramCount += 2;
-      }
-      if (args.learning_type) {
-        queryStr += ` AND learning_type = $${paramCount}`;
-        params.push(args.learning_type);
-        paramCount++;
-      }
-      queryStr += ` ORDER BY created_at DESC LIMIT $${paramCount}`;
-      params.push(args.limit);
+        const queryEmbedding = await generateEmbedding(args.task_type);
+        const embeddingSql = vectorToSql(queryEmbedding);
 
-      const learnings = await db.query(queryStr, params);
+        let whereClause = `WHERE (
+          (embedding IS NOT NULL AND 1 - (embedding <=> $1::vector) > 0.3)
+          OR (embedding IS NULL AND (task_type = $2 OR content ILIKE $3))
+        )`;
+        const params: any[] = [embeddingSql, args.task_type, `%${args.task_type}%`];
+        let paramCount = 4;
+
+        if (args.learning_type) {
+          whereClause += ` AND learning_type = $${paramCount}`;
+          params.push(args.learning_type);
+          paramCount++;
+        }
+
+        learnings = await db.query(
+          `SELECT id, content, summary, learning_type, created_at, confidence_score, impact_score, tags,
+                  CASE WHEN embedding IS NOT NULL THEN 1 - (embedding <=> $1::vector) ELSE 0.0 END AS similarity
+           FROM task_learnings ${whereClause}
+           ORDER BY similarity DESC, created_at DESC LIMIT $${paramCount}`,
+          [...params, args.limit]
+        );
+      } else {
+        let whereClause = `WHERE 1=1`;
+        const params: any[] = [];
+        let paramCount = 1;
+
+        if (args.learning_type) {
+          whereClause += ` AND learning_type = $${paramCount}`;
+          params.push(args.learning_type);
+          paramCount++;
+        }
+
+        learnings = await db.query(
+          `SELECT id, content, summary, learning_type, created_at, confidence_score, impact_score, tags, 0.0 AS similarity
+           FROM task_learnings ${whereClause}
+           ORDER BY created_at DESC LIMIT $${paramCount}`,
+          [...params, args.limit]
+        );
+      }
 
       if (learnings.rows.length === 0) {
         return { content: [{ type: "text", text: "No relevant learnings found." }] };

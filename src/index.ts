@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { db } from "./db.js";
 import { registerTools } from "./tools.js";
+import { getOrCreateSubject } from "./tools.js";
 import fs from 'fs';
 
 const server = new McpServer({
@@ -27,6 +28,12 @@ async function main() {
     console.error("📡 Pre-connecting to Database...");
     await db.connect();
     console.error("✅ Database ready.");
+
+    // Auto-register agent if AGENT_KEY env is set (e.g. "agent_claude", "agent_gemini")
+    if (process.env.AGENT_KEY) {
+      await getOrCreateSubject(process.env.AGENT_KEY, 'agent');
+      console.error(`🤖 Agent registered: ${process.env.AGENT_KEY}`);
+    }
 
     const transport = new StdioServerTransport();
     await server.connect(transport);

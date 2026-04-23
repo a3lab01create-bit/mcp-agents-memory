@@ -246,7 +246,29 @@ DB_NAME=${answers.dbName}${sshConfig}
     `);
 
     // ---------------------------------------------------------
-    // 4. Indices
+    // 4. Vector Support (pgvector)
+    // ---------------------------------------------------------
+    console.log("🧬 Setting up vector support...");
+    await db.query(`CREATE EXTENSION IF NOT EXISTS vector`);
+
+    await db.query(`
+      ALTER TABLE memories
+        ADD COLUMN IF NOT EXISTS embedding vector(1536);
+
+      ALTER TABLE task_learnings
+        ADD COLUMN IF NOT EXISTS embedding vector(1536);
+    `);
+
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_memories_embedding
+        ON memories USING hnsw (embedding vector_cosine_ops);
+
+      CREATE INDEX IF NOT EXISTS idx_task_learnings_embedding
+        ON task_learnings USING hnsw (embedding vector_cosine_ops);
+    `);
+
+    // ---------------------------------------------------------
+    // 5. Indices
     // ---------------------------------------------------------
     console.log("🔍 Creating indices...");
     await db.query(`
