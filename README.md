@@ -131,6 +131,37 @@ All tools are prefixed with `memory_` for clear intent in multi-agent environmen
                     └─────────────────────┘
 ```
 
+## Claude Code Hooks (Optional, Recommended)
+
+MCP 서버 자체는 어떤 AI 클라이언트에서든 작동하지만, Claude Code를 사용한다면 아래 훅 설정을 `~/.claude/settings.json`에 추가하면 자동화 수준이 올라갑니다.
+
+```jsonc
+{
+  "hooks": {
+    // 프롬프트 입력 시 자동으로 관련 메모리 검색
+    "UserPromptSubmit": [{
+      "hooks": [{
+        "type": "mcp_tool",
+        "server": "mcp-agents-memory",
+        "tool": "memory_recall",
+        "input": { "query": "${prompt}", "limit": 5 },
+        "statusMessage": "관련 메모리 검색 중..."
+      }]
+    }],
+    // 세션 종료 시 핵심 사실을 개별 저장
+    "Stop": [{
+      "hooks": [{
+        "type": "agent",
+        "prompt": "핵심 사실(fact)을 개별 memory_remember 호출로 분리 저장할 것. 서술적 요약 금지. 구체적 사실만 저장.",
+        "statusMessage": "세션 메모리 저장 중..."
+      }]
+    }]
+  }
+}
+```
+
+> ⚠️ `SessionStart` 훅에서 `mcp_tool`을 사용하면 서버 초기화 시간 때문에 타임아웃이 발생할 수 있습니다. 대신 `memory_startup` 툴의 description이 에이전트를 유도하므로 별도 설정이 필요 없습니다.
+
 ## Roadmap
 
 - [x] v1.0 — 기본 CRUD 메모리 시스템
