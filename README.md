@@ -168,8 +168,46 @@ MCP 서버 자체는 어떤 AI 클라이언트에서든 작동하지만, Claude 
 - [x] v2.0 — 동적 주체 생성, 유연한 subject_key
 - [x] v3.0 — pgvector 시맨틱 검색, 하이브리드 정렬
 - [x] v3.1 — 스마트 브리핑, 원자적 저장 강제, 퀄리티 개선
-- [ ] v4.0 — 툴 통합 (12개 → 3~4개: `memory_save`, `memory_search`, `memory_status`)
-- [ ] v5.0 — MCP Prompts 엔드포인트, 자동 요약/압축, 메모리 만료 정책
+
+### 🔮 향후 방향 (Where We're Headed)
+
+우리의 목표는 단순한 "메모리 DB"가 아니라, [supermemory](https://github.com/supermemoryai/supermemory)와 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 수준의 **자율적 기억 시스템**입니다.
+
+#### 현재 갭 분석
+
+| 기능 | supermemory | Hermes | 우리 (현재) | 목표 |
+|------|:-----------:|:------:|:-----------:|:----:|
+| 자동 사실 추출 | ✅ | ✅ | ❌ | v4.0 |
+| 모순 해결 (fact update) | ✅ | ✅ | ❌ | v4.0 |
+| 자동 만료 | ✅ | ❌ | ❌ | v5.0 |
+| 유저 프로필 자동 빌드 | ✅ | ✅ | ❌ | v4.0 |
+| 스킬/규칙 자동 갱신 | ❌ | ✅ | ❌ | v4.5 |
+| 멀티 에이전트 | ✅ | ✅ | ✅ | ✅ |
+| 시맨틱 검색 | ✅ | ❌ | ✅ | ✅ |
+
+#### Phase 1: v4.0 — 자동 추출 엔진 (Auto-Extract Engine)
+> "에이전트가 `memory_remember`를 직접 안 불러도 알아서 기억이 쌓인다"
+
+- [ ] **Fact Extractor**: 대화 내용을 LLM이 분석 → 핵심 사실 자동 추출 → 개별 저장
+- [ ] **Contradiction Resolver**: "서울 → 부산 이사" 같은 모순 감지 → 기존 기억 자동 업데이트
+- [ ] **Auto User Profile**: `profile.static` (장기 사실) + `profile.dynamic` (현재 맥락) 자동 합성
+- [ ] **Tool Consolidation**: 12개 → 3~4개 (`memory_save`, `memory_search`, `memory_status`)
+
+#### Phase 2: v4.5 — 스킬 시스템 (Skill System)
+> "기억이 행동 규칙으로 진화한다" (Hermes MEMORY.md 스타일)
+
+- [ ] **Project Rules Engine**: 프로젝트별 운영 규칙을 DB에서 관리하고 자동 갱신
+- [ ] **Learned Heuristics → Skills**: 반복된 학습 패턴이 일정 threshold 넘으면 자동으로 "스킬"로 승격
+- [ ] **Skill Injection**: `memory_startup` 호출 시 관련 스킬을 시스템 프롬프트에 자동 주입
+
+#### Phase 3: v5.0 — 완전 자율 메모리 (Autonomous Memory)
+> "사람처럼 기억하고, 잊고, 연결한다"
+
+- [ ] **Auto Forgetting**: 시간/관련성 기반 자동 만료 정책
+- [ ] **Memory Graph**: 기억 간 관계 그래프 → "A 작업에서 배운 걸 B에 적용" 추론
+- [ ] **MCP Prompts Endpoint**: 클라이언트가 자동으로 컨텍스트를 주입받는 표준 엔드포인트
+- [ ] **Connectors**: GitHub, Notion, Google Drive 등 외부 데이터 자동 동기화
 
 ## License
 MIT
+
