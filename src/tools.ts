@@ -6,7 +6,7 @@ export function registerTools(server: McpServer) {
   server.registerTool(
     "memory_remember",
     {
-      description: "Store persistent long-term memory about the user, project, or task context. Use this whenever you learn important information that should remain useful across future conversations, such as user profile, preferences, constraints, or project-specific rules. Do not use for temporary or one-off information.",
+      description: "Store persistent long-term memory about the user, project, or task context. Use this whenever you learn important information that should remain useful across future conversations.\n\n[CRITICAL RULES]\n1. 'subject_key' MUST be a valid existing key.\n2. Common keys: 'user_hoon' (Main User), 'project_centragens', 'project_yoontube', 'agent_claude', 'category_marketing', 'category_development'.\n3. If you are unsure of the subject_key, ask the user before saving.\n4. Do not use for temporary or one-off information.",
       inputSchema: {
         subject_key: z.string(),
         project_key: z.string().optional(),
@@ -44,7 +44,7 @@ export function registerTools(server: McpServer) {
   server.registerTool(
     "memory_recall",
     {
-      description: "Recall relevant long-term memories before or during a task. Use this to retrieve prior context about the current user, project, or topic so responses remain consistent and informed.",
+      description: "Recall relevant long-term memories before or during a task. Use this to retrieve prior context about the current user, project, or topic so responses remain consistent and informed.\n\n[CRITICAL RULES]\n1. 'subject_key' requires a valid key. Common keys: 'user_hoon' (Main User), 'project_centragens', 'project_yoontube'.\n2. If unsure, start by recalling from 'user_hoon' or ask the user.",
       inputSchema: {
         subject_key: z.string(),
         query: z.string(),
@@ -92,7 +92,7 @@ export function registerTools(server: McpServer) {
   server.registerTool(
     "memory_log_task",
     {
-      description: "Create a new task record. Use this to track major work items or goals for the user, a project, or a specific agent.",
+      description: "Create a new task record. Use this to track major work items or goals for the user, a project, or a specific agent.\n\n[CRITICAL RULES]\n1. 'owner_key' and 'project_key' must be valid subject keys (e.g., owner_key: 'user_hoon', project_key: 'project_centragens').",
       inputSchema: {
         title: z.string(),
         task_type: z.string(),
@@ -268,7 +268,7 @@ export function registerTools(server: McpServer) {
   server.registerTool(
     "memory_get_subject",
     {
-      description: "Fetch detailed subject information by key. Use this to look up metadata about a person, agent, project, team, or system in the memory ecosystem.",
+      description: "Fetch detailed subject information by key. Use this to verify if a subject exists or check its metadata. \n\n[COMMON KEYS]\nUsers: 'user_hoon'\nProjects: 'project_centragens', 'project_yoontube'\nCategories: 'category_marketing', 'category_healthcare', 'category_development'\nAgents: 'agent_claude'",
       inputSchema: {
         subject_key: z.string(),
       }
