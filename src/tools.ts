@@ -2,13 +2,33 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { db } from "./db.js";
 
+export async function getOrCreateSubject(subject_key: string | undefined | null, fallback_type: string = 'system'): Promise<number> {
+  const finalKey = subject_key || 'system_global';
+  const res = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [finalKey]);
+  if (res.rows.length > 0) return res.rows[0].id;
+
+  let guessedType = fallback_type;
+  if (finalKey.startsWith('user_')) guessedType = 'person';
+  else if (finalKey.startsWith('project_')) guessedType = 'project';
+  else if (finalKey.startsWith('agent_')) guessedType = 'agent';
+  else if (finalKey.startsWith('team_')) guessedType = 'team';
+  else if (finalKey.startsWith('category_')) guessedType = 'category';
+  else if (finalKey.startsWith('system_')) guessedType = 'system';
+
+  const insertRes = await db.query(
+    `INSERT INTO subjects (subject_type, subject_key, display_name) VALUES ($1, $2, $3) RETURNING id`,
+    [guessedType, finalKey, finalKey]
+  );
+  return insertRes.rows[0].id;
+}
+
 export function registerTools(server: McpServer) {
   server.registerTool(
     "memory_remember",
     {
       description: "Store persistent long-term memory about the user, project, or task context. Use this whenever you learn important information that should remain useful across future conversations.\n\n[CRITICAL RULES]\n1. 'subject_key' MUST be a valid existing key.\n2. Common keys: 'user_hoon' (Main User), 'project_centragens', 'project_yoontube', 'agent_claude', 'category_marketing', 'category_development'.\n3. If you are unsure of the subject_key, ask the user before saving.\n4. Do not use for temporary or one-off information.",
       inputSchema: {
-        subject_key: z.string(),
+        subject_key: z.string().optional().describe("Key of the subject (e.g., 'user_hoon'). If omitted, defaults to 'system_global'."),
         project_key: z.string().optional(),
         content: z.string(),
         memory_type: z.enum(['preference', 'profile', 'constraint', 'state', 'relationship']),
@@ -22,20 +42,17 @@ export function registerTools(server: McpServer) {
       }
     },
     async (args) => {
-      const subRes = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.subject_key]);
-      if (subRes.rows.length === 0) throw new Error(`Subject ${args.subject_key} not found`);
+      const subId = await getOrCreateSubject(args.subject_key, 'system');
       
       let projId = null;
       if (args.project_key) {
-        const projRes = await db.query("SELECT id FROM subjects WHERE subject_key = $1 AND subject_type = 'project'", [args.project_key]);
-        if (projRes.rows.length === 0) throw new Error(`Project ${args.project_key} not found or is not of type 'project'`);
-        projId = projRes.rows[0].id;
+        projId = await getOrCreateSubject(args.project_key, 'project');
       }
 
       await db.query(
         `INSERT INTO memories (subject_id, project_subject_id, content, summary, memory_type, memory_scope, source_type, importance_score, confidence_score, tags, expires_at) 
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-        [subRes.rows[0].id, projId, args.content, args.summary, args.memory_type, args.memory_scope, args.source_type, args.importance_score, args.confidence_score, args.tags, args.expires_at]
+        [subId, projId, args.content, args.summary, args.memory_type, args.memory_scope, args.source_type, args.importance_score, args.confidence_score, args.tags, args.expires_at]
       );
       return { content: [{ type: "text", text: "Memory successfully recorded." }] };
     }
@@ -46,14 +63,13 @@ export function registerTools(server: McpServer) {
     {
       description: "Recall relevant long-term memories before or during a task. Use this to retrieve prior context about the current user, project, or topic so responses remain consistent and informed.\n\n[CRITICAL RULES]\n1. 'subject_key' requires a valid key. Common keys: 'user_hoon' (Main User), 'project_centragens', 'project_yoontube'.\n2. If unsure, start by recalling from 'user_hoon' or ask the user.",
       inputSchema: {
-        subject_key: z.string(),
+        subject_key: z.string().optional().describe("Key of the subject to recall. Defaults to 'system_global' if omitted."),
         query: z.string(),
         limit: z.number().optional().default(5),
       }
     },
     async (args) => {
-      const subRes = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.subject_key]);
-      if (subRes.rows.length === 0) throw new Error(`Subject ${args.subject_key} not found`);
+      const subId = await getOrCreateSubject(args.subject_key, 'system');
 
       const memories = await db.query(
         `SELECT m.id, m.content, m.summary, m.memory_type, m.memory_scope, m.created_at, m.confidence_score, m.importance_score, m.tags, s.display_name as project_name
@@ -61,7 +77,7 @@ export function registerTools(server: McpServer) {
          LEFT JOIN subjects s ON m.project_subject_id = s.id
          WHERE m.subject_id = $1 AND (m.content ILIKE $2 OR COALESCE(m.summary, '') ILIKE $2 OR EXISTS (SELECT 1 FROM unnest(m.tags) t WHERE t ILIKE $3))
          ORDER BY m.importance_score DESC, m.created_at DESC LIMIT $4`,
-        [subRes.rows[0].id, `%${args.query}%`, `%${args.query}%`, args.limit]
+        [subId, `%${args.query}%`, `%${args.query}%`, args.limit]
       );
 
       if (memories.rows.length === 0) {
@@ -96,22 +112,19 @@ export function registerTools(server: McpServer) {
       inputSchema: {
         title: z.string(),
         task_type: z.string(),
-        owner_key: z.string(),
-        project_key: z.string(),
+        owner_key: z.string().optional().describe("Owner of the task, defaults to 'user_hoon' if omitted"),
+        project_key: z.string().optional().describe("Project key, defaults to 'system_global' if omitted"),
         description: z.string().optional(),
       }
     },
     async (args) => {
-      const owner = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.owner_key]);
-      const project = await db.query("SELECT id FROM subjects WHERE subject_key = $1 AND subject_type = 'project'", [args.project_key]);
-      
-      if (!owner.rows[0]) throw new Error(`Owner ${args.owner_key} not found`);
-      if (!project.rows[0]) throw new Error(`Project ${args.project_key} not found or is not of type 'project'`);
+      const ownerId = await getOrCreateSubject(args.owner_key || 'user_hoon', 'person');
+      const projId = await getOrCreateSubject(args.project_key, 'project');
 
       const res = await db.query(
         `INSERT INTO tasks (title, task_type, owner_subject_id, project_subject_id, description) 
          VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-        [args.title, args.task_type, owner.rows[0].id, project.rows[0].id, args.description]
+        [args.title, args.task_type, ownerId, projId, args.description]
       );
       return { content: [{ type: "text", text: `Task created with ID: ${res.rows[0].id}` }] };
     }
@@ -294,6 +307,35 @@ export function registerTools(server: McpServer) {
   );
 
   server.registerTool(
+    "memory_register_subject",
+    {
+      description: "Explicitly register a new subject. Use this to track a new project, user, or category before logging memories.",
+      inputSchema: {
+        subject_key: z.string().describe("Unique key, e.g., 'project_new_app', 'user_john'"),
+        subject_type: z.enum(['person', 'agent', 'project', 'team', 'system', 'category', 'heuristic']),
+        display_name: z.string().describe("Human readable name"),
+        metadata: z.record(z.any()).optional().default({}),
+      }
+    },
+    async (args) => {
+      const res = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.subject_key]);
+      if (res.rows.length > 0) {
+        await db.query(
+          "UPDATE subjects SET subject_type = $1, display_name = $2, metadata = $3 WHERE subject_key = $4",
+          [args.subject_type, args.display_name, args.metadata, args.subject_key]
+        );
+        return { content: [{ type: "text", text: `Subject '${args.subject_key}' updated.` }] };
+      }
+
+      await db.query(
+        `INSERT INTO subjects (subject_type, subject_key, display_name, metadata) VALUES ($1, $2, $3, $4)`,
+        [args.subject_type, args.subject_key, args.display_name, args.metadata]
+      );
+      return { content: [{ type: "text", text: `Subject '${args.subject_key}' created.` }] };
+    }
+  );
+
+  server.registerTool(
     "memory_log_raw",
     {
       description: "Log an unprocessed observation, conversation snippet, or reflection. Use this to capture raw data that can be refined into structured memories later.",
@@ -311,14 +353,12 @@ export function registerTools(server: McpServer) {
     async (args) => {
       let subId = null;
       if (args.subject_key) {
-        const sub = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.subject_key]);
-        subId = sub.rows[0]?.id || null;
+        subId = await getOrCreateSubject(args.subject_key, 'system');
       }
 
       let projId = null;
       if (args.project_key) {
-        const proj = await db.query("SELECT id FROM subjects WHERE subject_key = $1 AND subject_type = 'project'", [args.project_key]);
-        projId = proj.rows[0]?.id || null;
+        projId = await getOrCreateSubject(args.project_key, 'project');
       }
 
       const res = await db.query(

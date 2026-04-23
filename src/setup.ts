@@ -299,6 +299,7 @@ DB_NAME=${answers.dbName}${sshConfig}
       ('project',  'project_yoontube',      'YoonTube', '{}'),
       ('team',     'team_triplealab',       'TripleA Lab', '{}'),
       ('system',   'system_orchestrator',   'Harness-Main', '{"version": "1.0.0"}'),
+      ('system',   'system_global',         'Global Context', '{}'),
       ('category', 'category_marketing',    'Marketing', '{}'),
       ('category', 'category_branding',     'Branding', '{}'),
       ('category', 'category_healthcare',   'Healthcare / Wellness', '{}')
