@@ -24,6 +24,125 @@ export async function getOrCreateSubject(subject_key: string | undefined | null,
 }
 
 export function registerTools(server: McpServer) {
+
+  // ─────────────────────────────────────────────────────────────
+  // memory_startup — Smart Briefing (MUST be called first)
+  // ─────────────────────────────────────────────────────────────
+  server.registerTool(
+    "memory_startup",
+    {
+      description: "🚨 MANDATORY FIRST CALL — Run this tool at the very start of every new session before doing anything else.\n\nReturns a structured briefing containing:\n- User profile & preferences\n- Recent session summaries (last 3)\n- Active project list with latest context\n- Top learning patterns\n\nThis ensures you have full context from prior sessions. Do NOT skip this step.",
+      inputSchema: {
+        user_key: z.string().optional().default("user_hoon").describe("User subject key. Defaults to 'user_hoon'."),
+      }
+    },
+    async (args) => {
+      const sections: string[] = [];
+      sections.push("═══════════════════════════════════════");
+      sections.push("🧠 MEMORY BRIEFING — Session Context");
+      sections.push("═══════════════════════════════════════\n");
+
+      // 1. User Profile & Preferences
+      try {
+        const userId = await getOrCreateSubject(args.user_key, 'person');
+        const profileRes = await db.query(
+          `SELECT content, summary, memory_type, tags, importance_score
+           FROM memories
+           WHERE subject_id = $1 AND memory_type IN ('profile', 'preference', 'constraint')
+           ORDER BY importance_score DESC, updated_at DESC
+           LIMIT 8`,
+          [userId]
+        );
+        if (profileRes.rows.length > 0) {
+          sections.push("👤 USER PROFILE");
+          sections.push("───────────────");
+          profileRes.rows.forEach(r => {
+            const label = r.summary || r.content.substring(0, 120);
+            sections.push(`• [${r.memory_type}] ${label}`);
+            if (r.tags?.length > 0) sections.push(`  tags: ${r.tags.join(', ')}`);
+          });
+          sections.push("");
+        }
+      } catch (e) { /* silent fallback */ }
+
+      // 2. Recent Session Summaries (latest state memories)
+      try {
+        const sessionRes = await db.query(
+          `SELECT m.content, m.summary, m.tags, m.created_at,
+                  s.display_name as project_name
+           FROM memories m
+           LEFT JOIN subjects s ON m.project_subject_id = s.id
+           WHERE m.source_type = 'session' AND m.memory_type = 'state'
+           ORDER BY m.created_at DESC
+           LIMIT 3`
+        );
+        if (sessionRes.rows.length > 0) {
+          sections.push("📋 RECENT SESSIONS");
+          sections.push("──────────────────");
+          sessionRes.rows.forEach((r, i) => {
+            const date = new Date(r.created_at).toLocaleDateString('ko-KR');
+            const project = r.project_name ? ` [${r.project_name}]` : '';
+            sections.push(`${i + 1}. ${date}${project}`);
+            sections.push(`   ${r.summary || r.content.substring(0, 150)}`);
+            if (r.tags?.length > 0) sections.push(`   tags: ${r.tags.join(', ')}`);
+          });
+          sections.push("");
+        }
+      } catch (e) { /* silent fallback */ }
+
+      // 3. Active Projects
+      try {
+        const projRes = await db.query(
+          `SELECT s.subject_key, s.display_name,
+                  (SELECT content FROM memories WHERE project_subject_id = s.id ORDER BY updated_at DESC LIMIT 1) as latest_memory
+           FROM subjects s
+           WHERE s.subject_type = 'project' AND s.is_active = TRUE
+           ORDER BY s.updated_at DESC
+           LIMIT 6`
+        );
+        if (projRes.rows.length > 0) {
+          sections.push("📂 ACTIVE PROJECTS");
+          sections.push("──────────────────");
+          projRes.rows.forEach(r => {
+            const latest = r.latest_memory ? ` — ${r.latest_memory.substring(0, 80)}` : '';
+            sections.push(`• ${r.display_name} (${r.subject_key})${latest}`);
+          });
+          sections.push("");
+        }
+      } catch (e) { /* silent fallback */ }
+
+      // 4. Top Learnings
+      try {
+        const learnRes = await db.query(
+          `SELECT content, summary, learning_type, impact_score, tags
+           FROM task_learnings
+           ORDER BY impact_score DESC, usage_count DESC
+           LIMIT 5`
+        );
+        if (learnRes.rows.length > 0) {
+          sections.push("💡 TOP LEARNINGS");
+          sections.push("────────────────");
+          learnRes.rows.forEach(r => {
+            const label = r.summary || r.content.substring(0, 120);
+            sections.push(`• [${r.learning_type}] (impact: ${r.impact_score}) ${label}`);
+          });
+          sections.push("");
+        }
+      } catch (e) { /* silent fallback */ }
+
+      // 5. Usage Instructions
+      sections.push("📌 INSTRUCTIONS");
+      sections.push("───────────────");
+      sections.push("• Use memory_recall to search for specific past context");
+      sections.push("• Use memory_remember to save NEW important facts (one fact per call)");
+      sections.push("• Use memory_learn to record reusable patterns from completed work");
+      sections.push("• Save facts atomically: one clear fact per memory_remember call");
+      sections.push("═══════════════════════════════════════");
+
+      return { content: [{ type: "text", text: sections.join("\n") }] };
+    }
+  );
+
   server.registerTool(
     "memory_remember",
     {
