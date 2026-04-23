@@ -4,9 +4,14 @@ import fs from 'fs';
 import dotenv from 'dotenv';
 import path from 'path';
 
-dotenv.config({
-  path: path.resolve('/Users/hoon/Documents/Playgrounds/mcp-agents-memory/.env')
-});
+const defaultEnvPath = path.resolve(process.cwd(), '.env');
+const fallbackEnvPath = '/Users/hoon/Documents/Playgrounds/mcp-agents-memory/.env';
+
+if (fs.existsSync(defaultEnvPath)) {
+  dotenv.config({ path: defaultEnvPath });
+} else {
+  dotenv.config({ path: fallbackEnvPath });
+}
 
 const { Pool } = pg;
 

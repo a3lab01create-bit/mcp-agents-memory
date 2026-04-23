@@ -12,11 +12,13 @@ export function registerTools(server: McpServer) {
         project_key: z.string().optional(),
         content: z.string(),
         memory_type: z.enum(['preference', 'profile', 'constraint', 'state', 'relationship']),
-        memory_scope: z.enum(['global', 'project', 'local']).default('global'),
+        memory_scope: z.enum(['global', 'project', 'local', 'category']).default('global'),
         source_type: z.enum(['user', 'agent', 'inferred', 'session', 'task', 'system']),
         importance_score: z.number().min(1).max(10).optional().default(5),
+        confidence_score: z.number().min(1).max(10).optional().default(5),
         summary: z.string().optional(),
         tags: z.array(z.string()).optional().default([]),
+        expires_at: z.string().optional(),
       }
     },
     async (args) => {
@@ -31,9 +33,9 @@ export function registerTools(server: McpServer) {
       }
 
       await db.query(
-        `INSERT INTO memories (subject_id, project_subject_id, content, summary, memory_type, memory_scope, source_type, importance_score, tags) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [subRes.rows[0].id, projId, args.content, args.summary, args.memory_type, args.memory_scope, args.source_type, args.importance_score, args.tags]
+        `INSERT INTO memories (subject_id, project_subject_id, content, summary, memory_type, memory_scope, source_type, importance_score, confidence_score, tags, expires_at) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [subRes.rows[0].id, projId, args.content, args.summary, args.memory_type, args.memory_scope, args.source_type, args.importance_score, args.confidence_score, args.tags, args.expires_at]
       );
       return { content: [{ type: "text", text: "Memory successfully recorded." }] };
     }
@@ -54,12 +56,12 @@ export function registerTools(server: McpServer) {
       if (subRes.rows.length === 0) throw new Error(`Subject ${args.subject_key} not found`);
 
       const memories = await db.query(
-        `SELECT m.id, m.content, m.summary, m.memory_type, m.memory_scope, m.created_at, s.display_name as project_name
+        `SELECT m.id, m.content, m.summary, m.memory_type, m.memory_scope, m.created_at, m.confidence_score, m.importance_score, m.tags, s.display_name as project_name
          FROM memories m
          LEFT JOIN subjects s ON m.project_subject_id = s.id
-         WHERE m.subject_id = $1 AND (m.content ILIKE $2 OR COALESCE(m.summary, '') ILIKE $2)
-         ORDER BY m.importance_score DESC, m.created_at DESC LIMIT $3`,
-        [subRes.rows[0].id, `%${args.query}%`, args.limit]
+         WHERE m.subject_id = $1 AND (m.content ILIKE $2 OR COALESCE(m.summary, '') ILIKE $2 OR EXISTS (SELECT 1 FROM unnest(m.tags) t WHERE t ILIKE $3))
+         ORDER BY m.importance_score DESC, m.created_at DESC LIMIT $4`,
+        [subRes.rows[0].id, `%${args.query}%`, `%${args.query}%`, args.limit]
       );
 
       if (memories.rows.length === 0) {
@@ -74,8 +76,9 @@ export function registerTools(server: McpServer) {
 
       let formatted = "🧠 Recalled Memories:\n\n";
       memories.rows.forEach(m => {
-        formatted += `[ID: ${m.id}] Type: ${m.memory_type} | Scope: ${m.memory_scope}\n`;
+        formatted += `[ID: ${m.id}] Type: ${m.memory_type} | Scope: ${m.memory_scope} | Imp: ${m.importance_score} | Conf: ${m.confidence_score}\n`;
         if (m.project_name) formatted += `Project: ${m.project_name}\n`;
+        if (m.tags && m.tags.length > 0) formatted += `Tags: ${m.tags.join(", ")}\n`;
         if (m.summary) formatted += `Summary: ${m.summary}\n`;
         formatted += `Content: ${m.content}\n`;
         formatted += `Date: ${new Date(m.created_at).toLocaleString()}\n`;
@@ -193,13 +196,16 @@ export function registerTools(server: McpServer) {
         learning_type: z.enum(['success_pattern', 'failure_pattern', 'heuristic', 'routing_rule']),
         content: z.string(),
         summary: z.string().optional(),
+        confidence_score: z.number().min(1).max(10).optional().default(5),
+        impact_score: z.number().min(1).max(10).optional().default(5),
+        tags: z.array(z.string()).optional().default([]),
       }
     },
     async (args) => {
       await db.query(
-        `INSERT INTO task_learnings (task_id, task_type, learning_type, content, summary) 
-         VALUES ($1, $2, $3, $4, $5)`,
-        [args.task_id, args.task_type, args.learning_type, args.content, args.summary]
+        `INSERT INTO task_learnings (task_id, task_type, learning_type, content, summary, confidence_score, impact_score, tags) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [args.task_id, args.task_type, args.learning_type, args.content, args.summary, args.confidence_score, args.impact_score, args.tags]
       );
       return { content: [{ type: "text", text: "Learning pattern recorded." }] };
     }
@@ -210,16 +216,30 @@ export function registerTools(server: McpServer) {
     {
       description: "Retrieve past learning patterns. Use this before starting a new task of a specific type to discover known best practices, previous mistakes to avoid, and proven heuristics.",
       inputSchema: {
-        task_type: z.string(),
+        task_type: z.string().optional(),
+        learning_type: z.enum(['success_pattern', 'failure_pattern', 'heuristic', 'routing_rule']).optional(),
         limit: z.number().optional().default(5),
       }
     },
     async (args) => {
-      const learnings = await db.query(
-        `SELECT id, content, summary, learning_type, created_at FROM task_learnings 
-         WHERE task_type = $1 OR content ILIKE $2 ORDER BY created_at DESC LIMIT $3`,
-        [args.task_type, `%${args.task_type}%`, args.limit]
-      );
+      let queryStr = `SELECT id, content, summary, learning_type, created_at, confidence_score, impact_score, tags FROM task_learnings WHERE 1=1`;
+      let params: any[] = [];
+      let paramCount = 1;
+
+      if (args.task_type) {
+        queryStr += ` AND (task_type = $${paramCount} OR content ILIKE $${paramCount+1} OR EXISTS (SELECT 1 FROM unnest(tags) t WHERE t ILIKE $${paramCount+1}))`;
+        params.push(args.task_type, `%${args.task_type}%`);
+        paramCount += 2;
+      }
+      if (args.learning_type) {
+        queryStr += ` AND learning_type = $${paramCount}`;
+        params.push(args.learning_type);
+        paramCount++;
+      }
+      queryStr += ` ORDER BY created_at DESC LIMIT $${paramCount}`;
+      params.push(args.limit);
+
+      const learnings = await db.query(queryStr, params);
 
       if (learnings.rows.length === 0) {
         return { content: [{ type: "text", text: "No relevant learnings found." }] };
@@ -233,7 +253,8 @@ export function registerTools(server: McpServer) {
 
       let formatted = "📚 Retrieved Learnings:\n\n";
       learnings.rows.forEach(l => {
-        formatted += `[ID: ${l.id}] Type: ${l.learning_type}\n`;
+        formatted += `[ID: ${l.id}] Type: ${l.learning_type} | Imp: ${l.impact_score} | Conf: ${l.confidence_score}\n`;
+        if (l.tags && l.tags.length > 0) formatted += `Tags: ${l.tags.join(", ")}\n`;
         if (l.summary) formatted += `Summary: ${l.summary}\n`;
         formatted += `Content: ${l.content}\n`;
         formatted += `Date: ${new Date(l.created_at).toLocaleString()}\n`;
@@ -269,6 +290,43 @@ export function registerTools(server: McpServer) {
       formatted += `Created: ${new Date(s.created_at).toLocaleString()}\n`;
       
       return { content: [{ type: "text", text: formatted }] };
+    }
+  );
+
+  server.registerTool(
+    "memory_log_raw",
+    {
+      description: "Log an unprocessed observation, conversation snippet, or reflection. Use this to capture raw data that can be refined into structured memories later.",
+      inputSchema: {
+        subject_key: z.string().optional(),
+        project_key: z.string().optional(),
+        session_id: z.number().optional(),
+        task_id: z.number().optional(),
+        content: z.string(),
+        raw_type: z.enum(['conversation', 'message', 'observation', 'draft', 'reflection', 'event']).default('observation'),
+        source_type: z.enum(['user', 'agent', 'system', 'tool']).default('agent'),
+        tags: z.array(z.string()).optional().default([]),
+      }
+    },
+    async (args) => {
+      let subId = null;
+      if (args.subject_key) {
+        const sub = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [args.subject_key]);
+        subId = sub.rows[0]?.id || null;
+      }
+
+      let projId = null;
+      if (args.project_key) {
+        const proj = await db.query("SELECT id FROM subjects WHERE subject_key = $1 AND subject_type = 'project'", [args.project_key]);
+        projId = proj.rows[0]?.id || null;
+      }
+
+      const res = await db.query(
+        `INSERT INTO raw_memories (subject_id, project_subject_id, session_id, task_id, content, raw_type, source_type, tags) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+        [subId, projId, args.session_id, args.task_id, args.content, args.raw_type, args.source_type, args.tags]
+      );
+      return { content: [{ type: "text", text: `Raw memory logged with ID: ${res.rows[0].id}` }] };
     }
   );
 }
