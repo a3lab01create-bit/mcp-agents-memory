@@ -35,12 +35,25 @@ SSH_KEY_PATH=${sshAnswers.sshKey}`;
     sshConfig = "\nSSH_ENABLED=false";
   }
 
+  // OpenAI API Key (required for semantic search embeddings)
+  console.log("\n🧠 Semantic Search Setup");
+  console.log("   Embeddings use OpenAI text-embedding-3-small.");
+  console.log("   Get your key at: https://platform.openai.com/api-keys\n");
+  const aiAnswers = await inquirer.prompt([
+    { type: 'password', name: 'openaiKey', message: 'OpenAI API Key? (sk-...)', mask: '*' },
+  ]);
+
+  const openaiConfig = aiAnswers.openaiKey ? `\nOPENAI_API_KEY=${aiAnswers.openaiKey}` : '';
+  if (!aiAnswers.openaiKey) {
+    console.log("⚠️  No API key provided. Semantic search will be disabled until you add OPENAI_API_KEY to .env");
+  }
+
   const envContent = `
 DB_HOST=${answers.dbHost}
 DB_PORT=${answers.dbPort}
 DB_USER=${answers.dbUser}
 DB_PASS=${answers.dbPass}
-DB_NAME=${answers.dbName}${sshConfig}
+DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}
 `;
 
   fs.writeFileSync('.env', envContent.trim());
