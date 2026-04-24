@@ -35,9 +35,9 @@ SSH_KEY_PATH=${sshAnswers.sshKey}`;
     sshConfig = "\nSSH_ENABLED=false";
   }
 
-  // OpenAI API Key (required for semantic search embeddings)
-  console.log("\n🧠 Semantic Search Setup");
-  console.log("   Embeddings use OpenAI text-embedding-3-small.");
+  // OpenAI API Key (required for semantic search + librarian)
+  console.log("\n🧠 AI Setup (Embeddings + Librarian)");
+  console.log("   Used for: semantic search (embeddings) + fact extraction (librarian)");
   console.log("   Get your key at: https://platform.openai.com/api-keys\n");
   const aiAnswers = await inquirer.prompt([
     { type: 'password', name: 'openaiKey', message: 'OpenAI API Key? (sk-...)', mask: '*' },
@@ -45,15 +45,18 @@ SSH_KEY_PATH=${sshAnswers.sshKey}`;
 
   const openaiConfig = aiAnswers.openaiKey ? `\nOPENAI_API_KEY=${aiAnswers.openaiKey}` : '';
   if (!aiAnswers.openaiKey) {
-    console.log("⚠️  No API key provided. Semantic search will be disabled until you add OPENAI_API_KEY to .env");
+    console.log("⚠️  No API key provided. Semantic search & Librarian will be disabled until you add OPENAI_API_KEY to .env");
   }
+
+  // Librarian model selection
+  const librarianConfig = `\nLIBRARIAN_MODEL=gpt-4o-mini`;
 
   const envContent = `
 DB_HOST=${answers.dbHost}
 DB_PORT=${answers.dbPort}
 DB_USER=${answers.dbUser}
 DB_PASS=${answers.dbPass}
-DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}
+DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}${librarianConfig}
 `;
 
   fs.writeFileSync('.env', envContent.trim());
@@ -79,14 +82,22 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}
     `);
 
     // ---------------------------------------------------------
-    // 2. Core Tables
+    // 2. Vector Support (pgvector) — must come before tables
+    // ---------------------------------------------------------
+    console.log("🧬 Setting up vector support...");
+    await db.query(`CREATE EXTENSION IF NOT EXISTS vector`);
+
+    // ---------------------------------------------------------
+    // 3. Core Tables (v0.4 — simplified schema)
     // ---------------------------------------------------------
     console.log("📁 Creating tables...");
+
+    // subjects — 주체 관리 (유지)
     await db.query(`
       CREATE TABLE IF NOT EXISTS subjects (
           id SERIAL PRIMARY KEY,
           subject_type VARCHAR(20) NOT NULL
-              CHECK (subject_type IN ('person', 'agent', 'project', 'team', 'system', 'category', 'heuristic')),
+              CHECK (subject_type IN ('person', 'agent', 'project', 'team', 'system', 'category')),
           subject_key VARCHAR(100) NOT NULL UNIQUE,
           display_name VARCHAR(100) NOT NULL,
           is_active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -94,126 +105,75 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+    `);
 
-      CREATE TABLE IF NOT EXISTS tasks (
+    // facts — 통합 메모리 테이블 (신규)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS facts (
           id SERIAL PRIMARY KEY,
-          title VARCHAR(200) NOT NULL,
-          task_type VARCHAR(50) NOT NULL,
-          owner_subject_id INTEGER NOT NULL REFERENCES subjects(id),
-          project_subject_id INTEGER NOT NULL REFERENCES subjects(id),
-          status VARCHAR(20) NOT NULL DEFAULT 'todo'
-              CHECK (status IN ('todo', 'doing', 'done', 'failed', 'canceled')),
-          description TEXT,
-          outcome_summary TEXT,
-          success_score INTEGER CHECK (success_score BETWEEN 1 AND 10),
-          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-          started_at TIMESTAMPTZ,
-          ended_at TIMESTAMPTZ,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          CONSTRAINT chk_task_time_order
-              CHECK (ended_at IS NULL OR started_at IS NULL OR ended_at >= started_at)
-      );
 
-      CREATE TABLE IF NOT EXISTS sessions (
-          id SERIAL PRIMARY KEY,
-          task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-          orchestrator_subject_id INTEGER REFERENCES subjects(id),
-          started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          ended_at TIMESTAMPTZ,
-          final_outcome VARCHAR(20)
-              CHECK (final_outcome IN ('success', 'failure', 'partial')),
-          summary TEXT,
-          model_name VARCHAR(100),
-          provider VARCHAR(100),
-          token_usage INTEGER,
-          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          CONSTRAINT chk_session_time_order
-              CHECK (ended_at IS NULL OR ended_at >= started_at)
-      );
-
-      CREATE TABLE IF NOT EXISTS memories (
-          id SERIAL PRIMARY KEY,
+          -- 소유자 & 프로젝트
           subject_id INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
           project_subject_id INTEGER REFERENCES subjects(id),
+
+          -- 핵심 내용
           content TEXT NOT NULL,
-          summary TEXT,
-          memory_type VARCHAR(20) NOT NULL
-              CHECK (memory_type IN ('preference', 'profile', 'constraint', 'state', 'relationship')),
-          memory_scope VARCHAR(20) NOT NULL DEFAULT 'global'
-              CHECK (memory_scope IN ('global', 'category', 'project', 'local')),
-          source_type VARCHAR(20) NOT NULL
-              CHECK (source_type IN ('user', 'agent', 'inferred', 'session', 'task', 'system')),
-          confidence_score INTEGER NOT NULL DEFAULT 5
-              CHECK (confidence_score BETWEEN 1 AND 10),
-          importance_score INTEGER NOT NULL DEFAULT 5
-              CHECK (importance_score BETWEEN 1 AND 10),
+          source_text TEXT,
+
+          -- 분류
+          fact_type VARCHAR(20) NOT NULL
+              CHECK (fact_type IN ('preference', 'profile', 'state', 'skill', 'decision', 'learning', 'relationship')),
+
+          -- 품질 점수
+          confidence SMALLINT NOT NULL DEFAULT 7
+              CHECK (confidence BETWEEN 1 AND 10),
+          importance SMALLINT NOT NULL DEFAULT 5
+              CHECK (importance BETWEEN 1 AND 10),
+
+          -- 검색 & 태깅
+          tags TEXT[] DEFAULT '{}',
+          embedding vector(1536),
+
+          -- 추적
+          source VARCHAR(20) NOT NULL DEFAULT 'librarian'
+              CHECK (source IN ('librarian', 'user', 'agent', 'system', 'migration')),
           access_count INTEGER NOT NULL DEFAULT 0,
           last_accessed_at TIMESTAMPTZ,
-          expires_at TIMESTAMPTZ,
-          tags TEXT[] DEFAULT '{}',
-          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+          superseded_by INTEGER REFERENCES facts(id),
+          is_active BOOLEAN NOT NULL DEFAULT TRUE,
+
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS task_learnings (
-          id SERIAL PRIMARY KEY,
-          task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
-          task_type VARCHAR(50) NOT NULL,
-          learning_type VARCHAR(20) NOT NULL
-              CHECK (learning_type IN ('success_pattern', 'failure_pattern', 'heuristic', 'routing_rule')),
-          content TEXT NOT NULL,
-          summary TEXT,
-          confidence_score INTEGER NOT NULL DEFAULT 5
-              CHECK (confidence_score BETWEEN 1 AND 10),
-          impact_score INTEGER NOT NULL DEFAULT 5
-              CHECK (impact_score BETWEEN 1 AND 10),
-          usage_count INTEGER NOT NULL DEFAULT 0,
-          last_used_at TIMESTAMPTZ,
-          tags TEXT[] DEFAULT '{}',
-          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS raw_memories (
-          id SERIAL PRIMARY KEY,
-          subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL,
-          project_subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL,
-          session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
-          task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
-          raw_type VARCHAR(30) NOT NULL DEFAULT 'conversation'
-              CHECK (raw_type IN ('conversation', 'message', 'observation', 'draft', 'reflection', 'event')),
-          content TEXT NOT NULL,
-          source_type VARCHAR(20) NOT NULL DEFAULT 'agent'
-              CHECK (source_type IN ('user', 'agent', 'system', 'tool')),
-          processed BOOLEAN NOT NULL DEFAULT FALSE,
-          processed_at TIMESTAMPTZ,
-          tags TEXT[] DEFAULT '{}',
-          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS subject_relationships (
-          id SERIAL PRIMARY KEY,
-          from_subject_id INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
-          to_subject_id INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
-          relationship_type VARCHAR(50) NOT NULL
-              CHECK (relationship_type IN ('owns', 'delegates_to', 'advises', 'reports_to', 'collaborates', 'belongs_to', 'related_to', 'derived_from')),
-          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          CONSTRAINT chk_no_self_relationship CHECK (from_subject_id <> to_subject_id),
-          CONSTRAINT uq_subject_relationship UNIQUE (from_subject_id, to_subject_id, relationship_type)
       );
     `);
 
     // ---------------------------------------------------------
-    // 3. Trigger Logic / Validation
+    // 4. Triggers
     // ---------------------------------------------------------
-    console.log("⚙️ Setting up triggers and validation...");
+    console.log("⚙️ Setting up triggers...");
+
+    // updated_at trigger for subjects and facts
+    await db.query(`
+      DO $$
+      DECLARE
+          t text;
+      BEGIN
+          FOR t IN
+              SELECT table_name
+              FROM information_schema.tables
+              WHERE table_schema = 'public'
+                AND table_name IN ('subjects', 'facts')
+          LOOP
+              EXECUTE format('DROP TRIGGER IF EXISTS trg_updated_at ON %I', t);
+              EXECUTE format(
+                  'CREATE TRIGGER trg_updated_at BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION set_updated_at()',
+                  t
+              );
+          END LOOP;
+      END $$;
+    `);
+
+    // Validate project_subject_id references a 'project' type subject
     await db.query(`
       CREATE OR REPLACE FUNCTION validate_project_subject_type()
       RETURNS TRIGGER AS $$
@@ -227,57 +187,11 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}
       END;
       $$ LANGUAGE plpgsql;
 
-      DROP TRIGGER IF EXISTS trg_validate_project_type_memories ON memories;
-      CREATE TRIGGER trg_validate_project_type_memories
-      BEFORE INSERT OR UPDATE ON memories
+      DROP TRIGGER IF EXISTS trg_validate_project_type_facts ON facts;
+      CREATE TRIGGER trg_validate_project_type_facts
+      BEFORE INSERT OR UPDATE ON facts
       FOR EACH ROW
       EXECUTE FUNCTION validate_project_subject_type();
-
-      DROP TRIGGER IF EXISTS trg_validate_project_type_raw_memories ON raw_memories;
-      CREATE TRIGGER trg_validate_project_type_raw_memories
-      BEFORE INSERT OR UPDATE ON raw_memories
-      FOR EACH ROW
-      EXECUTE FUNCTION validate_project_subject_type();
-
-      DO $$
-      DECLARE
-          t text;
-      BEGIN
-          FOR t IN
-              SELECT table_name
-              FROM information_schema.tables
-              WHERE table_schema = 'public'
-                AND table_name IN ('subjects', 'tasks', 'sessions', 'memories', 'task_learnings')
-          LOOP
-              EXECUTE format('DROP TRIGGER IF EXISTS trg_updated_at ON %I', t);
-              EXECUTE format(
-                  'CREATE TRIGGER trg_updated_at BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION set_updated_at()',
-                  t
-              );
-          END LOOP;
-      END $$;
-    `);
-
-    // ---------------------------------------------------------
-    // 4. Vector Support (pgvector)
-    // ---------------------------------------------------------
-    console.log("🧬 Setting up vector support...");
-    await db.query(`CREATE EXTENSION IF NOT EXISTS vector`);
-
-    await db.query(`
-      ALTER TABLE memories
-        ADD COLUMN IF NOT EXISTS embedding vector(1536);
-
-      ALTER TABLE task_learnings
-        ADD COLUMN IF NOT EXISTS embedding vector(1536);
-    `);
-
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_memories_embedding
-        ON memories USING hnsw (embedding vector_cosine_ops);
-
-      CREATE INDEX IF NOT EXISTS idx_task_learnings_embedding
-        ON task_learnings USING hnsw (embedding vector_cosine_ops);
     `);
 
     // ---------------------------------------------------------
@@ -285,43 +199,89 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}
     // ---------------------------------------------------------
     console.log("🔍 Creating indices...");
     await db.query(`
+      -- subjects
       CREATE INDEX IF NOT EXISTS idx_subjects_type ON subjects(subject_type);
       CREATE INDEX IF NOT EXISTS idx_subjects_key ON subjects(subject_key);
       CREATE INDEX IF NOT EXISTS idx_subjects_active ON subjects(is_active);
 
-      CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-      CREATE INDEX IF NOT EXISTS idx_tasks_type ON tasks(task_type);
-      CREATE INDEX IF NOT EXISTS idx_tasks_project_subject_id ON tasks(project_subject_id);
-
-      CREATE INDEX IF NOT EXISTS idx_sessions_task_id ON sessions(task_id);
-      CREATE INDEX IF NOT EXISTS idx_sessions_model_name ON sessions(model_name);
-
-      CREATE INDEX IF NOT EXISTS idx_memories_subject_id ON memories(subject_id);
-      CREATE INDEX IF NOT EXISTS idx_memories_project_subject_id ON memories(project_subject_id);
-      CREATE INDEX IF NOT EXISTS idx_memories_memory_type ON memories(memory_type);
-      CREATE INDEX IF NOT EXISTS idx_memories_memory_scope ON memories(memory_scope);
-      CREATE INDEX IF NOT EXISTS idx_memories_importance_score ON memories(importance_score);
-      CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories USING GIN(tags);
-
-      CREATE INDEX IF NOT EXISTS idx_task_learnings_type ON task_learnings(task_type);
-      CREATE INDEX IF NOT EXISTS idx_task_learnings_learning_type ON task_learnings(learning_type);
-      CREATE INDEX IF NOT EXISTS idx_task_learnings_tags ON task_learnings USING GIN(tags);
-
-      CREATE INDEX IF NOT EXISTS idx_raw_memories_subject_id ON raw_memories(subject_id);
-      CREATE INDEX IF NOT EXISTS idx_raw_memories_project_subject_id ON raw_memories(project_subject_id);
-      CREATE INDEX IF NOT EXISTS idx_raw_memories_session_id ON raw_memories(session_id);
-      CREATE INDEX IF NOT EXISTS idx_raw_memories_task_id ON raw_memories(task_id);
-      CREATE INDEX IF NOT EXISTS idx_raw_memories_processed ON raw_memories(processed);
-      CREATE INDEX IF NOT EXISTS idx_raw_memories_raw_type ON raw_memories(raw_type);
-      CREATE INDEX IF NOT EXISTS idx_raw_memories_tags ON raw_memories USING GIN(tags);
-
-      CREATE INDEX IF NOT EXISTS idx_subject_relationships_from_subject_id ON subject_relationships(from_subject_id);
-      CREATE INDEX IF NOT EXISTS idx_subject_relationships_to_subject_id ON subject_relationships(to_subject_id);
-      CREATE INDEX IF NOT EXISTS idx_subject_relationships_type ON subject_relationships(relationship_type);
+      -- facts
+      CREATE INDEX IF NOT EXISTS idx_facts_subject_id ON facts(subject_id);
+      CREATE INDEX IF NOT EXISTS idx_facts_project_subject_id ON facts(project_subject_id);
+      CREATE INDEX IF NOT EXISTS idx_facts_fact_type ON facts(fact_type);
+      CREATE INDEX IF NOT EXISTS idx_facts_is_active ON facts(is_active);
+      CREATE INDEX IF NOT EXISTS idx_facts_importance ON facts(importance);
+      CREATE INDEX IF NOT EXISTS idx_facts_tags ON facts USING GIN(tags);
+      CREATE INDEX IF NOT EXISTS idx_facts_embedding ON facts USING hnsw (embedding vector_cosine_ops);
+      CREATE INDEX IF NOT EXISTS idx_facts_superseded ON facts(superseded_by);
+      CREATE INDEX IF NOT EXISTS idx_facts_source ON facts(source);
     `);
 
     // ---------------------------------------------------------
-    // 5. Seed Data
+    // 6. Data Migration (v0.3 → v0.4)
+    // ---------------------------------------------------------
+    // Check if old tables exist and migrate data
+    const oldTablesCheck = await db.query(`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name IN ('memories', 'task_learnings')
+    `);
+
+    if (oldTablesCheck.rows.length > 0) {
+      console.log("📦 Migrating data from v0.3 tables...");
+
+      // Migrate memories → facts
+      const memoriesExists = oldTablesCheck.rows.some((r: any) => r.table_name === 'memories');
+      if (memoriesExists) {
+        const migrateCount = await db.query(`
+          INSERT INTO facts (subject_id, project_subject_id, content, fact_type, confidence, importance, tags, embedding, source, access_count, last_accessed_at, created_at, updated_at)
+          SELECT subject_id, project_subject_id, content,
+            CASE memory_type
+              WHEN 'preference' THEN 'preference'
+              WHEN 'profile' THEN 'profile'
+              WHEN 'constraint' THEN 'preference'
+              WHEN 'state' THEN 'state'
+              WHEN 'relationship' THEN 'relationship'
+              ELSE 'state'
+            END::VARCHAR(20),
+            confidence_score, importance_score, tags, embedding, 'migration', access_count, last_accessed_at, created_at, updated_at
+          FROM memories
+          WHERE NOT EXISTS (
+            SELECT 1 FROM facts WHERE facts.content = memories.content AND facts.source = 'migration'
+          )
+        `);
+        console.log(`   ✅ Migrated ${migrateCount.rowCount} memories → facts`);
+      }
+
+      // Migrate task_learnings → facts
+      const learningsExists = oldTablesCheck.rows.some((r: any) => r.table_name === 'task_learnings');
+      if (learningsExists) {
+        const learnCount = await db.query(`
+          INSERT INTO facts (subject_id, content, fact_type, confidence, importance, tags, embedding, source, created_at, updated_at)
+          SELECT
+            (SELECT id FROM subjects WHERE subject_key = 'system_global' LIMIT 1),
+            content, 'learning', confidence_score, impact_score, tags, embedding, 'migration', created_at, updated_at
+          FROM task_learnings
+          WHERE NOT EXISTS (
+            SELECT 1 FROM facts WHERE facts.content = task_learnings.content AND facts.source = 'migration'
+          )
+        `);
+        console.log(`   ✅ Migrated ${learnCount.rowCount} task_learnings → facts`);
+      }
+
+      // Drop old tables
+      console.log("🗑️ Removing deprecated tables...");
+      await db.query(`
+        DROP TABLE IF EXISTS raw_memories CASCADE;
+        DROP TABLE IF EXISTS subject_relationships CASCADE;
+        DROP TABLE IF EXISTS task_learnings CASCADE;
+        DROP TABLE IF EXISTS sessions CASCADE;
+        DROP TABLE IF EXISTS tasks CASCADE;
+        DROP TABLE IF EXISTS memories CASCADE;
+      `);
+      console.log("   ✅ Old tables removed.");
+    }
+
+    // ---------------------------------------------------------
+    // 7. Seed Data
     // ---------------------------------------------------------
     console.log("🌱 Seeding initial data...");
     await db.query(`
@@ -333,7 +293,7 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}
       ('project',  'project_centragens',    '센트라젠', '{}'),
       ('project',  'project_yoontube',      'YoonTube', '{}'),
       ('team',     'team_triplealab',       'TripleA Lab', '{}'),
-      ('system',   'system_orchestrator',   'Harness-Main', '{"version": "1.0.0"}'),
+      ('system',   'system_orchestrator',   'Harness-Main', '{"version": "0.4.0"}'),
       ('system',   'system_global',         'Global Context', '{}'),
       ('category', 'category_marketing',    'Marketing', '{}'),
       ('category', 'category_branding',     'Branding', '{}'),
@@ -341,7 +301,7 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}
       ON CONFLICT (subject_key) DO NOTHING;
     `);
 
-    console.log("✅ Database setup completed successfully!");
+    console.log("✅ Database setup completed successfully! (v0.4 Schema)");
   } catch (err) {
     console.error("❌ Error during database setup:", err);
   } finally {

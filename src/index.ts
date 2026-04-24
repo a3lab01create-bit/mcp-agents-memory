@@ -1,3 +1,6 @@
+import dotenv from 'dotenv';
+dotenv.config(); // Load .env BEFORE any module reads process.env
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { db } from "./db.js";
@@ -7,7 +10,7 @@ import fs from 'fs';
 
 const server = new McpServer({
   name: "mcp-agents-memory",
-  version: "0.3.0"
+  version: "0.4.0"
 });
 
 // Register all memory tools with enriched descriptions
@@ -28,7 +31,7 @@ async function main() {
     // 1. Connect stdio immediately so Claude Code does not fail SessionStart hook
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error("🧠 Memory MCP Server (v0.3.0) running on stdio");
+    console.error("🧠 Memory MCP Server (v0.4.0) running on stdio — Librarian Engine Active");
 
     // 2. Initialize DB asynchronously in the background
     db.connect().then(() => {
