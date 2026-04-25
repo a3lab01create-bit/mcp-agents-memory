@@ -1,7 +1,7 @@
 {
   "name": "mcp-agents-memory",
-  "version": "0.4.0",
-  "description": "Multi-agent Shared Long-term Memory MCP Server",
+  "version": "0.5.3",
+  "description": "Long-term memory for AI agents with provenance and trust weights",
   "main": "build/index.js",
   "type": "module",
   "scripts": {

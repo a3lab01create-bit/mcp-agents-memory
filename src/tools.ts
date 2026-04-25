@@ -154,11 +154,14 @@ export function registerTools(server: McpServer) {
   server.registerTool(
     "memory_add",
     {
-      description: "Store information in long-term memory. The Librarian AI will automatically:\n1. Extract atomic facts from your text\n2. Classify each fact (preference, skill, decision, etc.)\n3. Detect & resolve contradictions with existing knowledge\n4. Generate embeddings for semantic search\n\nJust provide the raw text — the system handles the rest.\n\n[WHEN TO CALL]\n• When you learn important new information about the user\n• After significant decisions or discoveries\n• When project state changes\n• NOT for trivial/temporary info\n\n[EXAMPLES]\n✅ 'Hoon prefers Korean for communication. He is working on YoonTube with React Native.'\n✅ 'Decided to use hq720 fallback to hqdefault for thumbnail loading.'\n❌ 'Let me check that for you.' (trivial)",
+      description: "Store information in long-term memory. The Librarian AI will automatically:\n1. Extract atomic facts from your text\n2. Classify each fact (preference, skill, decision, etc.)\n3. Detect & resolve contradictions with existing knowledge\n4. Calculate Effective Confidence based on model trust\n5. Save provenance (who, where, when)\n\nJust provide the raw text — the system handles the rest.",
       inputSchema: {
-        text: z.string().describe("Raw text containing information to remember. Can be a conversation excerpt, observation, or summary."),
-        subject_key: z.string().optional().default("user_hoon").describe("Primary subject key. Defaults to 'user_hoon'."),
-        project_key: z.string().optional().describe("Project key if relevant (e.g., 'project_yoontube')."),
+        text: z.string().describe("Raw text containing information to remember."),
+        subject_key: z.string().optional().default("user_hoon").describe("Primary subject key."),
+        project_key: z.string().optional().describe("Project key if relevant."),
+        author_model: z.string().optional().describe("Model name or alias (e.g., 'sonnet', 'opus', 'gemini')."),
+        platform: z.string().optional().describe("Platform (e.g., 'antigravity', 'claude-code')."),
+        session_id: z.string().optional().describe("Unique session identifier."),
       }
     },
     async (args) => {
@@ -169,13 +172,23 @@ export function registerTools(server: McpServer) {
         projectId = await getOrCreateSubject(args.project_key, 'project');
       }
 
-      const result = await processBatch(args.text, subjectId, projectId, args.text);
+      const result = await processBatch(
+        args.text, 
+        subjectId, 
+        projectId, 
+        args.text,
+        {
+          author_model: args.author_model,
+          platform: args.platform,
+          session_id: args.session_id
+        }
+      );
 
       // Format result
       const lines: string[] = [];
-      lines.push(`📚 Librarian Report`);
-      lines.push(`───────────────────`);
-      lines.push(`Extracted: ${result.extracted} facts | Saved: ${result.saved} | Contradictions resolved: ${result.contradictions_resolved}`);
+      lines.push(`📚 Librarian Report (v0.5.3 Provenance Layer)`);
+      lines.push(`──────────────────────────────────────────`);
+      lines.push(`Extracted: ${result.extracted} | Saved: ${result.saved} | Contradictions: ${result.contradictions_resolved}`);
 
       if (result.facts.length > 0) {
         lines.push("");
@@ -202,7 +215,7 @@ export function registerTools(server: McpServer) {
   server.registerTool(
     "memory_search",
     {
-      description: "Search long-term memory for relevant facts. Combines semantic (vector) search with keyword matching.\n\n[TIPS]\n• Omit subject_key to search across ALL subjects\n• Use fact_type to filter (e.g., 'decision' for past choices)\n• Use tags to narrow results (e.g., ['react-native', 'webview'])",
+      description: "Search long-term memory for relevant facts. Combines semantic (vector) search with keyword matching.",
       inputSchema: {
         query: z.string().describe("Search query — can be a question or topic."),
         subject_key: z.string().optional().describe("Filter by subject. Omit for global search."),
@@ -215,15 +228,13 @@ export function registerTools(server: McpServer) {
       const queryEmbedding = await generateEmbedding(args.query);
       const embeddingSql = vectorToSql(queryEmbedding);
 
-      // ── Base Context: Always include core user profile ──
+      // ── Base Context ──
       let baseContext = "";
       try {
         const profileRes = await db.query(
-          `SELECT content, fact_type
-           FROM facts
+          `SELECT content, fact_type FROM facts
            WHERE fact_type IN ('profile', 'preference') AND is_active = TRUE
-           ORDER BY importance DESC, updated_at DESC
-           LIMIT 3`
+           ORDER BY importance DESC, updated_at DESC LIMIT 3`
         );
         if (profileRes.rows.length > 0) {
           baseContext = "👤 Base Context:\n";
@@ -234,7 +245,7 @@ export function registerTools(server: McpServer) {
         }
       } catch (e) { /* silent */ }
 
-      // ── Semantic + Keyword Search ──
+      // ── Search Logic ──
       const params: any[] = [embeddingSql, args.limit, `%${args.query}%`];
       const conditions: string[] = [
         "f.is_active = TRUE",
@@ -264,6 +275,7 @@ export function registerTools(server: McpServer) {
 
       const results = await db.query(
         `SELECT f.id, f.content, f.fact_type, f.confidence, f.importance, f.tags, f.created_at,
+                f.effective_confidence, m.model_name as author_model,
                 subj.display_name as subject_name,
                 proj.display_name as project_name,
                 CASE WHEN f.embedding IS NOT NULL
@@ -273,6 +285,7 @@ export function registerTools(server: McpServer) {
          FROM facts f
          LEFT JOIN subjects subj ON f.subject_id = subj.id
          LEFT JOIN subjects proj ON f.project_subject_id = proj.id
+         LEFT JOIN models m ON f.author_model_id = m.id
          WHERE ${whereClause}
          ORDER BY similarity DESC, f.importance DESC
          LIMIT $2`,
@@ -280,7 +293,7 @@ export function registerTools(server: McpServer) {
       );
 
       if (results.rows.length === 0) {
-        return { content: [{ type: "text", text: baseContext + "No relevant memories found for this query." }] };
+        return { content: [{ type: "text", text: baseContext + "No relevant memories found." }] };
       }
 
       // Update access counts
@@ -293,11 +306,14 @@ export function registerTools(server: McpServer) {
       let formatted = baseContext + "🧠 Recalled Facts:\n\n";
       results.rows.forEach((r: any) => {
         const sim = (r.similarity * 100).toFixed(0);
-        formatted += `[#${r.id}] [${r.fact_type}] (imp: ${r.importance}, conf: ${r.confidence}, sim: ${sim}%)\n`;
+        const conf = r.effective_confidence ? `${r.effective_confidence} (eff)` : r.confidence;
+        const author = r.author_model ? ` | via ${r.author_model}` : '';
+        
+        formatted += `[#${r.id}] [${r.fact_type}] (imp: ${r.importance}, conf: ${conf}, sim: ${sim}%${author})\n`;
         if (r.subject_name) formatted += `Subject: ${r.subject_name}`;
         if (r.project_name) formatted += ` | Project: ${r.project_name}`;
         if (r.subject_name || r.project_name) formatted += `\n`;
-        if (r.tags && r.tags.length > 0) formatted += `Tags: ${r.tags.join(", ")}\n`;
+        if (r.tags?.length > 0) formatted += `Tags: ${r.tags.join(", ")}\n`;
         formatted += `Content: ${r.content}\n`;
         formatted += `Date: ${new Date(r.created_at).toLocaleDateString('ko-KR')}\n`;
         formatted += `---\n`;
@@ -318,8 +334,8 @@ export function registerTools(server: McpServer) {
     },
     async () => {
       const lines: string[] = [];
-      lines.push("📊 Memory Status Report");
-      lines.push("══════════════════════\n");
+      lines.push("📊 Memory Status Report (v0.5.3)");
+      lines.push("═══════════════════════════════\n");
 
       // Total facts
       try {
@@ -347,48 +363,10 @@ export function registerTools(server: McpServer) {
         }
       } catch (e) { /* silent */ }
 
-      // Facts by subject
-      try {
-        const bySubject = await db.query(
-          `SELECT s.display_name, COUNT(*) as count
-           FROM facts f
-           JOIN subjects s ON f.subject_id = s.id
-           WHERE f.is_active = TRUE
-           GROUP BY s.display_name ORDER BY count DESC
-           LIMIT 5`
-        );
-        if (bySubject.rows.length > 0) {
-          lines.push("👥 Top Subjects");
-          lines.push("───────────────");
-          bySubject.rows.forEach((r: any) => {
-            lines.push(`  ${r.display_name}: ${r.count} facts`);
-          });
-          lines.push("");
-        }
-      } catch (e) { /* silent */ }
-
-      // Recent facts
-      try {
-        const recent = await db.query(
-          `SELECT content, fact_type, source, created_at
-           FROM facts WHERE is_active = TRUE
-           ORDER BY created_at DESC LIMIT 5`
-        );
-        if (recent.rows.length > 0) {
-          lines.push("🕐 Recent Facts");
-          lines.push("───────────────");
-          recent.rows.forEach((r: any) => {
-            const date = new Date(r.created_at).toLocaleDateString('ko-KR');
-            lines.push(`  [${r.source}] [${r.fact_type}] ${r.content.substring(0, 80)} (${date})`);
-          });
-          lines.push("");
-        }
-      } catch (e) { /* silent */ }
-
       // System info
       lines.push("⚙️ System Info");
       lines.push("─────────────");
-      lines.push(`  Version: v0.4.0`);
+      lines.push(`  Version: v0.5.3 (Provenance Layer)`);
       lines.push(`  Librarian Model: ${process.env.LIBRARIAN_MODEL || 'gpt-4o-mini'}`);
       lines.push(`  Embedding Model: text-embedding-3-small`);
 

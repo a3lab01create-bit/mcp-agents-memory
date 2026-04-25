@@ -34,6 +34,13 @@ export interface ContradictionResult {
   reason: string;
 }
 
+export interface ProvenanceInfo {
+  author_model?: string;   // e.g., "claude-3-5-sonnet"
+  platform?: string;       // e.g., "antigravity"
+  session_id?: string;     // UUID or session name
+  metadata?: Record<string, any>;
+}
+
 export interface ProcessResult {
   extracted: number;
   saved: number;
@@ -111,6 +118,93 @@ OUTPUT FORMAT (strict JSON):
 }`;
 
 // ─────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────
+
+async function resolveModelId(modelName?: string): Promise<number | null> {
+  if (!modelName) return null;
+  const normalized = modelName.trim().toLowerCase();
+  
+  const res = await db.query(
+    "SELECT id FROM models WHERE model_name = $1 OR metadata->>'alias' = $1",
+    [normalized]
+  );
+  
+  if (res.rows.length > 0) {
+    return res.rows[0].id;
+  }
+
+  // Auto-register new model with default trust weight
+  try {
+    const provider = normalized.split('-')[0] || 'unknown';
+    const insertRes = await db.query(
+      `INSERT INTO models (provider, model_name, trust_weight, metadata) 
+       VALUES ($1, $2, 0.80, $3) 
+       ON CONFLICT (model_name) DO UPDATE SET model_name = EXCLUDED.model_name
+       RETURNING id`,
+      [provider, normalized, JSON.stringify({ auto_registered: true, registered_at: new Date().toISOString() })]
+    );
+    console.error(`🌱 [Librarian] Auto-registered new model: ${normalized}`);
+    return insertRes.rows[0].id;
+  } catch (err) {
+    console.error(`⚠️ [Librarian] Failed to auto-register model ${normalized}:`, err);
+    return null;
+  }
+}
+
+async function resolvePlatformId(platformName?: string): Promise<number | null> {
+  if (!platformName) return null;
+  const normalized = platformName.trim().toLowerCase();
+
+  const res = await db.query(
+    "SELECT id FROM platforms WHERE name = $1",
+    [normalized]
+  );
+
+  if (res.rows.length > 0) {
+    return res.rows[0].id;
+  }
+
+  // Auto-register new platform
+  try {
+    const insertRes = await db.query(
+      `INSERT INTO platforms (name, trust_weight) 
+       VALUES ($1, 1.00) 
+       ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+       RETURNING id`,
+      [normalized]
+    );
+    console.error(`🌱 [Librarian] Auto-registered new platform: ${normalized}`);
+    return insertRes.rows[0].id;
+  } catch (err) {
+    console.error(`⚠️ [Librarian] Failed to auto-register platform ${normalized}:`, err);
+    return null;
+  }
+}
+
+async function calculateEffectiveConfidence(
+  base: number,
+  modelId: number | null,
+  platformId: number | null
+): Promise<number> {
+  let modelWeight = 0.8;
+  let platformWeight = 1.0;
+
+  if (modelId) {
+    const res = await db.query("SELECT trust_weight FROM models WHERE id = $1", [modelId]);
+    if (res.rows.length > 0) modelWeight = parseFloat(res.rows[0].trust_weight);
+  }
+  if (platformId) {
+    const res = await db.query("SELECT trust_weight FROM platforms WHERE id = $1", [platformId]);
+    if (res.rows.length > 0) platformWeight = parseFloat(res.rows[0].trust_weight);
+  }
+
+  // Formula: (Base / 10) * ModelWeight * PlatformWeight * 10
+  // Result is on a 1-10 scale
+  return parseFloat(((base / 10) * modelWeight * platformWeight * 10).toFixed(2));
+}
+
+// ─────────────────────────────────────────────────────────────
 // Core Functions
 // ─────────────────────────────────────────────────────────────
 
@@ -169,10 +263,34 @@ export async function extractFacts(text: string): Promise<ExtractedFact[]> {
     return validated;
   } catch (err: any) {
     console.error("❌ [Librarian] Extraction FAILED:", err?.message || err);
-    console.error("❌ [Librarian] API Key present:", !!process.env.OPENAI_API_KEY);
-    console.error("❌ [Librarian] Model:", model);
     return [];
   }
+}
+
+/**
+ * Sanitize tags: string only, trimmed, unique, lowercase, max length.
+ */
+function sanitizeTags(tags: any[]): string[] {
+  if (!Array.isArray(tags)) return [];
+  return [...new Set(
+    tags
+      .filter(t => typeof t === 'string')
+      .map(t => t.trim().toLowerCase().substring(0, 50))
+      .filter(t => t.length > 0)
+  )].slice(0, 10);
+}
+
+/**
+ * Sanitize subject hint: only allow user_, project_, agent_, team_, system_, category_.
+ */
+function sanitizeSubjectHint(hint?: string): string | undefined {
+  if (!hint) return undefined;
+  const normalized = hint.trim().toLowerCase().substring(0, 100);
+  const allowed = ['user_', 'project_', 'agent_', 'team_', 'system_', 'category_'];
+  if (allowed.some(prefix => normalized.startsWith(prefix))) {
+    return normalized;
+  }
+  return undefined;
 }
 
 /**
@@ -180,67 +298,84 @@ export async function extractFacts(text: string): Promise<ExtractedFact[]> {
  */
 export async function resolveContradiction(
   newFact: ExtractedFact,
-  subjectId: number
+  subjectId: number,
+  existingEmbedding?: number[]
 ): Promise<ContradictionResult> {
   try {
-    // Fetch existing active facts for this subject with similar types
-    const existing = await db.query(
-      `SELECT id, content, fact_type, tags
-       FROM facts
-       WHERE subject_id = $1 AND is_active = TRUE AND fact_type = $2
-       ORDER BY updated_at DESC
-       LIMIT 10`,
-      [subjectId, newFact.fact_type]
-    );
+    // 1. Fetch Candidates (Similarity Search + Recent Fallback)
+    const embedding = existingEmbedding || await generateEmbedding(newFact.content);
+    let candidates: any[] = [];
+    let candidateIds: number[] = [];
 
-    if (existing.rows.length === 0) {
-      return { supersedes_id: null, reason: "No existing facts to compare" };
-    }
-
-    // Use embedding similarity for initial screening
-    const newEmbedding = await generateEmbedding(newFact.content);
-    if (newEmbedding) {
-      const embSql = vectorToSql(newEmbedding);
+    if (embedding) {
+      const embSql = vectorToSql(embedding);
       const similar = await db.query(
         `SELECT id, content, fact_type
          FROM facts
-         WHERE subject_id = $1 AND is_active = TRUE AND embedding IS NOT NULL
-           AND 1 - (embedding <=> $2::vector) > 0.7
-         ORDER BY embedding <=> $2::vector
+         WHERE subject_id = $1 AND is_active = TRUE AND fact_type = $2 AND embedding IS NOT NULL
+           AND 1 - (embedding <=> $3::vector) > 0.65
+         ORDER BY embedding <=> $3::vector
          LIMIT 5`,
-        [subjectId, embSql]
+        [subjectId, newFact.fact_type, embSql]
       );
+      candidates = similar.rows;
+    }
 
-      // If highly similar facts exist, check for contradiction via LLM
-      if (similar.rows.length > 0) {
-        const existingList = similar.rows
-          .map((r: any) => `[ID: ${r.id}] ${r.content}`)
-          .join("\n");
+    // Fallback: If no good vector matches, take 10 most recent of the same type
+    if (candidates.length < 3) {
+      const recent = await db.query(
+        `SELECT id, content, fact_type
+         FROM facts
+         WHERE subject_id = $1 AND is_active = TRUE AND fact_type = $2
+           AND id != ALL($3::int[])
+         ORDER BY updated_at DESC
+         LIMIT 10`,
+        [subjectId, newFact.fact_type, candidates.map(c => c.id)]
+      );
+      candidates = [...candidates, ...recent.rows];
+    }
 
-        const client = getClient();
-        const response = await client.chat.completions.create({
-          model: getLibrarianModel(),
-          messages: [
-            { role: "system", content: CONTRADICTION_SYSTEM_PROMPT },
-            {
-              role: "user",
-              content: `NEW FACT: "${newFact.content}"\n\nEXISTING FACTS:\n${existingList}`
-            }
-          ],
-          response_format: { type: "json_object" },
-          temperature: 0.1,
-          max_tokens: 200,
-        });
+    if (candidates.length === 0) {
+      return { supersedes_id: null, reason: "No existing facts to compare" };
+    }
 
-        const content = response.choices[0]?.message?.content;
-        if (content) {
-          const parsed = JSON.parse(content);
-          return {
-            supersedes_id: parsed.supersedes_id ?? null,
-            reason: parsed.reason || "Unknown",
-          };
+    candidateIds = candidates.map(c => c.id);
+
+    // 2. Ask LLM to compare
+    const existingList = candidates
+      .map((r: any) => `[ID: ${r.id}] ${r.content}`)
+      .join("\n");
+
+    const client = getClient();
+    const response = await client.chat.completions.create({
+      model: getLibrarianModel(),
+      messages: [
+        { role: "system", content: CONTRADICTION_SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: `NEW FACT: "${newFact.content}"\n\nEXISTING FACTS:\n${existingList}`
         }
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.1,
+      max_tokens: 200,
+    });
+
+    const content = response.choices[0]?.message?.content;
+    if (content) {
+      const parsed = JSON.parse(content);
+      const targetId = parsed.supersedes_id ?? null;
+
+      // Validate targetId is in our candidate list
+      if (targetId && !candidateIds.includes(targetId)) {
+        console.error(`⚠️ [Librarian] LLM suggested target #${targetId} which was not in candidates.`);
+        return { supersedes_id: null, reason: "LLM suggested out-of-bounds target" };
       }
+
+      return {
+        supersedes_id: targetId,
+        reason: parsed.reason || "Unknown",
+      };
     }
 
     return { supersedes_id: null, reason: "No contradiction detected" };
@@ -258,6 +393,7 @@ export async function processBatch(
   subjectId: number,
   projectSubjectId: number | null,
   sourceText?: string,
+  provenance?: ProvenanceInfo
 ): Promise<ProcessResult> {
   const result: ProcessResult = {
     extracted: 0,
@@ -266,6 +402,10 @@ export async function processBatch(
     facts: [],
     errors: [],
   };
+
+  // Step 0: Resolve metadata IDs
+  const authorModelId = await resolveModelId(provenance?.author_model);
+  const platformId = await resolvePlatformId(provenance?.platform);
 
   // Step 1: Extract facts from text
   const extracted = await extractFacts(text);
@@ -277,53 +417,63 @@ export async function processBatch(
 
   // Step 2: Process each fact
   for (const fact of extracted) {
+    // 2a & 2b: Move LLM/Embedding work OUTSIDE the transaction
+    const embedding = await generateEmbedding(fact.content);
+    const hint = sanitizeSubjectHint(fact.subject_hint);
+    const tags = sanitizeTags(fact.tags);
+
+    // Get the actual subject IDs before the transaction
+    let factSubjectId = subjectId;
+    let factProjectId = projectSubjectId;
+
+    if (hint) {
+      const hintRes = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [hint]);
+      if (hintRes.rows.length > 0) {
+        factSubjectId = hintRes.rows[0].id;
+        if (hint.startsWith('project_')) factProjectId = factSubjectId;
+      }
+    }
+
+    const contradiction = await resolveContradiction(fact, factSubjectId, embedding || undefined);
+
+    // 2c: Database Transaction
+    const client = await db.getClient();
     try {
-      // Determine the actual subject for this fact
-      let factSubjectId = subjectId;
-      if (fact.subject_hint) {
-        // Try to resolve subject_hint to an actual subject ID
-        const hintRes = await db.query(
-          "SELECT id FROM subjects WHERE subject_key = $1",
-          [fact.subject_hint]
-        );
-        if (hintRes.rows.length > 0) {
-          factSubjectId = hintRes.rows[0].id;
-        }
-      }
+      await client.query('BEGIN');
 
-      // Determine project subject
-      let factProjectId = projectSubjectId;
-      if (fact.subject_hint?.startsWith('project_')) {
-        const projRes = await db.query(
-          "SELECT id FROM subjects WHERE subject_key = $1",
-          [fact.subject_hint]
-        );
-        if (projRes.rows.length > 0) {
-          factProjectId = projRes.rows[0].id;
-        }
-      }
-
-      // Step 2a: Resolve contradictions
-      const contradiction = await resolveContradiction(fact, factSubjectId);
+      let actualSupersedesId = null;
 
       if (contradiction.supersedes_id) {
-        // Mark old fact as superseded
-        await db.query(
-          `UPDATE facts SET is_active = FALSE, superseded_by = NULL, updated_at = NOW()
-           WHERE id = $1`,
-          [contradiction.supersedes_id]
+        // Atomic update with validation
+        const updateRes = await client.query(
+          `UPDATE facts 
+           SET is_active = FALSE, updated_at = NOW() 
+           WHERE id = $1 AND subject_id = $2 AND fact_type = $3 AND is_active = TRUE
+           RETURNING id`,
+          [contradiction.supersedes_id, factSubjectId, fact.fact_type]
         );
-        result.contradictions_resolved++;
+        
+        if (updateRes.rows.length > 0) {
+          actualSupersedesId = updateRes.rows[0].id;
+          result.contradictions_resolved++;
+        }
       }
 
-      // Step 2b: Generate embedding for the new fact
-      const embedding = await generateEmbedding(fact.content);
+      const effectiveConfidence = await calculateEffectiveConfidence(
+        fact.confidence,
+        authorModelId,
+        platformId
+      );
 
-      // Step 2c: Save the new fact
-      const insertRes = await db.query(
-        `INSERT INTO facts (subject_id, project_subject_id, content, source_text, fact_type, confidence, importance, tags, embedding, source)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'librarian')
-         RETURNING id`,
+      // Save the new fact
+      const insertRes = await client.query(
+        `INSERT INTO facts (
+          subject_id, project_subject_id, content, source_text, 
+          fact_type, confidence, importance, tags, embedding, 
+          source, author_model_id, effective_confidence
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'librarian', $10, $11)
+        RETURNING id`,
         [
           factSubjectId,
           factProjectId,
@@ -332,33 +482,56 @@ export async function processBatch(
           fact.fact_type,
           fact.confidence,
           fact.importance,
-          fact.tags,
+          tags,
           vectorToSql(embedding),
+          authorModelId,
+          effectiveConfidence
         ]
       );
 
       const newId = insertRes.rows[0].id;
 
-      // If we superseded a fact, update the chain
-      if (contradiction.supersedes_id) {
-        await db.query(
+      // Save provenance details
+      await client.query(
+        `INSERT INTO fact_provenances (
+          fact_id, author_model_id, platform_id, session_id, raw_input, metadata
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          newId,
+          authorModelId,
+          platformId,
+          provenance?.session_id || null,
+          sourceText?.substring(0, 5000) || null,
+          provenance?.metadata || {}
+        ]
+      );
+
+      // Link supersedes chain
+      if (actualSupersedesId) {
+        await client.query(
           `UPDATE facts SET superseded_by = $1 WHERE id = $2`,
-          [newId, contradiction.supersedes_id]
+          [newId, actualSupersedesId]
         );
       }
+
+      await client.query('COMMIT');
 
       result.saved++;
       result.facts.push({
         id: newId,
         content: fact.content,
         fact_type: fact.fact_type,
-        superseded: contradiction.supersedes_id || undefined,
+        superseded: actualSupersedesId || undefined,
       });
 
     } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
       const errMsg = `Failed to save fact "${fact.content.substring(0, 50)}...": ${err}`;
       console.error(`⚠️ ${errMsg}`);
       result.errors.push(errMsg);
+    } finally {
+      client.release();
     }
   }
 

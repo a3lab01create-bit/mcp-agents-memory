@@ -10,7 +10,7 @@ import fs from 'fs';
 
 const server = new McpServer({
   name: "mcp-agents-memory",
-  version: "0.4.0"
+  version: "0.5.0"
 });
 
 // Register all memory tools with enriched descriptions
@@ -31,7 +31,7 @@ async function main() {
     // 1. Connect stdio immediately so Claude Code does not fail SessionStart hook
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error("🧠 Memory MCP Server (v0.4.0) running on stdio — Librarian Engine Active");
+    console.error("🧠 Memory MCP Server (v0.5.0) running on stdio — Librarian Engine Active");
 
     // 2. Initialize DB asynchronously in the background
     db.connect().then(() => {
