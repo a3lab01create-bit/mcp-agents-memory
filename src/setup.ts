@@ -99,6 +99,7 @@ async function promptApiKeys(): Promise<string> {
     { type: "password", name: "google", mask: "*", message: "GOOGLE_GENERATIVE_AI_API_KEY (optional, for Curator/Triage)" },
     { type: "password", name: "tavily", mask: "*", message: "TAVILY_API_KEY (optional, recency search)" },
     { type: "password", name: "exa", mask: "*", message: "EXA_API_KEY (optional, authority search)" },
+    { type: "password", name: "notion", mask: "*", message: "NOTION_API_KEY (optional, Notion Connector)" },
   ]);
 
   const lines: string[] = [];
@@ -107,6 +108,7 @@ async function promptApiKeys(): Promise<string> {
   if (a.google) lines.push(`GOOGLE_GENERATIVE_AI_API_KEY=${a.google}`);
   if (a.tavily) lines.push(`TAVILY_API_KEY=${a.tavily}`);
   if (a.exa) lines.push(`EXA_API_KEY=${a.exa}`);
+  if (a.notion) lines.push(`NOTION_API_KEY=${a.notion}`);
   lines.push("LIBRARIAN_MODEL=gpt-4o-mini");
 
   if (!a.openai) {

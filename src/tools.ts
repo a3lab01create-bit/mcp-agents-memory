@@ -7,6 +7,7 @@ import { getInjectableSkills, recordSkillExposure, updateOrCreateSkill } from ".
 import { auditSkill } from "./skill_auditor.js";
 import { runCurator } from "./curator.js";
 import { restoreMemories, RestoreInputError } from "./forgetting.js";
+import { runConnectorSync } from "./connectors/sync.js";
 import { PACKAGE_VERSION } from "./version.js";
 
 // ─────────────────────────────────────────────────────────────
@@ -646,6 +647,52 @@ export function registerTools(server: McpServer) {
           return { content: [{ type: "text", text: `❌ ${err.message}` }], isError: true };
         }
         throw err;
+      }
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════
+  // connector_sync — pull external content into memory (v5.0 Phase 3)
+  // v1: Notion only. Manual trigger; auto-polling deferred.
+  // ═══════════════════════════════════════════════════════════
+  server.registerTool(
+    "connector_sync",
+    {
+      description:
+        "Sync external content into memory via a Connector. v1 supports Notion only. Provide either a `page` id (top-level blocks of one page) or a `database` id (iterates child pages). Hash-based dedup via memory_sources table — re-syncing unchanged content is a no-op. Requires NOTION_API_KEY in your config.",
+      inputSchema: {
+        provider: z.enum(["notion"]).describe("Connector provider. Only 'notion' is implemented in v1."),
+        external_id: z.string().min(1).describe("Notion page id (UUID-like)."),
+        resource_type: z.enum(["page"]).default("page").describe("v1 only supports 'page'. Database/multi-page sync arrives with the next connector slice."),
+      },
+    },
+    async (args) => {
+      try {
+        const result = await runConnectorSync({
+          provider: args.provider,
+          external_id: args.external_id,
+          resource_type: args.resource_type,
+        });
+
+        const lines = [
+          `🔌 connector_sync(${args.provider}, ${args.resource_type}) result:`,
+          ``,
+          `  pages seen:                ${result.pages_seen}`,
+          `  pages synced (changed):    ${result.pages_synced}`,
+          `  pages skipped (unchanged): ${result.pages_skipped_unchanged}`,
+          `  facts added:               ${result.facts_added}`,
+        ];
+        if (result.errors.length > 0) {
+          lines.push(``, `⚠️  ${result.errors.length} error(s):`);
+          result.errors.slice(0, 10).forEach((e) => lines.push(`    - ${e}`));
+          if (result.errors.length > 10) lines.push(`    … (${result.errors.length - 10} more)`);
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `❌ connector_sync failed: ${err?.message ?? err}` }],
+          isError: true,
+        };
       }
     }
   );

@@ -60,6 +60,12 @@ export interface ProvenanceInfo {
   author_model?: string;
   platform?: string;
   session_id?: string;
+  /**
+   * Override for `memories.source` column. Defaults to 'librarian' when omitted.
+   * Used by Connectors (e.g. 'connector') to mark connector-derived memories.
+   * Must be one of the values allowed by the `memories_source_check` CHECK constraint.
+   */
+  source?: string;
 }
 
 export interface ProcessResult {
@@ -524,9 +530,9 @@ export async function processBatch(
            subject_id, project_subject_id, content, fact_type,
            confidence, importance, tags, embedding, validation_status,
            author_model, platform, session_id,
-           author_model_id, platform_id, effective_confidence
+           author_model_id, platform_id, effective_confidence, source
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
          RETURNING id`,
         [
           subjectId, projectId, fact.content, fact.fact_type,
@@ -536,7 +542,8 @@ export async function processBatch(
           provenance.author_model, provenance.platform, provenance.session_id,
           resolvedModel?.id ?? null,
           resolvedPlatform?.id ?? null,
-          effectiveConfidence
+          effectiveConfidence,
+          provenance.source ?? 'librarian'
         ]
       );
 
