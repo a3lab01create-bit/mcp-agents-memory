@@ -71,18 +71,45 @@ export function registerTools(server: McpServer) {
       // 1. User Profile & Preferences
       try {
         const userId = await getOrCreateSubject(args.user_key, 'person');
-        const profileRes = await db.query(
-          `SELECT content, fact_type, tags, importance, confidence
+        const staticProfileRes = await db.query(
+          `SELECT content, fact_type, tags
            FROM memories
-           WHERE subject_id = $1 AND fact_type IN ('profile', 'preference') AND is_active = TRUE
+           WHERE subject_id = $1
+             AND fact_type IN ('profile', 'preference')
+             AND is_active = TRUE
+             AND (
+               'profile_static' = ANY(tags)
+               OR (NOT ('profile_dynamic' = ANY(tags)) AND NOT ('profile_static' = ANY(tags)))
+             )
            ORDER BY importance DESC, updated_at DESC
            LIMIT 8`,
           [userId]
         );
-        if (profileRes.rows.length > 0) {
+        if (staticProfileRes.rows.length > 0) {
           sections.push("👤 USER PROFILE");
           sections.push("───────────────");
-          profileRes.rows.forEach((r: any) => {
+          staticProfileRes.rows.forEach((r: any) => {
+            sections.push(`• [${r.fact_type}] ${r.content}`);
+            if (r.tags?.length > 0) sections.push(`  tags: ${r.tags.join(', ')}`);
+          });
+          sections.push("");
+        }
+
+        const dynamicProfileRes = await db.query(
+          `SELECT content, fact_type, tags
+           FROM memories
+           WHERE subject_id = $1
+             AND fact_type IN ('profile', 'preference')
+             AND is_active = TRUE
+             AND 'profile_dynamic' = ANY(tags)
+           ORDER BY updated_at DESC, importance DESC
+           LIMIT 6`,
+          [userId]
+        );
+        if (dynamicProfileRes.rows.length > 0) {
+          sections.push("🌊 CURRENT CONTEXT");
+          sections.push("────────────────");
+          dynamicProfileRes.rows.forEach((r: any) => {
             sections.push(`• [${r.fact_type}] ${r.content}`);
             if (r.tags?.length > 0) sections.push(`  tags: ${r.tags.join(', ')}`);
           });

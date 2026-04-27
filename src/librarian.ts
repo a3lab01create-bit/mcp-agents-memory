@@ -72,6 +72,12 @@ Return a JSON object: { "worthy_segments": ["..."] }`;
 
 const EXTRACTION_SYSTEM_PROMPT = `You are a Librarian AI. Extract atomic facts from the provided text.
 FACT TYPES: preference, profile, state, skill, decision, learning, relationship.
+When fact_type is "profile" or "preference", ALSO set the profile axis:
+- Add tag "profile_static" if the fact is stable across weeks/months: identity (name, role), tooling preferences, coding style, language, long-running interests, baseline workflow patterns.
+- Add tag "profile_dynamic" if the fact reflects current context that may change within days/weeks: active project, this-week goal, recent decision pattern, current blocker, in-progress task focus.
+- When in doubt, default to "profile_static" — over-stable is less misleading than over-current.
+
+For fact_types other than profile/preference, do NOT add either tag.
 Output JSON: { "facts": [{ "content": "...", "fact_type": "...", "confidence": 1-10, "importance": 1-10, "tags": ["..."], "subject_hint": "..." }] }`;
 
 const AUDIT_SYSTEM_PROMPT = `You are a Senior Librarian Auditor. Review and refine extracted facts.
@@ -91,6 +97,35 @@ export function computeAuditScore(fact: any): number {
   const importanceScore = (fact.importance || 0) / 10;
   const confidencePenalty = (10 - (fact.confidence || 0)) / 10;
   return (importanceScore * 0.7) + (confidencePenalty * 0.3);
+}
+
+function normalizeProfileAxisTags(fact: ExtractedFact): ExtractedFact {
+  const tags = Array.isArray(fact.tags) ? [...new Set(fact.tags)] : [];
+  const staticIdx = tags.indexOf("profile_static");
+  const dynamicIdx = tags.indexOf("profile_dynamic");
+
+  if (fact.fact_type !== 'profile' && fact.fact_type !== 'preference') {
+    return {
+      ...fact,
+      tags: tags.filter((tag) => tag !== "profile_static" && tag !== "profile_dynamic"),
+    };
+  }
+
+  if (dynamicIdx >= 0) {
+    return {
+      ...fact,
+      tags: tags.filter((tag) => tag !== "profile_static"),
+    };
+  }
+
+  if (staticIdx === -1) {
+    tags.push("profile_static");
+  }
+
+  return {
+    ...fact,
+    tags,
+  };
 }
 
 export async function triageTranscript(text: string): Promise<string[]> {
@@ -117,11 +152,11 @@ export async function extractFacts(text: string): Promise<ExtractedFact[]> {
     const parsed = JSON.parse(raw || '{"facts":[]}');
     return (parsed.facts || []).map((f: any) => {
       const audit_score = computeAuditScore(f);
-      return {
+      return normalizeProfileAxisTags({
         ...f,
         audit_score,
         audit_required: audit_score > 0.7 || f.fact_type === 'decision',
-      };
+      });
     });
   } catch (err) {
     console.error("❌ [Librarian] Extraction FAILED:", err);
@@ -153,6 +188,7 @@ export async function auditFacts(facts: ExtractedFact[]): Promise<ExtractedFact[
             ...refined,
             _idx: merged[targetIdx]._idx,
           };
+          merged[targetIdx] = normalizeProfileAxisTags(merged[targetIdx]);
         }
       }
     }
