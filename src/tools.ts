@@ -210,6 +210,13 @@ export function registerTools(server: McpServer) {
       }
     },
     async (args) => {
+      // Curator identity — read from env at call time, never user-overridable.
+      // AGENT_PLATFORM = harness/CLI ("claude-code", "openclaw", "gemini-cli")
+      // AGENT_MODEL    = underlying model ("claude-opus-4-7", "gpt-5"). Required
+      //                  for platforms without a fixed model (e.g. OpenClaw).
+      const agentPlatform = process.env.AGENT_PLATFORM;
+      const agentModel = process.env.AGENT_MODEL;
+
       const subjectId = await getOrCreateSubject(args.subject_key, 'person');
 
       let projectId: number | null = null;
@@ -217,14 +224,22 @@ export function registerTools(server: McpServer) {
         projectId = await getOrCreateSubject(args.project_key, 'project');
       }
 
+      // Default Producer to Curator's model when caller doesn't specify.
+      // Producer == Curator is the common case; explicit override is for
+      // delegation scenarios (orchestrator saving subagent output).
+      const authorModel = args.author_model ?? agentModel;
+      const platform = args.platform ?? agentPlatform;
+
       const result = await processBatch(
         args.text,
         subjectId,
         projectId,
         args.text,
         {
-          author_model: args.author_model,
-          platform: args.platform,
+          author_model: authorModel,
+          platform,
+          agent_platform: agentPlatform,
+          agent_model: agentModel,
           session_id: args.session_id
         }
       );

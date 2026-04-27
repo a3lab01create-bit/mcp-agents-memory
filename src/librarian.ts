@@ -59,6 +59,14 @@ export interface ContradictionResult {
 export interface ProvenanceInfo {
   author_model?: string;
   platform?: string;
+  /**
+   * Curator identity — the agent that called memory_add. Distinct from
+   * Producer (author_model). Server-populated from process.env.AGENT_PLATFORM
+   * and process.env.AGENT_MODEL; not user-overridable.
+   * Two fields because some platforms (e.g. OpenClaw) have no default model.
+   */
+  agent_platform?: string;
+  agent_model?: string;
   session_id?: string;
   /**
    * Override for `memories.source` column. Defaults to 'librarian' when omitted.
@@ -530,9 +538,10 @@ export async function processBatch(
            subject_id, project_subject_id, content, fact_type,
            confidence, importance, tags, embedding, validation_status,
            author_model, platform, session_id,
+           agent_platform, agent_model,
            author_model_id, platform_id, effective_confidence, source
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
          RETURNING id`,
         [
           subjectId, projectId, fact.content, fact.fact_type,
@@ -540,6 +549,7 @@ export async function processBatch(
           emb ? vectorToSql(emb) : null,
           validationStatus,
           provenance.author_model, provenance.platform, provenance.session_id,
+          provenance.agent_platform, provenance.agent_model,
           resolvedModel?.id ?? null,
           resolvedPlatform?.id ?? null,
           effectiveConfidence,

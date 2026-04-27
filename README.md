@@ -90,11 +90,18 @@ Claude Desktop / Claude Code / any MCP-aware client:
 {
   "mcpServers": {
     "memory": {
-      "command": "mcp-agents-memory"
+      "command": "mcp-agents-memory",
+      "env": {
+        "AGENT_KEY": "agent_claude",
+        "AGENT_PLATFORM": "claude-code",
+        "AGENT_MODEL": "claude-opus-4-7"
+      }
     }
   }
 }
 ```
+
+`AGENT_PLATFORM` and `AGENT_MODEL` are recorded on every memory_add call as the **Curator** identity (the agent that saved the fact), separate from the **Producer** (`author_model`, the model that generated the content). For platforms without a fixed model (e.g. OpenClaw, generic agent runtimes), set `AGENT_MODEL` to whatever model is actually backing the session.
 
 ### Cross-machine memory
 
