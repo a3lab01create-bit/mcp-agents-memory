@@ -6,12 +6,44 @@ import { db } from "./db.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerTools, getOrCreateSubject } from "./tools.js";
-import { maybeStartPromotionLoop } from "./promotion.js";
-import { maybeStartForgettingLoop } from "./forgetting.js";
+import { maybeStartPromotionLoop, stopPromotionLoop } from "./promotion.js";
+import { maybeStartForgettingLoop, stopForgettingLoop } from "./forgetting.js";
 import { PACKAGE_VERSION } from "./version.js";
 import fs from "fs";
 
 export let connectedClient: { name: string, version: string } | null = null;
+
+let isShuttingDown = false;
+async function shutdown(reason: string): Promise<void> {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.error(`🛑 Shutting down (${reason})...`);
+
+  try { stopPromotionLoop(); } catch {}
+  try { stopForgettingLoop(); } catch {}
+
+  try {
+    await Promise.race([
+      db.close(),
+      new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+    ]);
+  } catch (err) {
+    console.error("Error during shutdown:", err);
+  }
+
+  process.exit(0);
+}
+
+function installShutdownHandlers(): void {
+  process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
+  process.on("SIGINT", () => { void shutdown("SIGINT"); });
+  process.on("SIGHUP", () => { void shutdown("SIGHUP"); });
+
+  // Parent closing stdin = parent process died (MCP stdio convention).
+  // Without this, an orphaned tunnel-ssh socket keeps the event loop alive forever.
+  process.stdin.on("end", () => { void shutdown("stdin-end"); });
+  process.stdin.on("close", () => { void shutdown("stdin-close"); });
+}
 
 function printHelp() {
   console.log(`mcp-agents-memory v${PACKAGE_VERSION}
@@ -49,6 +81,8 @@ async function runMcpServer() {
   };
 
   registerTools(server);
+
+  installShutdownHandlers();
 
   console.error("🚀 Starting Memory MCP Server...");
 
