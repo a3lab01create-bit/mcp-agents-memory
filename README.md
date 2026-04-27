@@ -63,30 +63,64 @@ v0.6 employs a sophisticated multi-role architecture using the best models for e
 
 ## Setup
 
-### 1. Requirements
-- PostgreSQL with `pgvector` extension.
-- **Required API Keys**: OpenAI (Embeddings), Tavily, Exa.
-- **Optional**: Gemini, Anthropic, xAI (for specialized roles).
+### Quick install (npx, cross-machine via cloud Postgres)
 
-### 2. Install & Build
+If you want the same memory accessible from multiple computers, use a cloud Postgres provider with `pgvector` (Neon and Supabase both have free tiers).
+
+```bash
+# 1. Get a Postgres connection string from neon.tech (or Supabase). Make sure the
+#    URL ends with ?sslmode=require so the client negotiates SSL.
+
+# 2. Run the setup wizard. It writes config to ~/.config/mcp-agents-memory/.env
+#    and applies the base v0.4 schema. NOTE: end-to-end fresh-cloud-DB install is
+#    still being validated — migrations 006-007 target an older `facts` schema that
+#    a fresh database doesn't have. If you hit a migration error, drop into this
+#    repo and run `npm run setup` against a dev DB while the cloud-fresh path
+#    gets stabilised in the next slice.
+npx github:USER/mcp-agents-memory setup
+# (replace USER once published; for local dev: `npm run setup` from this repo)
+
+# 3. Add to your MCP client config (Claude Desktop, Claude Code, etc.):
+#    {
+#      "mcpServers": {
+#        "memory": { "command": "npx", "args": ["mcp-agents-memory"] }
+#      }
+#    }
+```
+
+On a second computer, repeat steps 2–3 with the **same** `DATABASE_URL`. Memory is shared automatically since the MCP server is stateless — the database is the source of truth.
+
+CLI subcommands:
+- `mcp-agents-memory` — run the MCP server (stdio).
+- `mcp-agents-memory setup` — interactive wizard (writes XDG config, applies schema + migrations).
+- `mcp-agents-memory migrate` — apply pending migrations against an already-configured database.
+- `mcp-agents-memory help` — show help.
+
+### Local development (this repo)
+
+For self-hosted Postgres or working on the codebase directly:
+
 ```bash
 npm install
 npm run build
-npm run setup  # Run Wizard for DB/API config
+npm run setup   # interactive wizard, same as `node build/index.js setup`
 ```
 
-### 3. Connect
-Add the server to your client (Claude Code, Antigravity, etc.).
-```bash
-claude mcp add mcp-agents-memory node /path/to/build/index.js
-```
+The wizard searches for config in this order: `$MEMORY_CONFIG_PATH` → `./.env` → `~/.config/mcp-agents-memory/.env` → `<package>/.env`. Project-root `.env` always wins for dev workflows.
+
+### Requirements
+- PostgreSQL ≥ 14 with the `pgvector` extension.
+- **Required API key**: OpenAI (embeddings + Librarian extraction).
+- **Optional API keys**: Anthropic / Google / Tavily / Exa (used by the v4.5 Skill Auditor and v5.0 memory-grounding paths — disabled by default).
 
 ## Roadmap
 
 - [x] v0.4 — Librarian Engine (Auto extraction + resolution)
 - [x] v0.5 — Provenance Layer (Model/Platform tracking)
-- [x] v0.6 — **Knowledge Evolution**: Tiered Memory + Skill Grounding (Current)
-- [ ] v0.8 — **Memory Graph**: Advanced relationship traversal and auto-forgetting
+- [x] v0.6 — **Knowledge Evolution**: Tiered Memory + Skill Grounding
+- [x] v4.5 — Skill System closure (Curator + Auditor + Promotion + Injector filtering)
+- [x] v5.0 — Memory Graph + External Knowledge Grounding + Auto Forgetting + memory_restore
+- [ ] **Connectors**: GitHub / Notion / Drive ingestion
 - [ ] v1.0 — **Production Ready**: Full benchmark and stability
 
 ## License

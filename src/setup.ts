@@ -1,291 +1,316 @@
-import dotenv from 'dotenv';
-dotenv.config(); // Load environment variables BEFORE importing db
+/**
+ * Interactive setup wizard. Invoked by `mcp-agents-memory setup`.
+ *
+ * Flow:
+ *   1. Prompt user for DATABASE_URL (preferred) or individual DB_* fields.
+ *   2. Prompt for OpenAI key (required) + optional Tavily/Exa for grounding.
+ *   3. Write the resulting .env to ~/.config/mcp-agents-memory/.env (XDG).
+ *   4. Reload env from that location.
+ *   5. Apply base v0.4 schema (subjects, memories) idempotently.
+ *   6. Run `runAllMigrations()` so 006-011 land too.
+ *   7. Insert generic system seed subjects (system_global, system_orchestrator).
+ *
+ * Notes for future-me:
+ * - Existing dev environments with project-root .env will still work because
+ *   db.ts's loadEnv() searches `cwd/.env` BEFORE the XDG path. The wizard's
+ *   XDG write only takes effect for npx-style installs that run outside the
+ *   project tree.
+ * - Schema-vs-migrations divergence on a TRULY fresh DB has not been
+ *   verified end-to-end against a cloud Postgres yet (advisor flag from
+ *   the packaging session). Migrations 006/007 target a `facts` table that
+ *   never exists on a fresh install; they need a "skip-if-facts-missing"
+ *   guard before this wizard works on Neon. Tracked in scratch packaging spec.
+ */
 
-import inquirer from 'inquirer';
-import fs from 'fs';
-import { db } from './db.js';
-import { PACKAGE_VERSION } from './version.js';
+import inquirer from "inquirer";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import dotenv from "dotenv";
+import { db } from "./db.js";
+import { PACKAGE_VERSION } from "./version.js";
+import { runAllMigrations } from "./migrations/runner.js";
 
-async function setup() {
-  console.log("🚀 mcp-agents-memory Setup Wizard starting...");
+const XDG_DIR = path.join(os.homedir(), ".config", "mcp-agents-memory");
+const XDG_ENV_PATH = path.join(XDG_DIR, ".env");
 
-  const answers = await inquirer.prompt([
-    { type: 'input', name: 'dbHost', message: 'DB Host?', default: 'localhost' },
-    { type: 'input', name: 'dbPort', message: 'DB Port?', default: '5432' },
-    { type: 'input', name: 'dbUser', message: 'DB User?', default: 'postgres' },
-    { type: 'password', name: 'dbPass', message: 'DB Password?' },
-    { type: 'input', name: 'dbName', message: 'DB Name?', default: 'mcp_memory' },
-    { type: 'confirm', name: 'useSSH', message: 'Use SSH Tunnel?', default: false },
+function ensureXdgDir() {
+  fs.mkdirSync(XDG_DIR, { recursive: true });
+}
+
+async function promptDb(): Promise<{ envBlock: string; description: string }> {
+  const { mode } = await inquirer.prompt([
+    {
+      type: "list",
+      name: "mode",
+      message: "Database connection",
+      choices: [
+        { name: "Connection string (recommended — Neon, Supabase, Railway, etc.)", value: "url" },
+        { name: "Individual fields (host/port/user/pass/db)", value: "fields" },
+      ],
+      default: "url",
+    },
   ]);
 
-  let sshConfig = "";
-  if (answers.useSSH) {
-    const sshAnswers = await inquirer.prompt([
-      { type: 'input', name: 'sshHost', message: 'SSH Host?' },
-      { type: 'input', name: 'sshPort', message: 'SSH Port?', default: '22' },
-      { type: 'input', name: 'sshUser', message: 'SSH User?' },
-      { type: 'input', name: 'sshKey', message: 'SSH Private Key Path?' },
+  if (mode === "url") {
+    const { url } = await inquirer.prompt([
+      {
+        type: "password",
+        name: "url",
+        mask: "*",
+        message: "DATABASE_URL (postgres://user:pass@host:5432/db?sslmode=require)",
+        validate: (v: string) =>
+          /^postgres(ql)?:\/\//.test(v.trim()) || "Must start with postgres:// or postgresql://",
+      },
     ]);
-    sshConfig = `
-SSH_ENABLED=true
-SSH_HOST=${sshAnswers.sshHost}
-SSH_PORT=${sshAnswers.sshPort}
-SSH_USER=${sshAnswers.sshUser}
-SSH_KEY_PATH=${sshAnswers.sshKey}`;
-  } else {
-    sshConfig = "\nSSH_ENABLED=false";
+    const trimmed = url.trim();
+    return { envBlock: `DATABASE_URL=${trimmed}`, description: "DATABASE_URL" };
   }
 
-  // OpenAI API Key (required for semantic search + librarian)
-  console.log("\n🧠 AI Setup (Embeddings + Librarian)");
-  console.log("   Used for: semantic search (embeddings) + fact extraction (librarian)");
-  console.log("   Get your key at: https://platform.openai.com/api-keys\n");
-  const aiAnswers = await inquirer.prompt([
-    { type: 'password', name: 'openaiKey', message: 'OpenAI API Key? (sk-...)', mask: '*' },
+  const a = await inquirer.prompt([
+    { type: "input", name: "dbHost", message: "DB Host?", default: "localhost" },
+    { type: "input", name: "dbPort", message: "DB Port?", default: "5432" },
+    { type: "input", name: "dbUser", message: "DB User?", default: "postgres" },
+    { type: "password", name: "dbPass", message: "DB Password?", mask: "*" },
+    { type: "input", name: "dbName", message: "DB Name?", default: "mcp_memory" },
+    { type: "confirm", name: "ssl", message: "Connection requires SSL?", default: false },
   ]);
 
-  const openaiConfig = aiAnswers.openaiKey ? `\nOPENAI_API_KEY=${aiAnswers.openaiKey}` : '';
-  if (!aiAnswers.openaiKey) {
-    console.log("⚠️  No API key provided. Semantic search & Librarian will be disabled until you add OPENAI_API_KEY to .env");
+  const lines = [
+    `DB_HOST=${a.dbHost}`,
+    `DB_PORT=${a.dbPort}`,
+    `DB_USER=${a.dbUser}`,
+    `DB_PASS=${a.dbPass}`,
+    `DB_NAME=${a.dbName}`,
+  ];
+  if (a.ssl) lines.push("DB_SSL=true");
+  return { envBlock: lines.join("\n"), description: "individual DB_* fields" };
+}
+
+async function promptApiKeys(): Promise<string> {
+  console.log("\n🧠 AI keys");
+  console.log("  OpenAI is required for embeddings + Librarian fact extraction.");
+  console.log("  Tavily/Exa are optional (used for v4.5 Skill Auditor + v5.0 memory grounding).");
+  console.log("  Leave blank to skip a key — you can add it later by editing the config file.\n");
+
+  const a = await inquirer.prompt([
+    { type: "password", name: "openai", mask: "*", message: "OPENAI_API_KEY (sk-...)" },
+    { type: "password", name: "anthropic", mask: "*", message: "ANTHROPIC_API_KEY (optional, for grounding-pipeline reconciler)" },
+    { type: "password", name: "google", mask: "*", message: "GOOGLE_GENERATIVE_AI_API_KEY (optional, for Curator/Triage)" },
+    { type: "password", name: "tavily", mask: "*", message: "TAVILY_API_KEY (optional, recency search)" },
+    { type: "password", name: "exa", mask: "*", message: "EXA_API_KEY (optional, authority search)" },
+  ]);
+
+  const lines: string[] = [];
+  if (a.openai) lines.push(`OPENAI_API_KEY=${a.openai}`);
+  if (a.anthropic) lines.push(`ANTHROPIC_API_KEY=${a.anthropic}`);
+  if (a.google) lines.push(`GOOGLE_GENERATIVE_AI_API_KEY=${a.google}`);
+  if (a.tavily) lines.push(`TAVILY_API_KEY=${a.tavily}`);
+  if (a.exa) lines.push(`EXA_API_KEY=${a.exa}`);
+  lines.push("LIBRARIAN_MODEL=gpt-4o-mini");
+
+  if (!a.openai) {
+    console.log("⚠️  No OpenAI key — semantic search and Librarian extraction will fail at runtime.");
   }
 
-  // Librarian model selection
-  const librarianConfig = `\nLIBRARIAN_MODEL=gpt-4o-mini`;
+  return lines.join("\n");
+}
 
-  const envContent = `
-DB_HOST=${answers.dbHost}
-DB_PORT=${answers.dbPort}
-DB_USER=${answers.dbUser}
-DB_PASS=${answers.dbPass}
-DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}${librarianConfig}
-`;
+async function applyBaseSchema() {
+  console.log("\n📡 Applying base schema...");
 
-  fs.writeFileSync('.env', envContent.trim());
-  console.log("✅ .env file generated successfully.");
+  await db.query(`
+    CREATE OR REPLACE FUNCTION set_updated_at()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        NEW.updated_at = NOW();
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+  `);
 
-  dotenv.config();
+  await db.query(`CREATE EXTENSION IF NOT EXISTS vector`);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS subjects (
+        id SERIAL PRIMARY KEY,
+        subject_type VARCHAR(20) NOT NULL
+            CHECK (subject_type IN ('person', 'agent', 'project', 'team', 'system', 'category')),
+        subject_key VARCHAR(100) NOT NULL UNIQUE,
+        display_name VARCHAR(100) NOT NULL,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS memories (
+        id SERIAL PRIMARY KEY,
+        subject_id INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+        project_subject_id INTEGER REFERENCES subjects(id),
+        content TEXT NOT NULL,
+        source_text TEXT,
+        fact_type VARCHAR(20) NOT NULL
+            CHECK (fact_type IN ('preference', 'profile', 'state', 'skill', 'decision', 'learning', 'relationship')),
+        confidence SMALLINT NOT NULL DEFAULT 7
+            CHECK (confidence BETWEEN 1 AND 10),
+        importance SMALLINT NOT NULL DEFAULT 5
+            CHECK (importance BETWEEN 1 AND 10),
+        tags TEXT[] DEFAULT '{}',
+        embedding vector(1536),
+        source VARCHAR(20) NOT NULL DEFAULT 'librarian'
+            CHECK (source IN ('librarian', 'user', 'agent', 'system', 'migration')),
+        access_count INTEGER NOT NULL DEFAULT 0,
+        last_accessed_at TIMESTAMPTZ,
+        superseded_by INTEGER REFERENCES memories(id),
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await db.query(`
+    DO $$
+    DECLARE
+        t text;
+    BEGIN
+        FOR t IN
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name IN ('subjects', 'memories')
+        LOOP
+            EXECUTE format('DROP TRIGGER IF EXISTS trg_updated_at ON %I', t);
+            EXECUTE format(
+                'CREATE TRIGGER trg_updated_at BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION set_updated_at()',
+                t
+            );
+        END LOOP;
+    END $$;
+  `);
+
+  await db.query(`
+    CREATE OR REPLACE FUNCTION validate_project_subject_type()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF NEW.project_subject_id IS NOT NULL THEN
+            IF (SELECT subject_type FROM subjects WHERE id = NEW.project_subject_id) != 'project' THEN
+                RAISE EXCEPTION 'project_subject_id must reference a subject with type "project"';
+            END IF;
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    DROP TRIGGER IF EXISTS trg_validate_project_type_memories ON memories;
+    CREATE TRIGGER trg_validate_project_type_memories
+    BEFORE INSERT OR UPDATE ON memories
+    FOR EACH ROW
+    EXECUTE FUNCTION validate_project_subject_type();
+  `);
+
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_subjects_type ON subjects(subject_type);
+    CREATE INDEX IF NOT EXISTS idx_subjects_key ON subjects(subject_key);
+    CREATE INDEX IF NOT EXISTS idx_subjects_active ON subjects(is_active);
+    CREATE INDEX IF NOT EXISTS idx_memories_subject_id ON memories(subject_id);
+    CREATE INDEX IF NOT EXISTS idx_memories_project_subject_id ON memories(project_subject_id);
+    CREATE INDEX IF NOT EXISTS idx_memories_fact_type ON memories(fact_type);
+    CREATE INDEX IF NOT EXISTS idx_memories_is_active ON memories(is_active);
+    CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
+    CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories USING GIN(tags);
+    CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
+    CREATE INDEX IF NOT EXISTS idx_memories_superseded ON memories(superseded_by);
+    CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source);
+  `);
+}
+
+async function applyGenericSeed() {
+  console.log("🌱 Seeding system subjects...");
+  await db.query(
+    `
+    INSERT INTO subjects (subject_type, subject_key, display_name, metadata) VALUES
+    ('system',   'system_global',         'Global Context', '{}'),
+    ('system',   'system_orchestrator',   'Harness-Main', $1::jsonb)
+    ON CONFLICT (subject_key) DO NOTHING;
+  `,
+    [JSON.stringify({ version: PACKAGE_VERSION })]
+  );
+}
+
+export async function runSetupWizard(): Promise<void> {
+  console.log(`🚀 mcp-agents-memory setup wizard (v${PACKAGE_VERSION})\n`);
+
+  const { envBlock: dbBlock, description: dbDesc } = await promptDb();
+  const apiBlock = await promptApiKeys();
+
+  const envContent =
+    [
+      "# mcp-agents-memory configuration — generated by setup wizard",
+      `# Generated: ${new Date().toISOString()}`,
+      "",
+      dbBlock,
+      "",
+      apiBlock,
+      "",
+      "# Optional v5.0 background loops — opt-in",
+      "PROMOTION_ENABLED=false",
+      "FORGETTING_ENABLED=false",
+      "MEMORY_AUDIT_ENABLED=false",
+    ].join("\n") + "\n";
+
+  ensureXdgDir();
+  fs.writeFileSync(XDG_ENV_PATH, envContent, { mode: 0o600 });
+  console.log(`\n✅ Config written to ${XDG_ENV_PATH} (mode 0600)`);
+  console.log(`   Database: ${dbDesc}`);
+
+  // Reload env from the file we just wrote so the schema/migration phase can use it.
+  // db.ts memoizes the first load; we force a re-read by calling dotenv.config directly.
+  dotenv.config({ path: XDG_ENV_PATH, override: true });
 
   try {
-    console.log("📡 Connecting to Database to apply schema...");
+    await applyBaseSchema();
 
-    // ---------------------------------------------------------
-    // 1. Utility Functions
-    // ---------------------------------------------------------
-    console.log("🛠️ Creating utility functions...");
-    await db.query(`
-      CREATE OR REPLACE FUNCTION set_updated_at()
-      RETURNS TRIGGER AS $$
-      BEGIN
-          NEW.updated_at = NOW();
-          RETURN NEW;
-      END;
-      $$ LANGUAGE plpgsql;
-    `);
+    console.log("\n📦 Running migration runner...");
+    await runAllMigrations();
 
-    // ---------------------------------------------------------
-    // 2. Vector Support (pgvector) — must come before tables
-    // ---------------------------------------------------------
-    console.log("🧬 Setting up vector support...");
-    await db.query(`CREATE EXTENSION IF NOT EXISTS vector`);
+    await applyGenericSeed();
 
-    // ---------------------------------------------------------
-    // 3. Core Tables (v0.4 — simplified schema)
-    // ---------------------------------------------------------
-    console.log("📁 Creating tables...");
-
-    // subjects — 주체 관리 (유지)
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS subjects (
-          id SERIAL PRIMARY KEY,
-          subject_type VARCHAR(20) NOT NULL
-              CHECK (subject_type IN ('person', 'agent', 'project', 'team', 'system', 'category')),
-          subject_key VARCHAR(100) NOT NULL UNIQUE,
-          display_name VARCHAR(100) NOT NULL,
-          is_active BOOLEAN NOT NULL DEFAULT TRUE,
-          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    const cwdEnv = path.resolve(process.cwd(), ".env");
+    if (fs.existsSync(cwdEnv) && cwdEnv !== XDG_ENV_PATH) {
+      console.log(
+        `\nℹ️  A project-root ${cwdEnv} exists and takes precedence over the XDG config above.`
       );
-    `);
-
-    // memories — 통합 메모리 테이블 (신규)
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS memories (
-          id SERIAL PRIMARY KEY,
-
-          -- 소유자 & 프로젝트
-          subject_id INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
-          project_subject_id INTEGER REFERENCES subjects(id),
-
-          -- 핵심 내용
-          content TEXT NOT NULL,
-          source_text TEXT,
-
-          -- 분류
-          fact_type VARCHAR(20) NOT NULL
-              CHECK (fact_type IN ('preference', 'profile', 'state', 'skill', 'decision', 'learning', 'relationship')),
-
-          -- 품질 점수
-          confidence SMALLINT NOT NULL DEFAULT 7
-              CHECK (confidence BETWEEN 1 AND 10),
-          importance SMALLINT NOT NULL DEFAULT 5
-              CHECK (importance BETWEEN 1 AND 10),
-
-          -- 검색 & 태깅
-          tags TEXT[] DEFAULT '{}',
-          embedding vector(1536),
-
-          -- 추적
-          source VARCHAR(20) NOT NULL DEFAULT 'librarian'
-              CHECK (source IN ('librarian', 'user', 'agent', 'system', 'migration')),
-          access_count INTEGER NOT NULL DEFAULT 0,
-          last_accessed_at TIMESTAMPTZ,
-          superseded_by INTEGER REFERENCES memories(id),
-          is_active BOOLEAN NOT NULL DEFAULT TRUE,
-          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
-
-    // ---------------------------------------------------------
-    // 4. Triggers
-    // ---------------------------------------------------------
-    console.log("⚙️ Setting up triggers...");
-
-    // updated_at trigger for subjects and memories
-    await db.query(`
-      DO $$
-      DECLARE
-          t text;
-      BEGIN
-          FOR t IN
-              SELECT table_name
-              FROM information_schema.tables
-              WHERE table_schema = 'public'
-                AND table_name IN ('subjects', 'memories')
-          LOOP
-              EXECUTE format('DROP TRIGGER IF EXISTS trg_updated_at ON %I', t);
-              EXECUTE format(
-                  'CREATE TRIGGER trg_updated_at BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION set_updated_at()',
-                  t
-              );
-          END LOOP;
-      END $$;
-    `);
-
-    // Validate project_subject_id references a 'project' type subject
-    await db.query(`
-      CREATE OR REPLACE FUNCTION validate_project_subject_type()
-      RETURNS TRIGGER AS $$
-      BEGIN
-          IF NEW.project_subject_id IS NOT NULL THEN
-              IF (SELECT subject_type FROM subjects WHERE id = NEW.project_subject_id) != 'project' THEN
-                  RAISE EXCEPTION 'project_subject_id must reference a subject with type "project"';
-              END IF;
-          END IF;
-          RETURN NEW;
-      END;
-      $$ LANGUAGE plpgsql;
-
-      DROP TRIGGER IF EXISTS trg_validate_project_type_memories ON memories;
-      CREATE TRIGGER trg_validate_project_type_memories
-      BEFORE INSERT OR UPDATE ON memories
-      FOR EACH ROW
-      EXECUTE FUNCTION validate_project_subject_type();
-    `);
-
-    // ---------------------------------------------------------
-    // 5. Indices
-    // ---------------------------------------------------------
-    console.log("🔍 Creating indices...");
-    await db.query(`
-      -- subjects
-      CREATE INDEX IF NOT EXISTS idx_subjects_type ON subjects(subject_type);
-      CREATE INDEX IF NOT EXISTS idx_subjects_key ON subjects(subject_key);
-      CREATE INDEX IF NOT EXISTS idx_subjects_active ON subjects(is_active);
-
-      -- memories
-      CREATE INDEX IF NOT EXISTS idx_memories_subject_id ON memories(subject_id);
-      CREATE INDEX IF NOT EXISTS idx_memories_project_subject_id ON memories(project_subject_id);
-      CREATE INDEX IF NOT EXISTS idx_memories_fact_type ON memories(fact_type);
-      CREATE INDEX IF NOT EXISTS idx_memories_is_active ON memories(is_active);
-      CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
-      CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories USING GIN(tags);
-      CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
-      CREATE INDEX IF NOT EXISTS idx_memories_superseded ON memories(superseded_by);
-      CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source);
-    `);
-
-    // ---------------------------------------------------------
-    // 6. Data Migration (v0.3 → v0.4)
-    // ---------------------------------------------------------
-    // Check if old tables exist and migrate data
-    const oldTablesCheck = await db.query(`
-      SELECT table_name FROM information_schema.tables
-      WHERE table_schema = 'public' AND table_name IN ('task_learnings')
-    `);
-
-    if (oldTablesCheck.rows.length > 0) {
-      console.log("📦 Migrating data from v0.3 tables...");
-
-      // Migrate task_learnings → memories
-      const learningsExists = oldTablesCheck.rows.some((r: any) => r.table_name === 'task_learnings');
-      if (learningsExists) {
-        const learnCount = await db.query(`
-          INSERT INTO memories (subject_id, content, fact_type, confidence, importance, tags, embedding, source, created_at, updated_at)
-          SELECT
-            (SELECT id FROM subjects WHERE subject_key = 'system_global' LIMIT 1),
-            content, 'learning', confidence_score, impact_score, tags, embedding, 'migration', created_at, updated_at
-          FROM task_learnings
-          WHERE NOT EXISTS (
-            SELECT 1 FROM memories WHERE memories.content = task_learnings.content AND memories.source = 'migration'
-          )
-        `);
-        console.log(`   ✅ Migrated ${learnCount.rowCount} task_learnings → memories`);
-      }
-
-      // Drop old tables
-      console.log("🗑️ Removing deprecated tables...");
-      await db.query(`
-        DROP TABLE IF EXISTS raw_memories CASCADE;
-        DROP TABLE IF EXISTS subject_relationships CASCADE;
-        DROP TABLE IF EXISTS task_learnings CASCADE;
-        DROP TABLE IF EXISTS sessions CASCADE;
-        DROP TABLE IF EXISTS tasks CASCADE;
-      `);
-      console.log("   ✅ Old tables removed.");
+      console.log("   Delete or rename it if you want this XDG config to be active.");
     }
 
-    // ---------------------------------------------------------
-    // 7. Seed Data
-    // ---------------------------------------------------------
-    console.log("🌱 Seeding initial data...");
-    await db.query(`
-      INSERT INTO subjects (subject_type, subject_key, display_name, metadata) VALUES
-      ('person',   'user_hoon',             'Hoon', '{"role": "owner"}'),
-      ('agent',    'agent_claude',          'Claude', '{"provider": "anthropic"}'),
-      ('agent',    'agent_gemini',          'Gemini', '{"provider": "google"}'),
-      ('agent',    'agent_gpt',             'GPT',    '{"provider": "openai"}'),
-      ('project',  'project_centragens',    '센트라젠', '{}'),
-      ('project',  'project_yoontube',      'YoonTube', '{}'),
-      ('team',     'team_triplealab',       'TripleA Lab', '{}'),
-      ('system',   'system_orchestrator',   'Harness-Main', $1::jsonb),
-      ('system',   'system_global',         'Global Context', '{}'),
-      ('category', 'category_marketing',    'Marketing', '{}'),
-      ('category', 'category_branding',     'Branding', '{}'),
-      ('category', 'category_healthcare',   'Healthcare / Wellness', '{}')
-      ON CONFLICT (subject_key) DO NOTHING;
-    `, [JSON.stringify({ version: PACKAGE_VERSION })]);
-
-    console.log(`✅ Database setup completed successfully! (v${PACKAGE_VERSION})`);
+    console.log(`\n✅ Setup complete. Add this to your MCP client config:`);
+    console.log(`
+{
+  "mcpServers": {
+    "memory": {
+      "command": "npx",
+      "args": ["mcp-agents-memory"]
+    }
+  }
+}
+`);
   } catch (err) {
-    console.error("❌ Error during database setup:", err);
+    console.error("\n❌ Schema/migration phase failed:", err);
+    throw err;
   } finally {
-    await db.close();
-    process.exit(0);
+    await db.close().catch(() => {});
   }
 }
 
-setup();
+// Allow `node build/setup.js` to still work (legacy `npm run setup` path).
+const invokedDirectly =
+  process.argv[1] && process.argv[1].endsWith("/setup.js");
+if (invokedDirectly) {
+  runSetupWizard()
+    .then(() => process.exit(0))
+    .catch(() => process.exit(1));
+}
