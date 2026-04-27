@@ -27,10 +27,21 @@
     "ai",
     "memory",
     "agents",
-    "postgresql"
+    "postgresql",
+    "pgvector",
+    "claude",
+    "gemini"
   ],
-  "author": "triplealab",
+  "author": "Hoon <isaac@triplealab.com> (triplealab)",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/a3lab01create-bit/mcp-agents-memory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/a3lab01create-bit/mcp-agents-memory/issues"
+  },
+  "homepage": "https://github.com/a3lab01create-bit/mcp-agents-memory#readme",
   "dependencies": {},
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.91.1",

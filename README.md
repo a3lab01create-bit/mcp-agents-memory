@@ -63,47 +63,63 @@ v0.6 employs a sophisticated multi-role architecture using the best models for e
 
 ## Setup
 
-### Quick install (npx, cross-machine via cloud Postgres)
-
-If you want the same memory accessible from multiple computers, use a cloud Postgres provider with `pgvector` (Neon and Supabase both have free tiers).
+### Install
 
 ```bash
-# 1. Get a Postgres connection string from neon.tech (or Supabase). Make sure the
-#    URL ends with ?sslmode=require so the client negotiates SSL.
-
-# 2. Run the setup wizard. Writes config to ~/.config/mcp-agents-memory/.env,
-#    applies the base v0.4 schema, runs all migrations (idempotent), and
-#    seeds the minimum-viable system subjects. Verified end-to-end on Neon.
-npx github:USER/mcp-agents-memory setup
-# (replace USER once published; for local dev: `npm run setup` from this repo)
-
-# 3. Add to your MCP client config (Claude Desktop, Claude Code, etc.):
-#    {
-#      "mcpServers": {
-#        "memory": { "command": "npx", "args": ["mcp-agents-memory"] }
-#      }
-#    }
+npm i -g mcp-agents-memory
 ```
 
-On a second computer, repeat steps 2–3 with the **same** `DATABASE_URL`. Memory is shared automatically since the MCP server is stateless — the database is the source of truth.
+### Configure
 
-CLI subcommands:
+```bash
+mcp-agents-memory setup
+```
+
+The interactive wizard:
+- Prompts for your Postgres connection (cloud provider with `pgvector` recommended — [Neon](https://neon.tech) and [Supabase](https://supabase.com) both have free tiers; URL must end with `?sslmode=require`).
+- Asks for the required OpenAI key (embeddings).
+- Lets you pick a Librarian model preset (see below).
+- Writes config to `~/.config/mcp-agents-memory/.env`.
+- Applies the base schema and runs all migrations idempotently.
+
+### Add to your MCP client
+
+Claude Desktop / Claude Code / any MCP-aware client:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "mcp-agents-memory"
+    }
+  }
+}
+```
+
+### Cross-machine memory
+
+On a second computer, run `npm i -g mcp-agents-memory` and `mcp-agents-memory setup` pointing to the **same** `DATABASE_URL`. Memory shares automatically — the database is the source of truth and the MCP server is stateless.
+
+### CLI
+
 - `mcp-agents-memory` — run the MCP server (stdio).
 - `mcp-agents-memory setup` — interactive wizard (writes XDG config, applies schema + migrations).
 - `mcp-agents-memory migrate` — apply pending migrations against an already-configured database.
 - `mcp-agents-memory help` — show help.
 
-### Local development (this repo)
+### Local development
 
 For self-hosted Postgres or working on the codebase directly:
 
 ```bash
+git clone https://github.com/a3lab01create-bit/mcp-agents-memory.git
+cd mcp-agents-memory
 npm install
 npm run build
-npm run setup   # interactive wizard, same as `node build/index.js setup`
+npm run setup
 ```
 
-The wizard searches for config in this order: `$MEMORY_CONFIG_PATH` → `./.env` → `~/.config/mcp-agents-memory/.env` → `<package>/.env`. Project-root `.env` always wins for dev workflows.
+Config search order: `$MEMORY_CONFIG_PATH` → `./.env` → `~/.config/mcp-agents-memory/.env` → `<package>/.env`. Project-root `.env` wins for dev workflows.
 
 ### Requirements
 - PostgreSQL ≥ 14 with the `pgvector` extension.
@@ -133,6 +149,10 @@ Grounding roles (`skill_auditor` + `memory_auditor`) default to `claude-sonnet-4
 - [x] **Connectors v1**: Notion page ingestion (`connector_sync` MCP tool)
 - [ ] **Connectors v2**: Notion database iteration, GitHub, Drive
 - [ ] v1.0 — **Production Ready**: Full benchmark and stability
+
+## Credits
+
+Built by **Hoon** ([triplealab](https://github.com/a3lab01create-bit)) in collaboration with **Claude** (Anthropic) and **Codex** (OpenAI). Most of v0.5 / v0.6 / v4.5 / v5.0 was designed and implemented through iterative human-AI pair programming — eating our own dog food on the same memory and skill systems this server provides.
 
 ## License
 MIT
