@@ -1,7 +1,7 @@
 /**
  * Librarian Engine — Autonomous Fact Extraction & Contradiction Resolution
  * 
- * Uses a Multi-Model Pipeline (v0.6):
+ * Uses a Multi-Model Pipeline:
  * 1. Triage (Gemini Flash) - Noise removal
  * 2. Extraction (GPT-4o-mini) - Atomic fact generation
  * 3. Audit (Grok/Opus) - Quality assurance & refinement
@@ -367,11 +367,7 @@ export async function processBatch(
       result.facts.push({ id: newId, content: fact.content, fact_type: fact.fact_type, superseded: supersedes_id });
 
       if (fact.importance > 7) {
-        validationQueue.enqueue(() =>
-          validateFact(fact.content, newId)
-            .then(() => {})
-            .catch(err => console.error("❌ Validation error:", err))
-        );
+        scheduleValidation(fact.content, newId);
       }
     }
   } catch (err: any) {
@@ -409,5 +405,15 @@ class BoundedQueue {
   }
 }
 
-const VALIDATION_LIMIT = parseInt(process.env.VALIDATION_CONCURRENCY || '2');
+export function scheduleValidation(factContent: string, factId: number): void {
+  validationQueue.enqueue(() =>
+    validateFact(factContent, factId)
+      .then(() => {})
+      .catch(err => console.error(`❌ [ValidationQueue] validateFact failed for memory #${factId}:`, err))
+  );
+}
+
+const VALIDATION_LIMIT = parseInt(
+  process.env.VALIDATE_CONCURRENCY || process.env.VALIDATION_CONCURRENCY || '2'
+);
 export const validationQueue = new BoundedQueue(VALIDATION_LIMIT);

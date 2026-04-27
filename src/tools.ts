@@ -6,6 +6,7 @@ import { processBatch } from "./librarian.js";
 import { getInjectableSkills, recordSkillExposure, updateOrCreateSkill } from "./skills.js";
 import { auditSkill } from "./skill_auditor.js";
 import { runCurator } from "./curator.js";
+import { PACKAGE_VERSION } from "./version.js";
 
 // ─────────────────────────────────────────────────────────────
 // Shared Helpers
@@ -43,7 +44,7 @@ export async function getOrCreateSubject(subject_key: string | undefined | null,
 }
 
 // ─────────────────────────────────────────────────────────────
-// Tool Registration (v0.4 — 4 tools)
+// Tool Registration
 // ─────────────────────────────────────────────────────────────
 
 export function registerTools(server: McpServer) {
@@ -229,7 +230,7 @@ export function registerTools(server: McpServer) {
 
       // Format result
       const lines: string[] = [];
-      lines.push(`📚 Librarian Report (v0.5.2 Provenance Layer)`);
+      lines.push(`📚 Librarian Report (v${PACKAGE_VERSION})`);
       lines.push(`──────────────────────────────────────────`);
       lines.push(`Extracted: ${result.extracted} | Saved: ${result.saved} | Contradictions: ${result.contradictions_resolved}`);
 
@@ -413,7 +414,7 @@ export function registerTools(server: McpServer) {
       if (args.subject_key) {
         const subId = await getSubjectId(args.subject_key);
         if (subId === null) {
-          return { content: [{ type: "text", text: baseContext + `No subject found with key: ${args.subject_key}` }] };
+          return { content: [{ type: "text", text: baseContext + `No memories found for subject_key='${args.subject_key}' (subject does not exist)` }] };
         }
         params.push(subId);
         conditions.push(`(f.subject_id = $${params.length} OR f.project_subject_id = $${params.length})`);
@@ -492,7 +493,7 @@ export function registerTools(server: McpServer) {
     },
     async () => {
       const lines: string[] = [];
-      lines.push("📊 Memory Status Report (v0.5.2)");
+      lines.push(`📊 Memory Status Report (v${PACKAGE_VERSION})`);
       lines.push("═══════════════════════════════\n");
 
       // Total facts
@@ -524,7 +525,7 @@ export function registerTools(server: McpServer) {
       // System info
       lines.push("⚙️ System Info");
       lines.push("─────────────");
-      lines.push(`  Version: v0.5.2 (Provenance Layer)`);
+      lines.push(`  Version: ${PACKAGE_VERSION}`);
       lines.push(`  Librarian Model: ${process.env.LIBRARIAN_MODEL || 'gpt-4o-mini'}`);
       lines.push(`  Embedding Model: text-embedding-3-small`);
 

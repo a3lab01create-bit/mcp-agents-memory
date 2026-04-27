@@ -7,13 +7,14 @@ import { db } from "./db.js";
 import { registerTools } from "./tools.js";
 import { getOrCreateSubject } from "./tools.js";
 import { maybeStartPromotionLoop } from "./promotion.js";
+import { PACKAGE_VERSION } from "./version.js";
 import fs from 'fs';
 
 export let connectedClient: { name: string, version: string } | null = null;
 
 const server = new McpServer({
   name: "mcp-agents-memory",
-  version: "0.6.0",
+  version: PACKAGE_VERSION,
 }, {
   instructions: `This server provides long-term memory and autonomous context management.
 - ALWAYS call 'memory_startup' once at the beginning of a session to load user profile and recent state.
@@ -50,7 +51,7 @@ async function main() {
     // 1. Connect stdio immediately so Claude Code does not fail SessionStart hook
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error("🧠 Memory MCP Server (v0.5.0) running on stdio — Librarian Engine Active");
+    console.error(`🧠 Memory MCP Server (v${PACKAGE_VERSION}) running on stdio — Librarian Engine Active`);
 
     // 2. Initialize DB asynchronously in the background
     db.connect().then(() => {

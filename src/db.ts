@@ -3,9 +3,11 @@ import { createTunnel } from 'tunnel-ssh';
 import fs from 'fs';
 import dotenv from 'dotenv';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const defaultEnvPath = path.resolve(process.cwd(), '.env');
-const fallbackEnvPath = '/Users/hoon/Documents/Playgrounds/mcp-agents-memory/.env';
+const fallbackEnvPath = path.resolve(__dirname, '..', '.env');
 
 if (fs.existsSync(defaultEnvPath)) {
   dotenv.config({ path: defaultEnvPath });

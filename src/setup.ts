@@ -4,6 +4,7 @@ dotenv.config(); // Load environment variables BEFORE importing db
 import inquirer from 'inquirer';
 import fs from 'fs';
 import { db } from './db.js';
+import { PACKAGE_VERSION } from './version.js';
 
 async function setup() {
   console.log("🚀 mcp-agents-memory Setup Wizard starting...");
@@ -269,15 +270,15 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}${librarianConfig}
       ('project',  'project_centragens',    '센트라젠', '{}'),
       ('project',  'project_yoontube',      'YoonTube', '{}'),
       ('team',     'team_triplealab',       'TripleA Lab', '{}'),
-      ('system',   'system_orchestrator',   'Harness-Main', '{"version": "0.4.0"}'),
+      ('system',   'system_orchestrator',   'Harness-Main', $1::jsonb),
       ('system',   'system_global',         'Global Context', '{}'),
       ('category', 'category_marketing',    'Marketing', '{}'),
       ('category', 'category_branding',     'Branding', '{}'),
       ('category', 'category_healthcare',   'Healthcare / Wellness', '{}')
       ON CONFLICT (subject_key) DO NOTHING;
-    `);
+    `, [JSON.stringify({ version: PACKAGE_VERSION })]);
 
-    console.log("✅ Database setup completed successfully! (v0.4 Schema)");
+    console.log(`✅ Database setup completed successfully! (v${PACKAGE_VERSION})`);
   } catch (err) {
     console.error("❌ Error during database setup:", err);
   } finally {
