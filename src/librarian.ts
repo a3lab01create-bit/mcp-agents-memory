@@ -11,6 +11,9 @@ import { generateEmbedding, vectorToSql } from "./embeddings.js";
 import { db } from "./db.js";
 import { validateFact } from "./validator.js";
 import { callRole, ROLE_REGISTRY } from "./model_registry.js";
+import { getOrCreateSubject } from "./subjects.js";
+import { auditMemory } from "./memory_auditor.js";
+import type { AuditedMemory, MemoryValidationTier } from "./memory_auditor.js";
 
 // ─────────────────────────────────────────────────────────────
 // Clients
@@ -23,6 +26,17 @@ import { callRole, ROLE_REGISTRY } from "./model_registry.js";
 
 export type FactType = 'preference' | 'profile' | 'state' | 'skill' | 'decision' | 'learning' | 'relationship';
 
+export type RelationshipType = 'owns' | 'delegates_to' | 'advises' | 'reports_to' | 'collaborates';
+export const RELATIONSHIP_TYPES: ReadonlySet<RelationshipType> = new Set([
+  'owns', 'delegates_to', 'advises', 'reports_to', 'collaborates',
+]);
+
+export interface SubjectEdge {
+  from: string;
+  to: string;
+  type: RelationshipType;
+}
+
 export interface ExtractedFact {
   content: string;
   fact_type: FactType;
@@ -30,6 +44,7 @@ export interface ExtractedFact {
   importance: number;
   tags: string[];
   subject_hint?: string;
+  edge?: SubjectEdge;
   audit_required: boolean;
   audit_score?: number;
   audit_reason?: string[];
@@ -51,10 +66,12 @@ export interface ProcessResult {
   extracted: number;
   saved: number;
   contradictions_resolved: number;
-  sources: Array<{ 
-    title: string; 
-    url: string; 
-    snippet: string; 
+  edges_saved: number;
+  audited: number;
+  sources: Array<{
+    title: string;
+    url: string;
+    snippet: string;
     engine: 'tavily' | 'exa';
   }>;
   facts: Array<{ id: number; content: string; fact_type: FactType; superseded: number | null }>;
@@ -78,12 +95,20 @@ When fact_type is "profile" or "preference", ALSO set the profile axis:
 - When in doubt, default to "profile_static" — over-stable is less misleading than over-current.
 
 For fact_types other than profile/preference, do NOT add either tag.
-Output JSON: { "facts": [{ "content": "...", "fact_type": "...", "confidence": 1-10, "importance": 1-10, "tags": ["..."], "subject_hint": "..." }] }`;
+
+When fact_type is "relationship", ALSO include an "edge" object describing the directed link between two subjects:
+  edge: { "from": "<subject_key>", "to": "<subject_key>", "type": "owns" | "delegates_to" | "advises" | "reports_to" | "collaborates" }
+Subject keys MUST be lowercase slug strings prefixed by entity type — user_<name>, agent_<name>, project_<name>, team_<name>, system_<name>, category_<name>.
+Example: { "from": "user_hoon", "to": "project_centragens", "type": "owns" }
+If you cannot confidently identify BOTH endpoints AND a relationship type from the allowed list, OMIT the edge field (still emit the fact). Never invent endpoints.
+
+Output JSON: { "facts": [{ "content": "...", "fact_type": "...", "confidence": 1-10, "importance": 1-10, "tags": ["..."], "subject_hint": "...", "edge": { "from": "...", "to": "...", "type": "..." } }] }`;
 
 const AUDIT_SYSTEM_PROMPT = `You are a Senior Librarian Auditor. Review and refine extracted facts.
 Refine wording for clarity and ensure high-stakes facts (decisions, preferences) are precise.
 CRITICAL: Each input fact has an "_idx" field — preserve it EXACTLY in your output. Do not modify, drop, or renumber it.
-Return JSON: { "facts": [{"_idx": 0, "content": "...", "fact_type": "...", "confidence": 1-10, "importance": 1-10, "tags": [...]}, ...] }`;
+If the input fact has an "edge" field, preserve it verbatim — do not modify endpoints or relationship_type.
+Return JSON: { "facts": [{"_idx": 0, "content": "...", "fact_type": "...", "confidence": 1-10, "importance": 1-10, "tags": [...], "edge": {...}?}, ...] }`;
 
 const CONTRADICTION_SYSTEM_PROMPT = `You are a Contradiction Resolver.
 Given a NEW FACT and EXISTING FACTS for the same subject, decide if the new fact SUPERSEDES any existing fact.
@@ -324,6 +349,102 @@ async function resolveContradiction(
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Memory Auditor gate (v5.0 External Knowledge Grounding)
+// ─────────────────────────────────────────────────────────────
+
+const AUDITABLE_FACT_TYPES: ReadonlySet<FactType> = new Set(['learning']);
+
+function memoryAuditEnabled(): boolean {
+  const flag = (process.env.MEMORY_AUDIT_ENABLED || '').toLowerCase();
+  return flag === '1' || flag === 'true' || flag === 'yes';
+}
+
+function shouldAuditFact(fact: ExtractedFact): boolean {
+  if (!memoryAuditEnabled()) return false;
+  if (!AUDITABLE_FACT_TYPES.has(fact.fact_type)) return false;
+  return fact.importance > 7;
+}
+
+/**
+ * Map MemoryValidationTier → memories.validation_status (free-form VARCHAR(20)).
+ * 'unvalidated' returns null so callers know to skip persistence (no row in fact_validations).
+ */
+function tierToStatus(tier: MemoryValidationTier): string | null {
+  switch (tier) {
+    case 'validated_external':
+    case 'validated_internal':
+      return 'valid';
+    case 'contested':
+      return 'contested';
+    case 'unvalidated':
+      return null;
+  }
+}
+
+async function persistAuditResult(
+  factId: number,
+  audited: AuditedMemory,
+  originalContent: string
+): Promise<void> {
+  const status = tierToStatus(audited.validation_tier);
+  if (status === null) return; // skip persistence for unvalidated
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO fact_validations (fact_id, status, confidence_score, research_report, metadata)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        factId,
+        audited.validation_tier,
+        audited.validation_tier === 'validated_external' ? 0.9 : audited.validation_tier === 'validated_internal' ? 0.7 : 0.4,
+        audited.audit_reasoning,
+        JSON.stringify({ sources: audited.sources, original_content: originalContent, audit_path: 'sync' }),
+      ]
+    );
+    await client.query(
+      `UPDATE memories SET validation_status = $1, last_validated_at = NOW() WHERE id = $2`,
+      [status, factId]
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(`❌ [MemoryAuditor] Failed to persist audit for fact #${factId}:`, err);
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Upsert a directed edge into subject_relationships.
+ * Returns true if a NEW edge was inserted, false if skipped or already existed.
+ * Skips: invalid relationship_type, missing endpoints, self-loops.
+ */
+async function upsertSubjectEdge(edge: SubjectEdge): Promise<boolean> {
+  if (!edge.from || !edge.to) return false;
+  if (!RELATIONSHIP_TYPES.has(edge.type)) {
+    console.error(`⚠️ [Librarian] Invalid relationship_type "${edge.type}" — skipping edge`);
+    return false;
+  }
+  try {
+    const fromId = await getOrCreateSubject(edge.from);
+    const toId = await getOrCreateSubject(edge.to);
+    if (fromId === toId) return false; // self-loop blocked by CHECK anyway
+    const res = await db.query(
+      `INSERT INTO subject_relationships (from_subject_id, to_subject_id, relationship_type)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (from_subject_id, to_subject_id, relationship_type) DO NOTHING
+       RETURNING id`,
+      [fromId, toId, edge.type]
+    );
+    return res.rowCount! > 0;
+  } catch (err) {
+    console.error(`❌ [Librarian] upsertSubjectEdge failed:`, err);
+    return false;
+  }
+}
+
 export async function processBatch(
   text: string,
   subjectId: number,
@@ -331,7 +452,7 @@ export async function processBatch(
   rawSource: string,
   provenance: ProvenanceInfo = {}
 ): Promise<ProcessResult> {
-  const result: ProcessResult = { extracted: 0, saved: 0, contradictions_resolved: 0, sources: [], facts: [], errors: [] };
+  const result: ProcessResult = { extracted: 0, saved: 0, contradictions_resolved: 0, edges_saved: 0, audited: 0, sources: [], facts: [], errors: [] };
 
   try {
     const segments = await triageTranscript(text);
@@ -363,6 +484,23 @@ export async function processBatch(
     result.extracted = audited.length;
 
     for (const fact of audited) {
+      // v5.0 SYNC Memory Auditor — gate on env flag + fact_type + importance.
+      // Runs BEFORE embedding so the persisted vector matches the reconciled wording.
+      const originalContent = fact.content;
+      let auditResult: AuditedMemory | null = null;
+      if (shouldAuditFact(fact)) {
+        try {
+          auditResult = await auditMemory(fact.content, fact.fact_type);
+          if (auditResult.reconciled_content && auditResult.reconciled_content !== fact.content) {
+            fact.content = auditResult.reconciled_content;
+          }
+          result.audited++;
+        } catch (err: any) {
+          console.error(`❌ [Librarian] auditMemory failed:`, err);
+          result.errors.push(`auditMemory: ${err?.message || err}`);
+        }
+      }
+
       const emb = await generateEmbedding(fact.content);
       const { supersedes_id } = await resolveContradiction(fact, subjectId, emb || undefined);
 
@@ -377,6 +515,10 @@ export async function processBatch(
       const trustWeight = resolvedModel?.trust_weight ?? DEFAULT_TRUST_WEIGHT;
       const effectiveConfidence = computeEffectiveConfidence(fact.confidence, trustWeight);
 
+      // Pick validation_status: sync audit wins; otherwise legacy async-pending rule.
+      const auditedStatus = auditResult ? tierToStatus(auditResult.validation_tier) : null;
+      const validationStatus = auditedStatus ?? (fact.importance > 7 ? 'pending' : 'valid');
+
       const insertRes = await db.query(
         `INSERT INTO memories (
            subject_id, project_subject_id, content, fact_type,
@@ -387,10 +529,10 @@ export async function processBatch(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
          RETURNING id`,
         [
-          subjectId, projectId, fact.content, fact.fact_type, 
-          fact.confidence, fact.importance, fact.tags, 
+          subjectId, projectId, fact.content, fact.fact_type,
+          fact.confidence, fact.importance, fact.tags,
           emb ? vectorToSql(emb) : null,
-          fact.importance > 7 ? 'pending' : 'valid',
+          validationStatus,
           provenance.author_model, provenance.platform, provenance.session_id,
           resolvedModel?.id ?? null,
           resolvedPlatform?.id ?? null,
@@ -402,7 +544,20 @@ export async function processBatch(
       result.saved++;
       result.facts.push({ id: newId, content: fact.content, fact_type: fact.fact_type, superseded: supersedes_id });
 
-      if (fact.importance > 7) {
+      // v5.0 Memory Graph — persist directed edge alongside the relationship fact.
+      if (fact.fact_type === 'relationship' && fact.edge) {
+        const inserted = await upsertSubjectEdge(fact.edge);
+        if (inserted) result.edges_saved++;
+      }
+
+      // Persist sync audit result OR fall back to async validation queue.
+      // Apply the same fact_type gate to async — subjective facts (preference / profile /
+      // state / relationship) should never be web-grounded regardless of importance.
+      if (auditResult) {
+        if (auditedStatus !== null) {
+          await persistAuditResult(newId, auditResult, originalContent);
+        }
+      } else if (fact.importance > 7 && AUDITABLE_FACT_TYPES.has(fact.fact_type)) {
         scheduleValidation(fact.content, newId);
       }
     }

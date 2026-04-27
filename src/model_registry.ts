@@ -16,7 +16,7 @@ import OpenAI from "openai";
 // ─────────────────────────────────────────────────────────────
 
 export type Provider = 'openai' | 'anthropic' | 'google' | 'xai';
-export type Role = 'triage' | 'extract' | 'audit' | 'contradiction' | 'skill_curator' | 'skill_auditor';
+export type Role = 'triage' | 'extract' | 'audit' | 'contradiction' | 'skill_curator' | 'skill_auditor' | 'memory_auditor';
 
 export interface ModelSpec {
   provider: Provider;
@@ -64,6 +64,7 @@ export const ROLE_REGISTRY: Record<Role, ModelSpec> = {
   contradiction: { provider: 'openai',    model_name: process.env.CONTRADICTION_MODEL || 'gpt-4o-mini' },
   skill_curator: { provider: 'openai',    model_name: process.env.SKILL_CURATOR_MODEL || 'gpt-4o-mini' },
   skill_auditor: { provider: 'anthropic', model_name: process.env.SKILL_AUDITOR_MODEL || 'claude-sonnet-4-6' },
+  memory_auditor: { provider: 'anthropic', model_name: process.env.MEMORY_AUDITOR_MODEL || 'claude-sonnet-4-6' },
 };
 
 // Validate at module load

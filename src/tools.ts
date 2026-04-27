@@ -12,36 +12,8 @@ import { PACKAGE_VERSION } from "./version.js";
 // Shared Helpers
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Read-only subject lookup. Returns null if not found.
- * Use this in search paths to avoid phantom subject creation.
- */
-export async function getSubjectId(subject_key: string): Promise<number | null> {
-  const res = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [subject_key]);
-  return res.rows.length > 0 ? res.rows[0].id : null;
-}
-
-export async function getOrCreateSubject(subject_key: string | undefined | null, fallback_type: string = 'system'): Promise<number> {
-  const finalKey = subject_key || 'system_global';
-
-  let guessedType = fallback_type;
-  if (finalKey.startsWith('user_')) guessedType = 'person';
-  else if (finalKey.startsWith('project_')) guessedType = 'project';
-  else if (finalKey.startsWith('agent_')) guessedType = 'agent';
-  else if (finalKey.startsWith('team_')) guessedType = 'team';
-  else if (finalKey.startsWith('category_')) guessedType = 'category';
-  else if (finalKey.startsWith('system_')) guessedType = 'system';
-
-  // Atomic upsert — race-safe. DO UPDATE SET ... is a no-op trick to make RETURNING fire on conflict.
-  const res = await db.query(
-    `INSERT INTO subjects (subject_type, subject_key, display_name)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (subject_key) DO UPDATE SET subject_key = EXCLUDED.subject_key
-     RETURNING id`,
-    [guessedType, finalKey, finalKey]
-  );
-  return res.rows[0].id;
-}
+export { getSubjectId, getOrCreateSubject } from "./subjects.js";
+import { getSubjectId, getOrCreateSubject } from "./subjects.js";
 
 // ─────────────────────────────────────────────────────────────
 // Tool Registration
@@ -259,7 +231,7 @@ export function registerTools(server: McpServer) {
       const lines: string[] = [];
       lines.push(`📚 Librarian Report (v${PACKAGE_VERSION})`);
       lines.push(`──────────────────────────────────────────`);
-      lines.push(`Extracted: ${result.extracted} | Saved: ${result.saved} | Contradictions: ${result.contradictions_resolved}`);
+      lines.push(`Extracted: ${result.extracted} | Saved: ${result.saved} | Contradictions: ${result.contradictions_resolved} | Edges: ${result.edges_saved} | Audited: ${result.audited}`);
 
       if (result.facts.length > 0) {
         lines.push("");
@@ -404,6 +376,7 @@ export function registerTools(server: McpServer) {
         subject_key: z.string().optional().describe("Filter by subject. Omit for global search."),
         fact_type: z.enum(['preference', 'profile', 'state', 'skill', 'decision', 'learning', 'relationship']).optional().describe("Filter by fact type."),
         tags: z.array(z.string()).optional().describe("Filter by tags."),
+        expand_via_graph: z.boolean().optional().default(false).describe("When subject_key is set, also include memories whose subject is 1 hop away via subject_relationships. Off by default."),
         limit: z.number().optional().default(5),
       }
     },
@@ -443,8 +416,22 @@ export function registerTools(server: McpServer) {
         if (subId === null) {
           return { content: [{ type: "text", text: baseContext + `No memories found for subject_key='${args.subject_key}' (subject does not exist)` }] };
         }
-        params.push(subId);
-        conditions.push(`(f.subject_id = $${params.length} OR f.project_subject_id = $${params.length})`);
+        if (args.expand_via_graph) {
+          const neighbors = await db.query(
+            `SELECT $1::int AS id
+             UNION
+             SELECT to_subject_id FROM subject_relationships WHERE from_subject_id = $1
+             UNION
+             SELECT from_subject_id FROM subject_relationships WHERE to_subject_id = $1`,
+            [subId]
+          );
+          const ids = neighbors.rows.map((r: any) => r.id);
+          params.push(ids);
+          conditions.push(`(f.subject_id = ANY($${params.length}::int[]) OR f.project_subject_id = ANY($${params.length}::int[]))`);
+        } else {
+          params.push(subId);
+          conditions.push(`(f.subject_id = $${params.length} OR f.project_subject_id = $${params.length})`);
+        }
       }
 
       if (args.fact_type) {
@@ -548,6 +535,26 @@ export function registerTools(server: McpServer) {
           lines.push("");
         }
       } catch (e) { /* silent */ }
+
+      // Memory Graph (v5.0)
+      try {
+        const totalEdges = await db.query(`SELECT COUNT(*)::int AS count FROM subject_relationships`);
+        const byRel = await db.query(
+          `SELECT relationship_type, COUNT(*)::int AS count
+           FROM subject_relationships
+           GROUP BY relationship_type ORDER BY count DESC`
+        );
+        const total = totalEdges.rows[0]?.count ?? 0;
+        if (total > 0 || byRel.rows.length > 0) {
+          lines.push("🕸️ Memory Graph");
+          lines.push("───────────────");
+          lines.push(`  Total edges: ${total}`);
+          byRel.rows.forEach((r: any) => {
+            lines.push(`  ${r.relationship_type}: ${r.count}`);
+          });
+          lines.push("");
+        }
+      } catch (e) { /* silent — table may not exist yet */ }
 
       // System info
       lines.push("⚙️ System Info");
