@@ -50,6 +50,7 @@ interface PersistedSkillFields {
   content: string;
   sources: string;
   validationTier: ValidationTier;
+  applicableTo: string;
   auditMetadata: Record<string, unknown>;
 }
 
@@ -66,6 +67,7 @@ function getPersistedSkillFields(
       content: candidate.content,
       sources: JSON.stringify([]),
       validationTier: 'unvalidated',
+      applicableTo: JSON.stringify({}),
       auditMetadata: {},
     };
   }
@@ -74,10 +76,12 @@ function getPersistedSkillFields(
     content: audit.reconciled_content,
     sources: JSON.stringify(audit.sources),
     validationTier: audit.validation_tier,
+    applicableTo: JSON.stringify(audit.applicable_to ?? {}),
     auditMetadata: {
       validation_tier: audit.validation_tier,
       audit_reasoning: audit.audit_reasoning,
       sources: audit.sources,
+      applicable_to: audit.applicable_to ?? {},
     },
   };
 }
@@ -217,9 +221,9 @@ export async function updateOrCreateSkill(
       const insertRes = await client.query(
         `INSERT INTO skills (
            title, content, embedding, parent_skill_id,
-           origin_model_ids, origin_platform_ids, validation_tier, sources, last_used_at
+           origin_model_ids, origin_platform_ids, validation_tier, sources, applicable_to, last_used_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
          RETURNING id, parent_skill_id`,
         [
           candidate.title,
@@ -230,6 +234,7 @@ export async function updateOrCreateSkill(
           originPlatformIds,
           persisted.validationTier,
           persisted.sources,
+          persisted.applicableTo,
         ]
       );
 
@@ -267,9 +272,9 @@ export async function updateOrCreateSkill(
     const insertRes = await client.query(
       `INSERT INTO skills (
          title, content, embedding,
-         origin_model_ids, origin_platform_ids, validation_tier, sources, last_used_at
+         origin_model_ids, origin_platform_ids, validation_tier, sources, applicable_to, last_used_at
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
        RETURNING id, parent_skill_id`,
       [
         candidate.title,
@@ -279,6 +284,7 @@ export async function updateOrCreateSkill(
         originPlatformIds,
         persisted.validationTier,
         persisted.sources,
+        persisted.applicableTo,
       ]
     );
 
