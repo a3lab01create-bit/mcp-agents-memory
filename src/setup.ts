@@ -142,6 +142,7 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}${librarianConfig}
           last_accessed_at TIMESTAMPTZ,
           superseded_by INTEGER REFERENCES memories(id),
           is_active BOOLEAN NOT NULL DEFAULT TRUE,
+          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
 
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

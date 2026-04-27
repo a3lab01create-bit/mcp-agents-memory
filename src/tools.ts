@@ -513,9 +513,12 @@ export function registerTools(server: McpServer) {
       // Total facts
       try {
         const total = await db.query(`SELECT COUNT(*) as count FROM memories WHERE is_active = TRUE`);
-        const inactive = await db.query(`SELECT COUNT(*) as count FROM memories WHERE is_active = FALSE`);
+        const superseded = await db.query(
+          `SELECT COUNT(*) as count FROM memories
+           WHERE is_active = FALSE AND superseded_by IS NOT NULL`
+        );
         lines.push(`Total active facts: ${total.rows[0].count}`);
-        lines.push(`Superseded facts: ${inactive.rows[0].count}`);
+        lines.push(`Superseded facts: ${superseded.rows[0].count}`);
         lines.push("");
       } catch (e) { lines.push("⚠️ Could not fetch totals\n"); }
 
@@ -555,6 +558,29 @@ export function registerTools(server: McpServer) {
           lines.push("");
         }
       } catch (e) { /* silent — table may not exist yet */ }
+
+      // Auto Forgetting (v5.0 Phase 3)
+      try {
+        const forgottenTotal = await db.query(
+          `SELECT COUNT(*)::int AS count FROM memories
+           WHERE is_active = FALSE AND metadata ? 'forgotten_at'`
+        );
+        const byTypeForgotten = await db.query(
+          `SELECT fact_type, COUNT(*)::int AS count FROM memories
+           WHERE is_active = FALSE AND metadata ? 'forgotten_at'
+           GROUP BY fact_type ORDER BY count DESC`
+        );
+        const total = forgottenTotal.rows[0]?.count ?? 0;
+        if (total > 0) {
+          lines.push("🗑️ Forgetting");
+          lines.push("─────────────");
+          lines.push(`  Total forgotten: ${total}`);
+          byTypeForgotten.rows.forEach((r: any) => {
+            lines.push(`  ${r.fact_type}: ${r.count}`);
+          });
+          lines.push("");
+        }
+      } catch (e) { /* silent — metadata column may not exist on older deployments */ }
 
       // System info
       lines.push("⚙️ System Info");

@@ -7,6 +7,7 @@ import { db } from "./db.js";
 import { registerTools } from "./tools.js";
 import { getOrCreateSubject } from "./tools.js";
 import { maybeStartPromotionLoop } from "./promotion.js";
+import { maybeStartForgettingLoop } from "./forgetting.js";
 import { PACKAGE_VERSION } from "./version.js";
 import fs from 'fs';
 
@@ -73,3 +74,4 @@ async function main() {
 
 main().catch(console.error);
 maybeStartPromotionLoop();
+maybeStartForgettingLoop();
