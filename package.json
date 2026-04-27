@@ -16,7 +16,6 @@
   ],
   "scripts": {
     "build": "tsc",
-    "prepare": "tsc",
     "start": "node build/index.js",
     "dev": "ts-node --esm src/index.ts",
     "setup": "tsc && node build/index.js setup",
