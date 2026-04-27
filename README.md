@@ -117,7 +117,8 @@ The wizard searches for config in this order: `$MEMORY_CONFIG_PATH` → `./.env`
 - [x] v0.6 — **Knowledge Evolution**: Tiered Memory + Skill Grounding
 - [x] v4.5 — Skill System closure (Curator + Auditor + Promotion + Injector filtering)
 - [x] v5.0 — Memory Graph + External Knowledge Grounding + Auto Forgetting + memory_restore
-- [ ] **Connectors**: GitHub / Notion / Drive ingestion
+- [x] **Connectors v1**: Notion page ingestion (`connector_sync` MCP tool)
+- [ ] **Connectors v2**: Notion database iteration, GitHub, Drive
 - [ ] v1.0 — **Production Ready**: Full benchmark and stability
 
 ## License
