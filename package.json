@@ -16,6 +16,7 @@
   ],
   "scripts": {
     "build": "node build.mjs",
+    "prepare": "true",
     "start": "node build/index.js",
     "dev": "ts-node --esm src/index.ts",
     "setup": "npm run build && node build/index.js setup",
