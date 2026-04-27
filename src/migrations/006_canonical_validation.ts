@@ -28,36 +28,43 @@ async function migrate() {
       await client.query('BEGIN');
       console.log("🛠️  Applying schema changes within transaction...");
 
-      // A. facts 테이블 컬럼 추가
+      // Detect target table — fresh installs have only `memories`,
+      // legacy upgrades may still carry `facts` (renamed by migration 008).
+      const tablesRes = await client.query(`
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema='public' AND table_name IN ('facts', 'memories')
+      `);
+      const tables = new Set(tablesRes.rows.map((r: any) => r.table_name));
+      const target = tables.has('memories')
+        ? 'memories'
+        : tables.has('facts')
+        ? 'facts'
+        : null;
+      if (!target) {
+        throw new Error(
+          "Neither 'facts' nor 'memories' exists. Run setup so the base schema is created before applying migrations."
+        );
+      }
+      console.log(`   Target table: ${target}`);
+
+      // A. Add provenance columns to the active table.
       await client.query(`
-        DO $$ 
-        BEGIN 
-          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='facts' AND column_name='author_model') THEN
-            ALTER TABLE facts ADD COLUMN author_model VARCHAR(100);
-          END IF;
-          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='facts' AND column_name='platform') THEN
-            ALTER TABLE facts ADD COLUMN platform VARCHAR(100);
-          END IF;
-          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='facts' AND column_name='session_id') THEN
-            ALTER TABLE facts ADD COLUMN session_id VARCHAR(100);
-          END IF;
-          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='facts' AND column_name='validation_status') THEN
-            ALTER TABLE facts ADD COLUMN validation_status VARCHAR(20) DEFAULT 'pending';
-          END IF;
-          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='facts' AND column_name='last_validated_at') THEN
-            ALTER TABLE facts ADD COLUMN last_validated_at TIMESTAMPTZ;
-          END IF;
-        END $$;
+        ALTER TABLE ${target}
+          ADD COLUMN IF NOT EXISTS author_model       VARCHAR(100),
+          ADD COLUMN IF NOT EXISTS platform           VARCHAR(100),
+          ADD COLUMN IF NOT EXISTS session_id         VARCHAR(100),
+          ADD COLUMN IF NOT EXISTS validation_status  VARCHAR(20) DEFAULT 'pending',
+          ADD COLUMN IF NOT EXISTS last_validated_at  TIMESTAMPTZ;
       `);
 
-      // SAFE TO DROP: 이전 fact_validations는 v0.6_schema/v0.6_validation 충돌로
-      // 일관성 없는 상태였으므로 데이터 손실 없음. 향후 마이그레이션은 ALTER 우선.
+      // SAFE TO DROP: prior fact_validations versions were inconsistent
+      // (v0.6_schema/v0.6_validation conflict). Recreated with the canonical
+      // schema and an FK to whichever table currently holds memories.
       await client.query(`DROP TABLE IF EXISTS fact_validations CASCADE;`);
-      
       await client.query(`
         CREATE TABLE fact_validations (
             id SERIAL PRIMARY KEY,
-            fact_id INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+            fact_id INTEGER NOT NULL REFERENCES ${target}(id) ON DELETE CASCADE,
             status VARCHAR(20) NOT NULL,
             confidence_score FLOAT NOT NULL,
             research_report TEXT,

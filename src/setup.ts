@@ -116,7 +116,7 @@ async function promptApiKeys(): Promise<string> {
   return lines.join("\n");
 }
 
-async function applyBaseSchema() {
+export async function applyBaseSchema() {
   console.log("\n📡 Applying base schema...");
 
   await db.query(`
@@ -228,7 +228,7 @@ async function applyBaseSchema() {
   `);
 }
 
-async function applyGenericSeed() {
+export async function applyGenericSeed() {
   console.log("🌱 Seeding system subjects...");
   await db.query(
     `

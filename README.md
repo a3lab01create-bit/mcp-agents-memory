@@ -71,12 +71,9 @@ If you want the same memory accessible from multiple computers, use a cloud Post
 # 1. Get a Postgres connection string from neon.tech (or Supabase). Make sure the
 #    URL ends with ?sslmode=require so the client negotiates SSL.
 
-# 2. Run the setup wizard. It writes config to ~/.config/mcp-agents-memory/.env
-#    and applies the base v0.4 schema. NOTE: end-to-end fresh-cloud-DB install is
-#    still being validated — migrations 006-007 target an older `facts` schema that
-#    a fresh database doesn't have. If you hit a migration error, drop into this
-#    repo and run `npm run setup` against a dev DB while the cloud-fresh path
-#    gets stabilised in the next slice.
+# 2. Run the setup wizard. Writes config to ~/.config/mcp-agents-memory/.env,
+#    applies the base v0.4 schema, runs all migrations (idempotent), and
+#    seeds the minimum-viable system subjects. Verified end-to-end on Neon.
 npx github:USER/mcp-agents-memory setup
 # (replace USER once published; for local dev: `npm run setup` from this repo)
 
