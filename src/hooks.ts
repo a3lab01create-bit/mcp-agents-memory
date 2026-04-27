@@ -1,7 +1,7 @@
 /**
  * Recall Hook System for Claude Code & AI Agents (v0.4)
  * 
- * Simplified for the new facts-based schema.
+ * Simplified for the new memories-based schema.
  * This layer manages intelligent retrieval and summarization of long-term memories.
  */
 

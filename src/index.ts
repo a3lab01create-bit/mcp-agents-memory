@@ -6,12 +6,31 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { db } from "./db.js";
 import { registerTools } from "./tools.js";
 import { getOrCreateSubject } from "./tools.js";
+import { maybeStartPromotionLoop } from "./promotion.js";
 import fs from 'fs';
+
+export let connectedClient: { name: string, version: string } | null = null;
 
 const server = new McpServer({
   name: "mcp-agents-memory",
-  version: "0.5.0"
+  version: "0.6.0",
+}, {
+  instructions: `This server provides long-term memory and autonomous context management.
+- ALWAYS call 'memory_startup' once at the beginning of a session to load user profile and recent state.
+- Use 'memory_search' before answering questions that might rely on past interactions or preferences.
+- Use 'memory_add' to store new atomic facts, decisions, or project updates discovered during the conversation.
+- If multiple conflicting facts are found (status: 'contested'), ask the user for clarification.`
 });
+
+// We'll intercept the connection to get client info
+const originalConnect = server.connect.bind(server);
+server.connect = async (transport: any) => {
+  // The SDK doesn't expose the initialize params easily, 
+  // but we can try to infer from the environment or transport if needed.
+  // For now, we'll look for standard environment signals.
+  console.error("🚀 Memory server starting connection...");
+  return originalConnect(transport);
+};
 
 // Register all memory tools with enriched descriptions
 registerTools(server);
@@ -52,3 +71,4 @@ async function main() {
 }
 
 main().catch(console.error);
+maybeStartPromotionLoop();

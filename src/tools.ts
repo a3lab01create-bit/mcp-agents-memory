@@ -3,15 +3,25 @@ import { z } from "zod";
 import { db } from "./db.js";
 import { generateEmbedding, vectorToSql } from "./embeddings.js";
 import { processBatch } from "./librarian.js";
+import { getInjectableSkills, recordSkillExposure, updateOrCreateSkill } from "./skills.js";
+import { auditSkill } from "./skill_auditor.js";
+import { runCurator } from "./curator.js";
 
 // ─────────────────────────────────────────────────────────────
 // Shared Helpers
 // ─────────────────────────────────────────────────────────────
 
+/**
+ * Read-only subject lookup. Returns null if not found.
+ * Use this in search paths to avoid phantom subject creation.
+ */
+export async function getSubjectId(subject_key: string): Promise<number | null> {
+  const res = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [subject_key]);
+  return res.rows.length > 0 ? res.rows[0].id : null;
+}
+
 export async function getOrCreateSubject(subject_key: string | undefined | null, fallback_type: string = 'system'): Promise<number> {
   const finalKey = subject_key || 'system_global';
-  const res = await db.query("SELECT id FROM subjects WHERE subject_key = $1", [finalKey]);
-  if (res.rows.length > 0) return res.rows[0].id;
 
   let guessedType = fallback_type;
   if (finalKey.startsWith('user_')) guessedType = 'person';
@@ -21,11 +31,15 @@ export async function getOrCreateSubject(subject_key: string | undefined | null,
   else if (finalKey.startsWith('category_')) guessedType = 'category';
   else if (finalKey.startsWith('system_')) guessedType = 'system';
 
-  const insertRes = await db.query(
-    `INSERT INTO subjects (subject_type, subject_key, display_name) VALUES ($1, $2, $3) RETURNING id`,
+  // Atomic upsert — race-safe. DO UPDATE SET ... is a no-op trick to make RETURNING fire on conflict.
+  const res = await db.query(
+    `INSERT INTO subjects (subject_type, subject_key, display_name)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (subject_key) DO UPDATE SET subject_key = EXCLUDED.subject_key
+     RETURNING id`,
     [guessedType, finalKey, finalKey]
   );
-  return insertRes.rows[0].id;
+  return res.rows[0].id;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -40,9 +54,11 @@ export function registerTools(server: McpServer) {
   server.registerTool(
     "memory_startup",
     {
-      description: "🚨 MANDATORY FIRST CALL — Run this at the very start of every new session.\n\nReturns a structured briefing:\n- User profile & preferences\n- Recent project states\n- Key decisions & learnings\n\nDo NOT skip this step.",
+      description: "🚨 MANDATORY FIRST CALL — Run this at the very start of every new session.\n\nReturns a structured briefing:\n- User profile & preferences\n- Recent project states\n- Key decisions & learnings\n- Active skills (auto-injected know-how)\n\nDo NOT skip this step.",
       inputSchema: {
-        user_key: z.string().optional().default("user_hoon").describe("User subject key. Defaults to 'user_hoon'."),
+        user_key: z.string().optional().default(process.env.MEMORY_DEFAULT_SUBJECT || "default_user").describe("User subject key."),
+        author_model: z.string().optional().describe("Caller's author model (for skill filtering)."),
+        platform: z.string().optional().describe("Caller's platform (for skill filtering)."),
       }
     },
     async (args) => {
@@ -56,7 +72,7 @@ export function registerTools(server: McpServer) {
         const userId = await getOrCreateSubject(args.user_key, 'person');
         const profileRes = await db.query(
           `SELECT content, fact_type, tags, importance, confidence
-           FROM facts
+           FROM memories
            WHERE subject_id = $1 AND fact_type IN ('profile', 'preference') AND is_active = TRUE
            ORDER BY importance DESC, updated_at DESC
            LIMIT 8`,
@@ -77,7 +93,7 @@ export function registerTools(server: McpServer) {
       try {
         const projRes = await db.query(
           `SELECT s.subject_key, s.display_name,
-                  (SELECT content FROM facts
+                  (SELECT content FROM memories
                    WHERE (project_subject_id = s.id OR subject_id = s.id) AND is_active = TRUE
                    ORDER BY updated_at DESC LIMIT 1) as latest_fact
            FROM subjects s
@@ -100,7 +116,7 @@ export function registerTools(server: McpServer) {
       try {
         const decisionRes = await db.query(
           `SELECT content, fact_type, tags, created_at
-           FROM facts
+           FROM memories
            WHERE fact_type IN ('decision', 'learning') AND is_active = TRUE
            ORDER BY importance DESC, created_at DESC
            LIMIT 5`
@@ -117,11 +133,38 @@ export function registerTools(server: McpServer) {
         }
       } catch (e) { /* silent fallback */ }
 
+      // 4.5. Active Skills (from new skills table — Phase 2)
+      try {
+        const skills = await getInjectableSkills({
+          author_model: args.author_model,
+          platform: args.platform,
+          limit: 5,
+        });
+        if (skills.length > 0) {
+          sections.push("🛠️ ACTIVE SKILLS");
+          sections.push("────────────────");
+          skills.forEach((r) => {
+            const tierBadge =
+              r.validation_tier === 'validated_external' ? '🔬' :
+              r.validation_tier === 'validated_internal' ? '✓' :
+              r.validation_tier === 'contested' ? '⚠️' :
+              r.validation_tier === 'pending_revalidation' ? '⏳' :
+              '·';
+            sections.push(`${tierBadge} [#${r.id}] ${r.title}`);
+            const firstChunk = r.content.split('\n\n')[0].trim().substring(0, 200);
+            const truncated = r.content.length > firstChunk.length ? '…' : '';
+            sections.push(`   ${firstChunk}${truncated}`);
+          });
+          sections.push("");
+          await recordSkillExposure(skills.map((s) => s.id)).catch(() => {});
+        }
+      } catch (e) { /* silent fallback — skills table may not exist yet */ }
+
       // 4. Skills
       try {
         const skillRes = await db.query(
           `SELECT content, tags
-           FROM facts
+           FROM memories
            WHERE fact_type = 'skill' AND is_active = TRUE
            ORDER BY importance DESC
            LIMIT 6`
@@ -157,7 +200,7 @@ export function registerTools(server: McpServer) {
       description: "Store information in long-term memory. The Librarian AI will automatically:\n1. Extract atomic facts from your text\n2. Classify each fact (preference, skill, decision, etc.)\n3. Detect & resolve contradictions with existing knowledge\n4. Calculate Effective Confidence based on model trust\n5. Save provenance (who, where, when)\n\nJust provide the raw text — the system handles the rest.",
       inputSchema: {
         text: z.string().describe("Raw text containing information to remember."),
-        subject_key: z.string().optional().default("user_hoon").describe("Primary subject key."),
+        subject_key: z.string().optional().default(process.env.MEMORY_DEFAULT_SUBJECT || "default_user").describe("Primary subject key."),
         project_key: z.string().optional().describe("Project key if relevant."),
         author_model: z.string().optional().describe("Model name or alias (e.g., 'sonnet', 'opus', 'gemini')."),
         platform: z.string().optional().describe("Platform (e.g., 'antigravity', 'claude-code')."),
@@ -173,9 +216,9 @@ export function registerTools(server: McpServer) {
       }
 
       const result = await processBatch(
-        args.text, 
-        subjectId, 
-        projectId, 
+        args.text,
+        subjectId,
+        projectId,
         args.text,
         {
           author_model: args.author_model,
@@ -186,7 +229,7 @@ export function registerTools(server: McpServer) {
 
       // Format result
       const lines: string[] = [];
-      lines.push(`📚 Librarian Report (v0.5.3 Provenance Layer)`);
+      lines.push(`📚 Librarian Report (v0.5.2 Provenance Layer)`);
       lines.push(`──────────────────────────────────────────`);
       lines.push(`Extracted: ${result.extracted} | Saved: ${result.saved} | Contradictions: ${result.contradictions_resolved}`);
 
@@ -203,6 +246,118 @@ export function registerTools(server: McpServer) {
         lines.push("");
         lines.push("⚠️ Errors:");
         result.errors.forEach(e => lines.push(`  ${e}`));
+      }
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════
+  // memory_save_skill — Explicit Skill Storage
+  // ═══════════════════════════════════════════════════════════
+  server.registerTool(
+    "memory_save_skill",
+    {
+      description: "Explicitly save a reusable skill. The Skill Updater compares it against active skills and decides whether to accumulate, branch, or create.",
+      inputSchema: {
+        title: z.string().describe("Short skill title."),
+        content: z.string().describe("Reusable skill content or rule body."),
+        source_memory_ids: z.array(z.number()).optional().describe("Memory IDs that produced this skill."),
+        author_model: z.string().optional().describe("Model name or alias that authored the skill."),
+        platform: z.string().optional().describe("Platform where the skill was authored."),
+        audit: z.boolean().optional().default(true).describe("Run Skill Auditor before saving. Default: true."),
+      }
+    },
+    async (args) => {
+      const candidate = {
+        title: args.title,
+        content: args.content,
+        source_memory_ids: args.source_memory_ids,
+        author_model: args.author_model,
+        platform: args.platform,
+      };
+      const audited = args.audit !== false ? await auditSkill(candidate) : undefined;
+      const result = await updateOrCreateSkill(candidate, audited);
+      const validationTier = audited?.validation_tier ?? 'unvalidated';
+      const auditReasoning = audited?.audit_reasoning ?? 'audit disabled';
+      const sourcesCount = audited?.sources.length ?? 0;
+
+      const lines: string[] = [];
+      lines.push(`SKILL ${result.action.toUpperCase()}`);
+      lines.push(`Skill ID: ${result.skill_id}`);
+      lines.push(`Similarity: ${(result.similarity * 100).toFixed(1)}%`);
+      lines.push(`validation_tier: ${validationTier}`);
+      lines.push(`sources_count: ${sourcesCount}`);
+      lines.push(`audit_reasoning: ${auditReasoning}`);
+      if (result.parent_skill_id) lines.push(`Parent Skill ID: ${result.parent_skill_id}`);
+
+      if (result.action === 'accumulated') {
+        lines.push("Appended this candidate to the matched skill changelog.");
+      } else if (result.action === 'branched') {
+        lines.push("Created a new active skill version linked to the matched parent.");
+      } else {
+        lines.push("Created a new root skill.");
+      }
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════
+  // memory_curator_run — Explicit Skill Curator Trigger
+  // ═══════════════════════════════════════════════════════════
+  server.registerTool(
+    "memory_curator_run",
+    {
+      description: "Run the Skill Curator: scan active memories for semantic clusters, auto-extract reusable know-how into skills. Use dry_run: true to see candidates without saving.",
+      inputSchema: {
+        subject_key: z.string().optional().describe("Limit scan to a subject key."),
+        project_key: z.string().optional().describe("Limit scan to a project key."),
+        dry_run: z.boolean().optional().default(false).describe("Preview candidates without saving skills."),
+        min_cluster_size: z.number().optional().describe("Minimum memory count per cluster."),
+        similarity_threshold: z.number().optional().describe("Minimum cosine similarity for cluster membership."),
+        min_importance: z.number().optional().describe("Minimum average importance for accepted clusters."),
+        max_clusters: z.number().optional().describe("Maximum clusters to analyze in one run."),
+      }
+    },
+    async (args) => {
+      const result = await runCurator({
+        subjectKey: args.subject_key,
+        projectKey: args.project_key,
+        dryRun: args.dry_run,
+        minClusterSize: args.min_cluster_size,
+        similarityThreshold: args.similarity_threshold,
+        minImportance: args.min_importance,
+        maxClusters: args.max_clusters,
+      });
+
+      const lines: string[] = [];
+      lines.push(`SKILL CURATOR ${result.dry_run ? 'DRY RUN' : 'RUN'}`);
+      lines.push(`Scanned memories: ${result.scanned_memories}`);
+      lines.push(`Clusters found: ${result.clusters_found}`);
+      lines.push(`Clusters skipped: ${result.clusters_skipped}`);
+      lines.push(`Skills saved: ${result.skills_saved}`);
+
+      if (result.candidates.length > 0) {
+        lines.push("");
+        lines.push("Candidates:");
+        result.candidates.forEach((candidate, idx) => {
+          const ids = candidate.cluster.member_ids.join(", ");
+          const label = candidate.covered
+            ? "covered"
+            : candidate.skill_worthy
+              ? "skill-worthy"
+              : "not-worthy";
+          lines.push(`${idx + 1}. ${label} | size=${candidate.cluster.size} | avg_importance=${candidate.cluster.avg_importance.toFixed(1)} | memories=[${ids}]`);
+          if (candidate.title) lines.push(`   Title: ${candidate.title}`);
+          lines.push(`   Reason: ${candidate.reason}`);
+          if (candidate.skill_result) {
+            lines.push(`   Saved: ${candidate.skill_result.action} skill #${candidate.skill_result.skill_id}`);
+          }
+          if (candidate.error) {
+            lines.push(`   Error: ${candidate.error}`);
+          }
+        });
       }
 
       return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -232,7 +387,7 @@ export function registerTools(server: McpServer) {
       let baseContext = "";
       try {
         const profileRes = await db.query(
-          `SELECT content, fact_type FROM facts
+          `SELECT content, fact_type FROM memories
            WHERE fact_type IN ('profile', 'preference') AND is_active = TRUE
            ORDER BY importance DESC, updated_at DESC LIMIT 3`
         );
@@ -256,7 +411,10 @@ export function registerTools(server: McpServer) {
       ];
 
       if (args.subject_key) {
-        const subId = await getOrCreateSubject(args.subject_key, 'system');
+        const subId = await getSubjectId(args.subject_key);
+        if (subId === null) {
+          return { content: [{ type: "text", text: baseContext + `No subject found with key: ${args.subject_key}` }] };
+        }
         params.push(subId);
         conditions.push(`(f.subject_id = $${params.length} OR f.project_subject_id = $${params.length})`);
       }
@@ -282,7 +440,7 @@ export function registerTools(server: McpServer) {
                      THEN 1 - (f.embedding <=> $1::vector)
                      ELSE 0.0
                 END AS similarity
-         FROM facts f
+         FROM memories f
          LEFT JOIN subjects subj ON f.subject_id = subj.id
          LEFT JOIN subjects proj ON f.project_subject_id = proj.id
          LEFT JOIN models m ON f.author_model_id = m.id
@@ -299,7 +457,7 @@ export function registerTools(server: McpServer) {
       // Update access counts
       const ids = results.rows.map((r: any) => r.id);
       await db.query(
-        `UPDATE facts SET access_count = access_count + 1, last_accessed_at = NOW() WHERE id = ANY($1::int[])`,
+        `UPDATE memories SET access_count = access_count + 1, last_accessed_at = NOW() WHERE id = ANY($1::int[])`,
         [ids]
       );
 
@@ -308,7 +466,7 @@ export function registerTools(server: McpServer) {
         const sim = (r.similarity * 100).toFixed(0);
         const conf = r.effective_confidence ? `${r.effective_confidence} (eff)` : r.confidence;
         const author = r.author_model ? ` | via ${r.author_model}` : '';
-        
+
         formatted += `[#${r.id}] [${r.fact_type}] (imp: ${r.importance}, conf: ${conf}, sim: ${sim}%${author})\n`;
         if (r.subject_name) formatted += `Subject: ${r.subject_name}`;
         if (r.project_name) formatted += ` | Project: ${r.project_name}`;
@@ -334,13 +492,13 @@ export function registerTools(server: McpServer) {
     },
     async () => {
       const lines: string[] = [];
-      lines.push("📊 Memory Status Report (v0.5.3)");
+      lines.push("📊 Memory Status Report (v0.5.2)");
       lines.push("═══════════════════════════════\n");
 
       // Total facts
       try {
-        const total = await db.query(`SELECT COUNT(*) as count FROM facts WHERE is_active = TRUE`);
-        const inactive = await db.query(`SELECT COUNT(*) as count FROM facts WHERE is_active = FALSE`);
+        const total = await db.query(`SELECT COUNT(*) as count FROM memories WHERE is_active = TRUE`);
+        const inactive = await db.query(`SELECT COUNT(*) as count FROM memories WHERE is_active = FALSE`);
         lines.push(`Total active facts: ${total.rows[0].count}`);
         lines.push(`Superseded facts: ${inactive.rows[0].count}`);
         lines.push("");
@@ -350,7 +508,7 @@ export function registerTools(server: McpServer) {
       try {
         const byType = await db.query(
           `SELECT fact_type, COUNT(*) as count
-           FROM facts WHERE is_active = TRUE
+           FROM memories WHERE is_active = TRUE
            GROUP BY fact_type ORDER BY count DESC`
         );
         if (byType.rows.length > 0) {
@@ -366,11 +524,59 @@ export function registerTools(server: McpServer) {
       // System info
       lines.push("⚙️ System Info");
       lines.push("─────────────");
-      lines.push(`  Version: v0.5.3 (Provenance Layer)`);
+      lines.push(`  Version: v0.5.2 (Provenance Layer)`);
       lines.push(`  Librarian Model: ${process.env.LIBRARIAN_MODEL || 'gpt-4o-mini'}`);
       lines.push(`  Embedding Model: text-embedding-3-small`);
 
       return { content: [{ type: "text", text: lines.join("\n") }] };
     }
+  );
+
+  // ---------------------------------------------------------
+  // 5. Prompts (Slash Commands)
+  // ---------------------------------------------------------
+  server.prompt(
+    "briefing",
+    "Get a full briefing of the user profile and project state.",
+    {},
+    (args) => ({
+      messages: [{
+        role: "user",
+        content: {
+          type: "text",
+          text: "Please run the 'memory_startup' tool and provide me with a summary of who I am and what we were working on."
+        }
+      }]
+    })
+  );
+
+  server.prompt(
+    "recall",
+    "Recall information from long-term memory.",
+    { query: z.string().describe("Search query") },
+    (args) => ({
+      messages: [{
+        role: "user",
+        content: {
+          type: "text",
+          text: `Please use the 'memory_search' tool with the query: "${args.query}" and tell me what you found.`
+        }
+      }]
+    })
+  );
+
+  server.prompt(
+    "save",
+    "Save a new fact or decision to memory.",
+    { text: z.string().describe("Information to save") },
+    (args) => ({
+      messages: [{
+        role: "user",
+        content: {
+          type: "text",
+          text: `Please use the 'memory_add' tool to store this information: "${args.text}"`
+        }
+      }]
+    })
   );
 }

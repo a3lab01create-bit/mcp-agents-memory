@@ -107,9 +107,9 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}${librarianConfig}
       );
     `);
 
-    // facts — 통합 메모리 테이블 (신규)
+    // memories — 통합 메모리 테이블 (신규)
     await db.query(`
-      CREATE TABLE IF NOT EXISTS facts (
+      CREATE TABLE IF NOT EXISTS memories (
           id SERIAL PRIMARY KEY,
 
           -- 소유자 & 프로젝트
@@ -139,7 +139,7 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}${librarianConfig}
               CHECK (source IN ('librarian', 'user', 'agent', 'system', 'migration')),
           access_count INTEGER NOT NULL DEFAULT 0,
           last_accessed_at TIMESTAMPTZ,
-          superseded_by INTEGER REFERENCES facts(id),
+          superseded_by INTEGER REFERENCES memories(id),
           is_active BOOLEAN NOT NULL DEFAULT TRUE,
 
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -152,7 +152,7 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}${librarianConfig}
     // ---------------------------------------------------------
     console.log("⚙️ Setting up triggers...");
 
-    // updated_at trigger for subjects and facts
+    // updated_at trigger for subjects and memories
     await db.query(`
       DO $$
       DECLARE
@@ -162,7 +162,7 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}${librarianConfig}
               SELECT table_name
               FROM information_schema.tables
               WHERE table_schema = 'public'
-                AND table_name IN ('subjects', 'facts')
+                AND table_name IN ('subjects', 'memories')
           LOOP
               EXECUTE format('DROP TRIGGER IF EXISTS trg_updated_at ON %I', t);
               EXECUTE format(
@@ -187,9 +187,9 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}${librarianConfig}
       END;
       $$ LANGUAGE plpgsql;
 
-      DROP TRIGGER IF EXISTS trg_validate_project_type_facts ON facts;
-      CREATE TRIGGER trg_validate_project_type_facts
-      BEFORE INSERT OR UPDATE ON facts
+      DROP TRIGGER IF EXISTS trg_validate_project_type_memories ON memories;
+      CREATE TRIGGER trg_validate_project_type_memories
+      BEFORE INSERT OR UPDATE ON memories
       FOR EACH ROW
       EXECUTE FUNCTION validate_project_subject_type();
     `);
@@ -204,16 +204,16 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}${librarianConfig}
       CREATE INDEX IF NOT EXISTS idx_subjects_key ON subjects(subject_key);
       CREATE INDEX IF NOT EXISTS idx_subjects_active ON subjects(is_active);
 
-      -- facts
-      CREATE INDEX IF NOT EXISTS idx_facts_subject_id ON facts(subject_id);
-      CREATE INDEX IF NOT EXISTS idx_facts_project_subject_id ON facts(project_subject_id);
-      CREATE INDEX IF NOT EXISTS idx_facts_fact_type ON facts(fact_type);
-      CREATE INDEX IF NOT EXISTS idx_facts_is_active ON facts(is_active);
-      CREATE INDEX IF NOT EXISTS idx_facts_importance ON facts(importance);
-      CREATE INDEX IF NOT EXISTS idx_facts_tags ON facts USING GIN(tags);
-      CREATE INDEX IF NOT EXISTS idx_facts_embedding ON facts USING hnsw (embedding vector_cosine_ops);
-      CREATE INDEX IF NOT EXISTS idx_facts_superseded ON facts(superseded_by);
-      CREATE INDEX IF NOT EXISTS idx_facts_source ON facts(source);
+      -- memories
+      CREATE INDEX IF NOT EXISTS idx_memories_subject_id ON memories(subject_id);
+      CREATE INDEX IF NOT EXISTS idx_memories_project_subject_id ON memories(project_subject_id);
+      CREATE INDEX IF NOT EXISTS idx_memories_fact_type ON memories(fact_type);
+      CREATE INDEX IF NOT EXISTS idx_memories_is_active ON memories(is_active);
+      CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
+      CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories USING GIN(tags);
+      CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
+      CREATE INDEX IF NOT EXISTS idx_memories_superseded ON memories(superseded_by);
+      CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source);
     `);
 
     // ---------------------------------------------------------
@@ -222,49 +222,26 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}${librarianConfig}
     // Check if old tables exist and migrate data
     const oldTablesCheck = await db.query(`
       SELECT table_name FROM information_schema.tables
-      WHERE table_schema = 'public' AND table_name IN ('memories', 'task_learnings')
+      WHERE table_schema = 'public' AND table_name IN ('task_learnings')
     `);
 
     if (oldTablesCheck.rows.length > 0) {
       console.log("📦 Migrating data from v0.3 tables...");
 
-      // Migrate memories → facts
-      const memoriesExists = oldTablesCheck.rows.some((r: any) => r.table_name === 'memories');
-      if (memoriesExists) {
-        const migrateCount = await db.query(`
-          INSERT INTO facts (subject_id, project_subject_id, content, fact_type, confidence, importance, tags, embedding, source, access_count, last_accessed_at, created_at, updated_at)
-          SELECT subject_id, project_subject_id, content,
-            CASE memory_type
-              WHEN 'preference' THEN 'preference'
-              WHEN 'profile' THEN 'profile'
-              WHEN 'constraint' THEN 'preference'
-              WHEN 'state' THEN 'state'
-              WHEN 'relationship' THEN 'relationship'
-              ELSE 'state'
-            END::VARCHAR(20),
-            confidence_score, importance_score, tags, embedding, 'migration', access_count, last_accessed_at, created_at, updated_at
-          FROM memories
-          WHERE NOT EXISTS (
-            SELECT 1 FROM facts WHERE facts.content = memories.content AND facts.source = 'migration'
-          )
-        `);
-        console.log(`   ✅ Migrated ${migrateCount.rowCount} memories → facts`);
-      }
-
-      // Migrate task_learnings → facts
+      // Migrate task_learnings → memories
       const learningsExists = oldTablesCheck.rows.some((r: any) => r.table_name === 'task_learnings');
       if (learningsExists) {
         const learnCount = await db.query(`
-          INSERT INTO facts (subject_id, content, fact_type, confidence, importance, tags, embedding, source, created_at, updated_at)
+          INSERT INTO memories (subject_id, content, fact_type, confidence, importance, tags, embedding, source, created_at, updated_at)
           SELECT
             (SELECT id FROM subjects WHERE subject_key = 'system_global' LIMIT 1),
             content, 'learning', confidence_score, impact_score, tags, embedding, 'migration', created_at, updated_at
           FROM task_learnings
           WHERE NOT EXISTS (
-            SELECT 1 FROM facts WHERE facts.content = task_learnings.content AND facts.source = 'migration'
+            SELECT 1 FROM memories WHERE memories.content = task_learnings.content AND memories.source = 'migration'
           )
         `);
-        console.log(`   ✅ Migrated ${learnCount.rowCount} task_learnings → facts`);
+        console.log(`   ✅ Migrated ${learnCount.rowCount} task_learnings → memories`);
       }
 
       // Drop old tables
@@ -275,7 +252,6 @@ DB_NAME=${answers.dbName}${sshConfig}${openaiConfig}${librarianConfig}
         DROP TABLE IF EXISTS task_learnings CASCADE;
         DROP TABLE IF EXISTS sessions CASCADE;
         DROP TABLE IF EXISTS tasks CASCADE;
-        DROP TABLE IF EXISTS memories CASCADE;
       `);
       console.log("   ✅ Old tables removed.");
     }
