@@ -16,12 +16,15 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const migrationsDir = fs.existsSync(path.join(__dirname, "migrations"))
+  ? path.join(__dirname, "migrations")
+  : __dirname;
 const MIGRATION_FILE_RE = /^\d{3}_.+\.js$/;
 
 export function listMigrationFiles(): string[] {
-  if (!fs.existsSync(__dirname)) return [];
+  if (!fs.existsSync(migrationsDir)) return [];
   return fs
-    .readdirSync(__dirname)
+    .readdirSync(migrationsDir)
     .filter((f) => MIGRATION_FILE_RE.test(f))
     .sort(); // 3-digit zero-padded prefix → lex sort == numeric sort
 }
@@ -43,12 +46,12 @@ function runOne(file: string): Promise<void> {
 export async function runAllMigrations(): Promise<{ ran: number; files: string[] }> {
   const files = listMigrationFiles();
   if (files.length === 0) {
-    console.log("ℹ️  No migration files found in", __dirname);
+    console.log("ℹ️  No migration files found in", migrationsDir);
     return { ran: 0, files: [] };
   }
-  console.log(`📦 Running ${files.length} migration(s) from ${__dirname}`);
+  console.log(`📦 Running ${files.length} migration(s) from ${migrationsDir}`);
   for (const f of files) {
-    await runOne(path.join(__dirname, f));
+    await runOne(path.join(migrationsDir, f));
   }
   console.log(`✅ Migration runner complete — ${files.length} file(s) processed.`);
   return { ran: files.length, files };
