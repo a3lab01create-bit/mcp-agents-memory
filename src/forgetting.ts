@@ -146,6 +146,103 @@ export async function runForgettingPass(opts: ForgetOptions = {}): Promise<Forge
   };
 }
 
+// ─────────────────────────────────────────────────────────────
+// Restore (kill-switch for Auto Forgetting)
+// ─────────────────────────────────────────────────────────────
+
+export interface RestoreOptions {
+  memoryId?: number;
+  sinceMinutes?: number;
+  dryRun?: boolean;
+}
+
+export interface RestoredRow {
+  id: number;
+  fact_type: string;
+  content: string;
+  forgotten_at?: string;
+}
+
+export interface RestoreResult {
+  rows: RestoredRow[];
+  dry_run: boolean;
+  mode: "single" | "bulk";
+}
+
+export class RestoreInputError extends Error {}
+
+/**
+ * Restore memories that were soft-deleted by Auto Forgetting.
+ *
+ * Eligible rows: `is_active = FALSE` AND `metadata ? 'forgotten_at'`.
+ * Superseded rows (which carry `superseded_by` and no `forgotten_at`)
+ * are intentionally NOT restorable — they were replaced by a newer
+ * fact and reviving them would resurrect a contradiction.
+ */
+export async function restoreMemories(opts: RestoreOptions = {}): Promise<RestoreResult> {
+  const hasId = typeof opts.memoryId === "number";
+  const hasSince = typeof opts.sinceMinutes === "number";
+  if (hasId === hasSince) {
+    throw new RestoreInputError(
+      "Provide exactly one of `memoryId` or `sinceMinutes`."
+    );
+  }
+
+  const dryRun = opts.dryRun ?? false;
+
+  const candidates = hasId
+    ? await db.query(
+        `SELECT id, fact_type, content, metadata
+         FROM memories
+         WHERE id = $1
+           AND is_active = FALSE
+           AND metadata ? 'forgotten_at'`,
+        [opts.memoryId]
+      )
+    : await db.query(
+        `SELECT id, fact_type, content, metadata
+         FROM memories
+         WHERE is_active = FALSE
+           AND metadata ? 'forgotten_at'
+           AND (metadata->>'forgotten_at')::timestamptz > NOW() - ($1::int || ' minutes')::interval
+         ORDER BY id`,
+        [Math.ceil(opts.sinceMinutes!)]
+      );
+
+  const rows: RestoredRow[] = (candidates.rows as any[]).map((r) => ({
+    id: r.id,
+    fact_type: r.fact_type,
+    content: r.content,
+    forgotten_at: r.metadata?.forgotten_at,
+  }));
+
+  if (rows.length > 0 && !dryRun) {
+    const ids = rows.map((r) => r.id);
+    // last_accessed_at = NOW() resets age_days to 0, buying the row at least
+    // one half-life of grace before the next decay pass can target it again.
+    // Without this, restore + an imminent forget pass silently re-forgets.
+    await db.query(
+      `UPDATE memories
+       SET is_active = TRUE,
+           last_accessed_at = NOW(),
+           metadata = jsonb_set(
+             COALESCE(metadata, '{}'::jsonb),
+             '{restored_at}',
+             to_jsonb(NOW()::text),
+             true
+           )
+       WHERE id = ANY($1::int[])`,
+      [ids]
+    );
+  }
+
+  return { rows, dry_run: dryRun, mode: hasId ? "single" : "bulk" };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Background loop
+// ─────────────────────────────────────────────────────────────
+
 let warmupTimer: NodeJS.Timeout | null = null;
 let intervalTimer: NodeJS.Timeout | null = null;
 let running = false;

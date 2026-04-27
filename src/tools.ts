@@ -6,6 +6,7 @@ import { processBatch } from "./librarian.js";
 import { getInjectableSkills, recordSkillExposure, updateOrCreateSkill } from "./skills.js";
 import { auditSkill } from "./skill_auditor.js";
 import { runCurator } from "./curator.js";
+import { restoreMemories, RestoreInputError } from "./forgetting.js";
 import { PACKAGE_VERSION } from "./version.js";
 
 // ─────────────────────────────────────────────────────────────
@@ -590,6 +591,62 @@ export function registerTools(server: McpServer) {
       lines.push(`  Embedding Model: text-embedding-3-small`);
 
       return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  // ═══════════════════════════════════════════════════════════
+  // memory_restore — kill-switch for Auto Forgetting (v5.0)
+  // Restores soft-deleted memories that were forgotten by the
+  // decay loop. Refuses to revive superseded rows (those were
+  // intentionally replaced and the newer fact is canonical).
+  // ═══════════════════════════════════════════════════════════
+  server.registerTool(
+    "memory_restore",
+    {
+      description:
+        "Restore memories that were soft-deleted by Auto Forgetting (v5.0). Provide either `memory_id` for a single restore, or `since_minutes` to bulk-restore everything forgotten in the last N minutes (useful when forgetting fired too aggressively). Use `dry_run` to preview without changes. Only restores rows with metadata.forgotten_at — superseded rows are intentionally replaced and cannot be revived through this tool.",
+      inputSchema: {
+        memory_id: z.number().int().positive().optional().describe("Restore this specific memory id."),
+        since_minutes: z.number().int().positive().optional().describe("Restore all forgotten rows whose forgotten_at falls in the last N minutes."),
+        dry_run: z.boolean().optional().default(false).describe("Preview which rows would be restored without flipping is_active."),
+      }
+    },
+    async (args) => {
+      try {
+        const result = await restoreMemories({
+          memoryId: args.memory_id,
+          sinceMinutes: args.since_minutes,
+          dryRun: args.dry_run,
+        });
+
+        if (result.rows.length === 0) {
+          const reason = args.memory_id
+            ? `No restorable memory with id=${args.memory_id} (either active already, never forgotten, or superseded — superseded rows cannot be restored).`
+            : `No memories were forgotten in the last ${args.since_minutes} minutes.`;
+          return { content: [{ type: "text", text: `ℹ️ ${reason}` }] };
+        }
+
+        const heading = result.dry_run
+          ? `🔍 Dry-run — ${result.rows.length} memory/memories would be restored:`
+          : `♻️ Restored ${result.rows.length} memory/memories:`;
+        const lines = [heading, ""];
+        result.rows.forEach((r) => {
+          const preview = String(r.content).slice(0, 80).replace(/\s+/g, " ");
+          const tail = String(r.content).length > 80 ? "…" : "";
+          if (result.dry_run) {
+            lines.push(`  [#${r.id}] (${r.fact_type}) forgotten_at=${r.forgotten_at ?? "?"}`);
+            lines.push(`    "${preview}${tail}"`);
+          } else {
+            lines.push(`  [#${r.id}] (${r.fact_type}) "${preview}${tail}"`);
+          }
+        });
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      } catch (err) {
+        if (err instanceof RestoreInputError) {
+          return { content: [{ type: "text", text: `❌ ${err.message}` }], isError: true };
+        }
+        throw err;
+      }
     }
   );
 
