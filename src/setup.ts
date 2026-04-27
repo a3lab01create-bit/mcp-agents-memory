@@ -87,32 +87,218 @@ async function promptDb(): Promise<{ envBlock: string; description: string }> {
   return { envBlock: lines.join("\n"), description: "individual DB_* fields" };
 }
 
-async function promptApiKeys(): Promise<string> {
-  console.log("\n🧠 AI keys");
-  console.log("  OpenAI is required for embeddings + Librarian fact extraction.");
-  console.log("  Tavily/Exa are optional (used for v4.5 Skill Auditor + v5.0 memory grounding).");
-  console.log("  Leave blank to skip a key — you can add it later by editing the config file.\n");
+// ─────────────────────────────────────────────────────────────
+// LLM-role presets — each preset writes a full <ROLE>_PROVIDER + <ROLE>_MODEL
+// pair set so model_registry.ts has consistent envs across all 7 roles.
+//
+// "Recommended" splits across providers for cost/quality balance.
+// "OpenAI only" / "Anthropic only" lock to a single provider — minimal keys.
+// "Premium" upgrades audit to a reasoning model for truth-seeking critique.
+// "Custom" lets the user fall through to per-role prompts.
+// ─────────────────────────────────────────────────────────────
 
-  const a = await inquirer.prompt([
-    { type: "password", name: "openai", mask: "*", message: "OPENAI_API_KEY (sk-...)" },
-    { type: "password", name: "anthropic", mask: "*", message: "ANTHROPIC_API_KEY (optional, for grounding-pipeline reconciler)" },
-    { type: "password", name: "google", mask: "*", message: "GOOGLE_GENERATIVE_AI_API_KEY (optional, for Curator/Triage)" },
-    { type: "password", name: "tavily", mask: "*", message: "TAVILY_API_KEY (optional, recency search)" },
-    { type: "password", name: "exa", mask: "*", message: "EXA_API_KEY (optional, authority search)" },
-    { type: "password", name: "notion", mask: "*", message: "NOTION_API_KEY (optional, Notion Connector)" },
+type PresetId = "recommended" | "openai_only" | "anthropic_only" | "premium" | "custom";
+
+interface RoleEnv { provider: string; model: string }
+interface Preset {
+  id: PresetId;
+  label: string;
+  desc: string;
+  needs: ("openai" | "anthropic" | "google" | "xai")[];
+  roles: Record<string, RoleEnv>;
+}
+
+const PRESETS: Preset[] = [
+  {
+    id: "recommended",
+    label: "Recommended (Gemini Flash + OpenAI mix)",
+    desc: "Best cost/quality. Triage on Gemini, the rest on gpt-4o-mini. Needs OpenAI + Google keys.",
+    needs: ["openai", "google"],
+    roles: {
+      triage:        { provider: "google",  model: "gemini-2.5-flash-lite" },
+      extract:       { provider: "openai",  model: "gpt-4o-mini" },
+      audit:         { provider: "openai",  model: "gpt-4o-mini" },
+      contradiction: { provider: "openai",  model: "gpt-4o-mini" },
+      skill_curator: { provider: "openai",  model: "gpt-4o-mini" },
+    },
+  },
+  {
+    id: "openai_only",
+    label: "OpenAI only",
+    desc: "Simplest setup — only OPENAI_API_KEY needed. Slightly more expensive (no Gemini-cheap-tier).",
+    needs: ["openai"],
+    roles: {
+      triage:        { provider: "openai", model: "gpt-4o-mini" },
+      extract:       { provider: "openai", model: "gpt-4o-mini" },
+      audit:         { provider: "openai", model: "gpt-4o-mini" },
+      contradiction: { provider: "openai", model: "gpt-4o-mini" },
+      skill_curator: { provider: "openai", model: "gpt-4o-mini" },
+    },
+  },
+  {
+    id: "anthropic_only",
+    label: "Anthropic only (Claude Haiku for everything)",
+    desc: "Single provider — only ANTHROPIC_API_KEY needed. Higher per-call cost than gpt-4o-mini.",
+    needs: ["anthropic"],
+    roles: {
+      triage:        { provider: "anthropic", model: "claude-haiku-4-5" },
+      extract:       { provider: "anthropic", model: "claude-haiku-4-5" },
+      audit:         { provider: "anthropic", model: "claude-haiku-4-5" },
+      contradiction: { provider: "anthropic", model: "claude-haiku-4-5" },
+      skill_curator: { provider: "anthropic", model: "claude-haiku-4-5" },
+    },
+  },
+  {
+    id: "premium",
+    label: "Premium (truth-seeking audit via Grok 4.20-reasoning)",
+    desc: "Recommended + Grok-4.20-reasoning for audit/contradiction. ~$1-2/mo more. Needs OpenAI + Google + xAI keys.",
+    needs: ["openai", "google", "xai"],
+    roles: {
+      triage:        { provider: "google",  model: "gemini-2.5-flash" },
+      extract:       { provider: "openai",  model: "gpt-4o-mini" },
+      audit:         { provider: "xai",     model: "grok-4.20-0309-reasoning" },
+      contradiction: { provider: "xai",     model: "grok-4.20-0309-reasoning" },
+      skill_curator: { provider: "openai",  model: "gpt-4o-mini" },
+    },
+  },
+  {
+    id: "custom",
+    label: "Custom — pick provider + model per role",
+    desc: "Advanced. Falls through to per-role prompts.",
+    needs: [],
+    roles: {},
+  },
+];
+
+interface KeysCollected {
+  openai?: string;
+  anthropic?: string;
+  google?: string;
+  xai?: string;
+  tavily?: string;
+  exa?: string;
+  notion?: string;
+}
+
+async function promptForKeys(needs: KeysCollected, prompts: Array<keyof KeysCollected>): Promise<KeysCollected> {
+  const fields: Record<keyof KeysCollected, { msg: string }> = {
+    openai:    { msg: "OPENAI_API_KEY (sk-...)" },
+    anthropic: { msg: "ANTHROPIC_API_KEY" },
+    google:    { msg: "GOOGLE_GENERATIVE_AI_API_KEY (Gemini)" },
+    xai:       { msg: "GROK_API_KEY (xAI)" },
+    tavily:    { msg: "TAVILY_API_KEY" },
+    exa:       { msg: "EXA_API_KEY" },
+    notion:    { msg: "NOTION_API_KEY" },
+  };
+  const questions = prompts
+    .filter((k) => !needs[k]) // skip if already collected
+    .map((k) => ({ type: "password" as const, name: k, mask: "*", message: fields[k].msg }));
+  if (questions.length === 0) return needs;
+  const answers = await inquirer.prompt(questions);
+  return { ...needs, ...answers };
+}
+
+async function promptCustomRoles(): Promise<Record<string, RoleEnv>> {
+  console.log("\n🧰 Custom role configuration — pick provider + model for each.");
+  const providers = ["openai", "google", "anthropic", "xai"];
+  const roles = ["triage", "extract", "audit", "contradiction", "skill_curator"];
+  const out: Record<string, RoleEnv> = {};
+  for (const role of roles) {
+    const a = await inquirer.prompt([
+      { type: "list", name: "provider", message: `${role} provider`, choices: providers, default: "openai" },
+      { type: "input", name: "model", message: `${role} model identifier`, default: "gpt-4o-mini" },
+    ]);
+    out[role] = { provider: a.provider, model: a.model };
+  }
+  return out;
+}
+
+async function promptModelsAndKeys(): Promise<string> {
+  console.log("\n🧠 LLM roles");
+  console.log("  Pick a preset for the always-on Librarian roles (triage/extract/audit/contradiction/skill_curator).\n");
+
+  // ── Bucket B: preset chooser ──
+  const { presetId } = await inquirer.prompt([
+    {
+      type: "list",
+      name: "presetId",
+      message: "Librarian preset",
+      choices: PRESETS.map((p) => ({
+        name: `${p.label}\n    ${p.desc}`,
+        value: p.id,
+        short: p.label,
+      })),
+      default: "recommended",
+    },
+  ]);
+  const preset = PRESETS.find((p) => p.id === presetId)!;
+  const roleEnv = preset.id === "custom" ? await promptCustomRoles() : preset.roles;
+  const presetNeeds = preset.id === "custom"
+    ? Array.from(new Set(Object.values(roleEnv).map((r) => r.provider as keyof KeysCollected)))
+    : preset.needs;
+
+  // ── Bucket C: opt-in grounding ──
+  const { enableGrounding } = await inquirer.prompt([
+    {
+      type: "confirm",
+      name: "enableGrounding",
+      message:
+        "Enable advanced grounding (Tavily + Exa + Claude Sonnet for skill/memory auditors)? Adds ~$15-25/year for typical use, $0 if you skip.",
+      default: false,
+    },
   ]);
 
-  const lines: string[] = [];
-  if (a.openai) lines.push(`OPENAI_API_KEY=${a.openai}`);
-  if (a.anthropic) lines.push(`ANTHROPIC_API_KEY=${a.anthropic}`);
-  if (a.google) lines.push(`GOOGLE_GENERATIVE_AI_API_KEY=${a.google}`);
-  if (a.tavily) lines.push(`TAVILY_API_KEY=${a.tavily}`);
-  if (a.exa) lines.push(`EXA_API_KEY=${a.exa}`);
-  if (a.notion) lines.push(`NOTION_API_KEY=${a.notion}`);
-  lines.push("LIBRARIAN_MODEL=gpt-4o-mini");
+  // Gather all keys we need based on preset + grounding choice (+ Bucket A: OpenAI for embedding).
+  const requiredProviders = new Set<keyof KeysCollected>(["openai", ...presetNeeds]);
+  const groundingKeys: Array<keyof KeysCollected> = enableGrounding ? ["anthropic", "tavily", "exa"] : [];
+  groundingKeys.forEach((k) => requiredProviders.add(k));
 
-  if (!a.openai) {
-    console.log("⚠️  No OpenAI key — semantic search and Librarian extraction will fail at runtime.");
+  // ── Bucket A: embedding requires OPENAI; collect all relevant keys in one pass ──
+  console.log("\n🔑 API keys");
+  console.log("  Embedding always uses OpenAI (text-embedding-3-small). Other keys depend on your preset choices above.");
+  console.log("  Leave blank to skip — you can add them to ~/.config/mcp-agents-memory/.env later.\n");
+  let keys: KeysCollected = {};
+  keys = await promptForKeys(keys, Array.from(requiredProviders));
+
+  // ── Connectors (always optional, asked at the end) ──
+  const { askNotion } = await inquirer.prompt([
+    { type: "confirm", name: "askNotion", message: "Configure Notion Connector key now? (optional)", default: false },
+  ]);
+  if (askNotion) keys = await promptForKeys(keys, ["notion"]);
+
+  // ── Build .env block ──
+  const lines: string[] = [];
+  if (keys.openai)    lines.push(`OPENAI_API_KEY=${keys.openai}`);
+  if (keys.anthropic) lines.push(`ANTHROPIC_API_KEY=${keys.anthropic}`);
+  if (keys.google)    lines.push(`GOOGLE_GENERATIVE_AI_API_KEY=${keys.google}`);
+  if (keys.xai)       lines.push(`GROK_API_KEY=${keys.xai}`);
+  if (keys.tavily)    lines.push(`TAVILY_API_KEY=${keys.tavily}`);
+  if (keys.exa)       lines.push(`EXA_API_KEY=${keys.exa}`);
+  if (keys.notion)    lines.push(`NOTION_API_KEY=${keys.notion}`);
+
+  lines.push("");
+  lines.push(`# Librarian preset: ${preset.label}`);
+  for (const [role, env] of Object.entries(roleEnv)) {
+    lines.push(`${role.toUpperCase()}_PROVIDER=${env.provider}`);
+    lines.push(`${role.toUpperCase()}_MODEL=${env.model}`);
+  }
+
+  // Grounding-only roles (skill_auditor + memory_auditor); keep defaults from model_registry but set the gate flags.
+  if (enableGrounding) {
+    lines.push("");
+    lines.push("# Advanced grounding — Sonnet auditors (per-call ~$0.04, gated)");
+    lines.push("MEMORY_AUDIT_ENABLED=true");
+    lines.push("SKILL_AUDITOR_PROVIDER=anthropic");
+    lines.push("SKILL_AUDITOR_MODEL=claude-sonnet-4-6");
+    lines.push("MEMORY_AUDITOR_PROVIDER=anthropic");
+    lines.push("MEMORY_AUDITOR_MODEL=claude-sonnet-4-6");
+  }
+
+  lines.push("");
+  lines.push("EMBEDDING_MODEL=text-embedding-3-small");
+
+  if (!keys.openai) {
+    console.log("⚠️  No OpenAI key — embedding + librarian extraction will fail at runtime until you add OPENAI_API_KEY.");
   }
 
   return lines.join("\n");
@@ -247,7 +433,7 @@ export async function runSetupWizard(): Promise<void> {
   console.log(`🚀 mcp-agents-memory setup wizard (v${PACKAGE_VERSION})\n`);
 
   const { envBlock: dbBlock, description: dbDesc } = await promptDb();
-  const apiBlock = await promptApiKeys();
+  const apiBlock = await promptModelsAndKeys();
 
   const envContent =
     [

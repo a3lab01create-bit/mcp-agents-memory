@@ -107,8 +107,21 @@ The wizard searches for config in this order: `$MEMORY_CONFIG_PATH` → `./.env`
 
 ### Requirements
 - PostgreSQL ≥ 14 with the `pgvector` extension.
-- **Required API key**: OpenAI (embeddings + Librarian extraction).
-- **Optional API keys**: Anthropic / Google / Tavily / Exa (used by the v4.5 Skill Auditor and v5.0 memory-grounding paths — disabled by default).
+- **Required API key**: OpenAI (embeddings).
+- **Optional API keys**: depends on the wizard preset you pick (see below).
+
+### Model presets
+
+The wizard offers four presets for the always-on Librarian roles. Every role still accepts `<ROLE>_PROVIDER` and `<ROLE>_MODEL` env overrides if you want to mix and match.
+
+| Preset | Triage | Extract | Audit | Contradiction | Required keys |
+|---|---|---|---|---|---|
+| **Recommended** | gemini-2.5-flash-lite | gpt-4o-mini | gpt-4o-mini | gpt-4o-mini | OpenAI + Google |
+| OpenAI only | gpt-4o-mini | gpt-4o-mini | gpt-4o-mini | gpt-4o-mini | OpenAI |
+| Anthropic only | claude-haiku-4-5 | claude-haiku-4-5 | claude-haiku-4-5 | claude-haiku-4-5 | Anthropic |
+| Premium | gemini-2.5-flash | gpt-4o-mini | grok-4.20-0309-reasoning | grok-4.20-0309-reasoning | OpenAI + Google + xAI |
+
+Grounding roles (`skill_auditor` + `memory_auditor`) default to `claude-sonnet-4-6` and only fire when `PROMOTION_ENABLED` / `MEMORY_AUDIT_ENABLED` are on. Sonnet calls use prompt caching automatically — repeat audits within 5 minutes hit at ~10× cheaper rate.
 
 ## Roadmap
 

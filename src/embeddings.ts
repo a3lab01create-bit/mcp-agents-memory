@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { EMBEDDING_MODEL } from "./model_registry.js";
 
 let client: OpenAI | null = null;
 let _warned = false;
@@ -24,7 +25,7 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
 
   try {
     const response = await getClient().embeddings.create({
-      model: "text-embedding-3-small",
+      model: EMBEDDING_MODEL,
       input: text.substring(0, 8000),
     });
     return response.data[0].embedding;

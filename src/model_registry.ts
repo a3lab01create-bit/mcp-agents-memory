@@ -28,6 +28,18 @@ export interface CallOptions {
   user: string;
   responseFormat?: 'json' | 'text';
   maxTokens?: number;
+  /**
+   * When true on Anthropic calls, marks the system prompt with
+   * `cache_control: { type: 'ephemeral' }`. Subsequent calls with the SAME
+   * system prompt within the cache TTL (~5min) are billed at the cache-hit
+   * rate (~10× cheaper). The first call pays a ~25% write premium, so set
+   * this only on roles whose system prompt is stable AND likely to repeat
+   * within the session (e.g. memory_auditor / skill_auditor across a batch
+   * of facts). Anthropic only — ignored for other providers. Anthropic
+   * additionally requires the cached portion to exceed a minimum token
+   * count (~1024 for Sonnet), so very short prompts get no benefit.
+   */
+  cache?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -54,20 +66,80 @@ export function assertModelProvider(spec: ModelSpec): void {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Role Registry
+// Role Registry — defaults + per-role env override
+//
+// Each role reads BOTH provider and model from env:
+//   <ROLE>_PROVIDER  — 'openai' | 'anthropic' | 'google' | 'xai'
+//   <ROLE>_MODEL     — exact model identifier passed to that provider
+//
+// Defaults below are tuned for cost/quality balance:
+//   - High-frequency roles (triage/extract/audit/contradiction) → cheap models
+//   - Opt-in grounding roles (skill/memory auditor) → quality models
+//
+// Users wanting "OpenAI only" or "Anthropic only" override via the wizard,
+// which sets all 7 <ROLE>_PROVIDER + <ROLE>_MODEL pairs at once.
 // ─────────────────────────────────────────────────────────────
 
-export const ROLE_REGISTRY: Record<Role, ModelSpec> = {
-  triage:        { provider: 'google',    model_name: process.env.TRIAGE_MODEL        || 'gemini-2.0-flash-exp' },
-  extract:       { provider: 'openai',    model_name: process.env.EXTRACT_MODEL       || 'gpt-4o-mini' },
-  audit:         { provider: 'xai',       model_name: process.env.AUDIT_MODEL         || 'grok-2-latest' },
-  contradiction: { provider: 'openai',    model_name: process.env.CONTRADICTION_MODEL || 'gpt-4o-mini' },
-  skill_curator: { provider: 'openai',    model_name: process.env.SKILL_CURATOR_MODEL || 'gpt-4o-mini' },
-  skill_auditor: { provider: 'anthropic', model_name: process.env.SKILL_AUDITOR_MODEL || 'claude-sonnet-4-6' },
-  memory_auditor: { provider: 'anthropic', model_name: process.env.MEMORY_AUDITOR_MODEL || 'claude-sonnet-4-6' },
+const DEFAULTS: Record<Role, ModelSpec> = {
+  triage:        { provider: 'google',    model_name: 'gemini-2.5-flash-lite' },
+  extract:       { provider: 'openai',    model_name: 'gpt-4o-mini' },
+  audit:         { provider: 'openai',    model_name: 'gpt-4o-mini' },
+  contradiction: { provider: 'openai',    model_name: 'gpt-4o-mini' },
+  skill_curator: { provider: 'openai',    model_name: 'gpt-4o-mini' },
+  skill_auditor: { provider: 'anthropic', model_name: 'claude-sonnet-4-6' },
+  memory_auditor: { provider: 'anthropic', model_name: 'claude-sonnet-4-6' },
 };
 
-// Validate at module load
+/**
+ * Infer provider from a model name's prefix. Used when a user sets
+ * <ROLE>_MODEL without an accompanying <ROLE>_PROVIDER — common for
+ * .env files migrated from the pre-PROVIDER schema.
+ */
+function inferProvider(modelName: string): Provider | null {
+  const lower = modelName.toLowerCase();
+  for (const [provider, prefixes] of Object.entries(KNOWN_PREFIXES) as [Provider, string[]][]) {
+    if (prefixes.some((p) => lower.startsWith(p))) return provider;
+  }
+  return null;
+}
+
+function envEnvelope(role: Role): ModelSpec {
+  const upper = role.toUpperCase();
+  const explicitProvider = process.env[`${upper}_PROVIDER`] as Provider | undefined;
+  const explicitModel = process.env[`${upper}_MODEL`];
+
+  if (explicitProvider && explicitModel) {
+    return { provider: explicitProvider, model_name: explicitModel };
+  }
+  if (explicitModel && !explicitProvider) {
+    // Migration friendliness: pre-existing .env files set MODEL only.
+    const inferred = inferProvider(explicitModel);
+    if (!inferred) {
+      console.error(
+        `⚠️  [ModelRegistry] ${upper}_MODEL=${explicitModel} but no ${upper}_PROVIDER set, ` +
+          `and the model prefix doesn't match any known provider. Falling back to default.`
+      );
+      return DEFAULTS[role];
+    }
+    return { provider: inferred, model_name: explicitModel };
+  }
+  if (explicitProvider && !explicitModel) {
+    return { provider: explicitProvider, model_name: DEFAULTS[role].model_name };
+  }
+  return DEFAULTS[role];
+}
+
+export const ROLE_REGISTRY: Record<Role, ModelSpec> = {
+  triage:        envEnvelope('triage'),
+  extract:       envEnvelope('extract'),
+  audit:         envEnvelope('audit'),
+  contradiction: envEnvelope('contradiction'),
+  skill_curator: envEnvelope('skill_curator'),
+  skill_auditor: envEnvelope('skill_auditor'),
+  memory_auditor: envEnvelope('memory_auditor'),
+};
+
+// Validate at module load — surfaces provider/model mismatch immediately.
 for (const [role, spec] of Object.entries(ROLE_REGISTRY)) {
   try {
     assertModelProvider(spec as ModelSpec);
@@ -76,6 +148,9 @@ for (const [role, spec] of Object.entries(ROLE_REGISTRY)) {
     throw err;
   }
 }
+
+/** Embedding model is not a "role" but follows the same env override pattern. */
+export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small';
 
 // ─────────────────────────────────────────────────────────────
 // Client Factories (lazy)
@@ -151,10 +226,13 @@ export async function callRole(role: Role, opts: CallOptions): Promise<string> {
     }
     case 'anthropic': {
       const client = getAnthropicClient();
+      const systemBlock = opts.cache
+        ? [{ type: "text" as const, text: opts.system, cache_control: { type: "ephemeral" as const } }]
+        : opts.system;
       const res = await client.messages.create({
         model: spec.model_name,
         max_tokens: maxTokens,
-        system: opts.system,
+        system: systemBlock as any,
         messages: [{ role: "user", content: opts.user }],
       });
       return (res.content[0] as any).text || "";

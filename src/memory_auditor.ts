@@ -134,6 +134,7 @@ ${searchResults.map((source, index) =>
       user,
       responseFormat: 'json',
       maxTokens: 2048,
+      cache: true, // Sonnet/Haiku — system prompt repeats per fact in a batch.
     });
     const normalized = normalizeAuditorResponse(raw);
     const citedSources = normalized.cited_indices
