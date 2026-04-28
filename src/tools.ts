@@ -8,6 +8,7 @@ import { auditSkill } from "./skill_auditor.js";
 import { runCurator } from "./curator.js";
 import { restoreMemories, RestoreInputError } from "./forgetting.js";
 import { runConnectorSync } from "./connectors/sync.js";
+import { processMostRecentPending } from "./transcript_processor.js";
 import { PACKAGE_VERSION } from "./version.js";
 
 // ─────────────────────────────────────────────────────────────
@@ -42,6 +43,28 @@ export function registerTools(server: McpServer) {
       sections.push("═══════════════════════════════════════");
       sections.push("🧠 MEMORY BRIEFING — Session Context");
       sections.push("═══════════════════════════════════════\n");
+
+      // 0. Drain the most recent pending transcript so this briefing reflects
+      //    the session that just ended. Bounded to 1 row to keep startup
+      //    latency under ~10s; remaining backlog flows through the background
+      //    processor (transcript_processor.ts).
+      try {
+        const drained = await processMostRecentPending(1);
+        if (drained.processed > 0 || drained.failed > 0 || drained.remaining_pending > 0) {
+          sections.push("📝 TRANSCRIPT INTAKE");
+          sections.push("───────────────────");
+          if (drained.processed > 0) {
+            sections.push(`• Just processed: ${drained.processed} session(s)`);
+          }
+          if (drained.failed > 0) {
+            sections.push(`• Failed: ${drained.failed} (check transcript_queue.error)`);
+          }
+          if (drained.remaining_pending > 0) {
+            sections.push(`• Pending in background: ${drained.remaining_pending}`);
+          }
+          sections.push("");
+        }
+      } catch (e) { /* silent — startup must never fail */ }
 
       // 1. User Profile & Preferences
       try {

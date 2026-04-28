@@ -20,7 +20,6 @@
     "start": "node build/index.js",
     "dev": "ts-node --esm src/index.ts",
     "setup": "npm run build && node build/index.js setup",
-    "setup-hook": "npm run build && node build/index.js setup-hook",
     "migrate": "npm run build && node build/index.js migrate",
     "eval": "npm run build && node build/eval/index.js"
   },

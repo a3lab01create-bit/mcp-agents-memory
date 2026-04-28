@@ -8,6 +8,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { registerTools, getOrCreateSubject } from "./tools.js";
 import { maybeStartPromotionLoop, stopPromotionLoop } from "./promotion.js";
 import { maybeStartForgettingLoop, stopForgettingLoop } from "./forgetting.js";
+import { maybeStartTranscriptProcessor, stopTranscriptProcessor } from "./transcript_processor.js";
+import { captureSessionStart, captureSessionEnd, backfillExistingTranscripts } from "./transcript_capture.js";
 import { PACKAGE_VERSION } from "./version.js";
 import fs from "fs";
 
@@ -21,6 +23,18 @@ async function shutdown(reason: string): Promise<void> {
 
   try { stopPromotionLoop(); } catch {}
   try { stopForgettingLoop(); } catch {}
+  try { stopTranscriptProcessor(); } catch {}
+
+  // Capture transcript before db.close — INSERT only, no LLM call.
+  // Bounded to 2s so it can't push us past the 3s db.close race.
+  try {
+    await Promise.race([
+      captureSessionEnd(),
+      new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+    ]);
+  } catch (err) {
+    console.error("Transcript capture error (non-blocking):", err);
+  }
 
   try {
     await Promise.race([
@@ -51,7 +65,6 @@ function printHelp() {
 Usage:
   mcp-agents-memory             Run the MCP server (stdio).
   mcp-agents-memory setup       Interactive setup — write config to ~/.config/mcp-agents-memory/.env and run migrations.
-  mcp-agents-memory setup-hook  Install Claude Code SessionEnd auto-save hook (writes settings.json).
   mcp-agents-memory migrate     Apply any pending DB migrations against the configured database.
   mcp-agents-memory help        Show this message.
 
@@ -85,6 +98,10 @@ async function runMcpServer() {
 
   installShutdownHandlers();
 
+  // Snapshot cwd at startup so captureSessionEnd can find the right
+  // ~/.claude/projects/<slug>/ directory at shutdown without re-deriving.
+  captureSessionStart(process.cwd());
+
   console.error("🚀 Starting Memory MCP Server...");
 
   if (process.env.SSH_ENABLED === "true" && !process.env.SSH_KEY_PATH) {
@@ -106,6 +123,11 @@ async function runMcpServer() {
           console.error(`🤖 Agent registered: ${process.env.AGENT_KEY}`);
         }).catch((err) => console.error("Failed to register agent:", err));
       }
+      // Backfill all existing transcripts in the active project dir.
+      // UNIQUE constraint handles idempotency — re-runs are no-ops.
+      backfillExistingTranscripts().catch((err) =>
+        console.error("📝 [Backfill] fatal:", err)
+      );
     }).catch((err) => {
       console.error("❌ Background DB connection failed:", err);
       console.error("   Run `mcp-agents-memory setup` if this is a fresh install.");
@@ -117,6 +139,7 @@ async function runMcpServer() {
 
   maybeStartPromotionLoop();
   maybeStartForgettingLoop();
+  maybeStartTranscriptProcessor();
 }
 
 async function cli() {
@@ -139,12 +162,6 @@ async function cli() {
   if (cmd === "setup") {
     const { runSetupWizard } = await import("./setup.js");
     await runSetupWizard();
-    process.exit(0);
-  }
-
-  if (cmd === "setup-hook") {
-    const { runSetupHookWizard } = await import("./setup_hook.js");
-    await runSetupHookWizard();
     process.exit(0);
   }
 
