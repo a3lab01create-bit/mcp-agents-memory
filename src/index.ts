@@ -51,6 +51,7 @@ function printHelp() {
 Usage:
   mcp-agents-memory             Run the MCP server (stdio).
   mcp-agents-memory setup       Interactive setup — write config to ~/.config/mcp-agents-memory/.env and run migrations.
+  mcp-agents-memory setup-hook  Install Claude Code SessionEnd auto-save hook (writes settings.json).
   mcp-agents-memory migrate     Apply any pending DB migrations against the configured database.
   mcp-agents-memory help        Show this message.
 
@@ -138,6 +139,12 @@ async function cli() {
   if (cmd === "setup") {
     const { runSetupWizard } = await import("./setup.js");
     await runSetupWizard();
+    process.exit(0);
+  }
+
+  if (cmd === "setup-hook") {
+    const { runSetupHookWizard } = await import("./setup_hook.js");
+    await runSetupHookWizard();
     process.exit(0);
   }
 
