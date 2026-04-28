@@ -24,7 +24,7 @@ async function run() {
     // 검증 SQL 실행
     console.log("\n📊 Verification SQL Results:");
     const res = await db.query(`
-      SELECT f.id, f.content, f.confidence, f.effective_confidence,
+      SELECT f.id, f.content, f.confidence,
              f.author_model AS legacy_text, f.author_model_id,
              m.model_name AS resolved_via_fk
       FROM memories f

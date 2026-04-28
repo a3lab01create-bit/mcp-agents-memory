@@ -10,7 +10,7 @@
 import { generateEmbedding, vectorToSql } from "./embeddings.js";
 import { db } from "./db.js";
 import { validateFact } from "./validator.js";
-import { callRole, ROLE_REGISTRY } from "./model_registry.js";
+import { callRole, ROLE_REGISTRY, inferProvider } from "./model_registry.js";
 import { getOrCreateSubject } from "./subjects.js";
 import { auditMemory } from "./memory_auditor.js";
 import type { AuditedMemory, MemoryValidationTier } from "./memory_auditor.js";
@@ -252,51 +252,48 @@ export async function auditFacts(facts: ExtractedFact[]): Promise<ExtractedFact[
 // ─────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────
-// Model Resolution & Trust Weight
+// Model & Platform Resolution (provenance FK lookup)
 // ─────────────────────────────────────────────────────────────
 
 interface ResolvedModel {
   id: number;
-  trust_weight: number;
   model_name: string;
 }
 
-interface ResolvedPlatform { id: number; trust_weight: number; name: string; }
+interface ResolvedPlatform { id: number; name: string; }
 
 const MODEL_CACHE = new Map<string, ResolvedModel | null>();
 const PLATFORM_CACHE = new Map<string, ResolvedPlatform | null>();
-const DEFAULT_TRUST_WEIGHT = 0.80;
 
 export async function resolvePlatform(name: string | undefined | null): Promise<ResolvedPlatform | null> {
   if (!name) return null;
   const key = name.toLowerCase();
   if (PLATFORM_CACHE.has(key)) return PLATFORM_CACHE.get(key) as ResolvedPlatform | null;
 
-  // Try exact match first
-  const sel = await db.query("SELECT id, name, trust_weight FROM platforms WHERE LOWER(name) = $1 LIMIT 1", [key]);
+  const sel = await db.query("SELECT id, name FROM platforms WHERE LOWER(name) = $1 LIMIT 1", [key]);
   if (sel.rows.length > 0) {
-    const r: ResolvedPlatform = { id: sel.rows[0].id, name: sel.rows[0].name, trust_weight: parseFloat(sel.rows[0].trust_weight) };
+    const r: ResolvedPlatform = { id: sel.rows[0].id, name: sel.rows[0].name };
     PLATFORM_CACHE.set(key, r);
     return r;
   }
 
-  // Auto-register with default trust_weight=1.00
   const ins = await db.query(
-    "INSERT INTO platforms (name, trust_weight) VALUES ($1, 1.00) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id, name, trust_weight",
+    "INSERT INTO platforms (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id, name",
     [name]
   );
-  const r: ResolvedPlatform = { id: ins.rows[0].id, name: ins.rows[0].name, trust_weight: parseFloat(ins.rows[0].trust_weight) };
+  const r: ResolvedPlatform = { id: ins.rows[0].id, name: ins.rows[0].name };
   PLATFORM_CACHE.set(key, r);
   console.error(`✨ [Librarian] Auto-registered platform "${name}"`);
   return r;
 }
 
 /**
- * Resolve a model name (or alias) to its DB id and trust_weight.
+ * Resolve a model name (or alias) to its DB id.
  * Resolution order:
  *   1. Exact match on models.model_name (case-insensitive)
  *   2. Alias match via metadata->>'alias' (case-insensitive)
- *   3. null (not found — caller uses DEFAULT_TRUST_WEIGHT)
+ *   3. Auto-register if provider can be inferred from name prefix (claude-*, gpt-*, gemini-*, grok-*, o1-*, o3-*)
+ *   4. null (provider unknown — author_model_id stays NULL)
  */
 export async function resolveModel(name: string | undefined | null): Promise<ResolvedModel | null> {
   if (!name) return null;
@@ -305,7 +302,7 @@ export async function resolveModel(name: string | undefined | null): Promise<Res
 
   try {
     const res = await db.query(
-      `SELECT id, model_name, trust_weight
+      `SELECT id, model_name
        FROM models
        WHERE LOWER(model_name) = $1
           OR LOWER(metadata->>'alias') = $1
@@ -313,33 +310,41 @@ export async function resolveModel(name: string | undefined | null): Promise<Res
       [key]
     );
 
-    if (res.rows.length === 0) {
-      console.error(`⚠️ [Librarian] Unknown model "${name}" — defaulting trust_weight ${DEFAULT_TRUST_WEIGHT}, author_model_id=NULL`);
+    if (res.rows.length > 0) {
+      const resolved: ResolvedModel = {
+        id: res.rows[0].id,
+        model_name: res.rows[0].model_name,
+      };
+      MODEL_CACHE.set(key, resolved);
+      return resolved;
+    }
+
+    // Auto-register: infer provider from prefix, INSERT, return new id.
+    const provider = inferProvider(name);
+    if (!provider) {
+      console.error(`⚠️ [Librarian] Unknown model "${name}" — provider not inferable, author_model_id=NULL`);
       MODEL_CACHE.set(key, null);
       return null;
     }
 
+    const ins = await db.query(
+      `INSERT INTO models (provider, model_name, metadata)
+       VALUES ($1, $2, '{}'::jsonb)
+       ON CONFLICT (model_name) DO UPDATE SET model_name = EXCLUDED.model_name
+       RETURNING id, model_name`,
+      [provider, name]
+    );
     const resolved: ResolvedModel = {
-      id: res.rows[0].id,
-      trust_weight: parseFloat(res.rows[0].trust_weight),
-      model_name: res.rows[0].model_name,
+      id: ins.rows[0].id,
+      model_name: ins.rows[0].model_name,
     };
     MODEL_CACHE.set(key, resolved);
+    console.error(`✨ [Librarian] Auto-registered model "${name}" (provider=${provider})`);
     return resolved;
   } catch (err) {
     console.error(`❌ [Librarian] resolveModel failed for "${name}":`, err);
     return null;
   }
-}
-
-/**
- * effective_confidence = (confidence / 10.0) * trust_weight
- * confidence: 1-10 → trust_weight: 0.00-1.00 → result: 0.00-1.00
- * Stored as NUMERIC(4,2).
- */
-export function computeEffectiveConfidence(confidence: number, trustWeight: number): number {
-  const raw = (confidence / 10.0) * trustWeight;
-  return Math.round(raw * 100) / 100;
 }
 
 async function resolveContradiction(
@@ -532,11 +537,9 @@ export async function processBatch(
         result.contradictions_resolved++;
       }
 
-      // Resolve model → FK id + trust_weight
+      // Resolve model + platform → provenance FK ids
       const resolvedModel = await resolveModel(provenance.author_model);
       const resolvedPlatform = await resolvePlatform(provenance.platform);
-      const trustWeight = resolvedModel?.trust_weight ?? DEFAULT_TRUST_WEIGHT;
-      const effectiveConfidence = computeEffectiveConfidence(fact.confidence, trustWeight);
 
       // Pick validation_status: sync audit wins; otherwise legacy async-pending rule.
       const auditedStatus = auditResult ? tierToStatus(auditResult.validation_tier) : null;
@@ -548,9 +551,9 @@ export async function processBatch(
            confidence, importance, tags, embedding, validation_status,
            author_model, platform, session_id,
            agent_platform, agent_model, agent_curator_id,
-           author_model_id, platform_id, effective_confidence, source
+           author_model_id, platform_id, source
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
          RETURNING id`,
         [
           subjectId, projectId, fact.content, fact.fact_type,
@@ -562,7 +565,6 @@ export async function processBatch(
           provenance.agent_curator_id ?? null,
           resolvedModel?.id ?? null,
           resolvedPlatform?.id ?? null,
-          effectiveConfidence,
           provenance.source ?? 'librarian'
         ]
       );

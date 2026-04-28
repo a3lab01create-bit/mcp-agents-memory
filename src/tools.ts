@@ -231,8 +231,8 @@ export function registerTools(server: McpServer) {
       // Default Curator to Producer's model when caller doesn't specify.
       // Producer == Curator is the common case; explicit curator_model is for
       // delegation scenarios (orchestrator saving subagent output).
-      const authorModel = args.author_model ?? null;
-      const curatorModel = args.curator_model ?? args.author_model ?? null;
+      const authorModel = args.author_model ?? undefined;
+      const curatorModel = args.curator_model ?? args.author_model ?? undefined;
       const platform = args.platform ?? agentPlatform;
 
       const result = await processBatch(
@@ -483,7 +483,7 @@ export function registerTools(server: McpServer) {
 
       const results = await db.query(
         `SELECT f.id, f.content, f.fact_type, f.confidence, f.importance, f.tags, f.created_at,
-                f.effective_confidence, m.model_name as author_model,
+                m.model_name as author_model,
                 subj.display_name as subject_name,
                 proj.display_name as project_name,
                 CASE WHEN f.embedding IS NOT NULL
@@ -514,10 +514,9 @@ export function registerTools(server: McpServer) {
       let formatted = baseContext + "🧠 Recalled Facts:\n\n";
       results.rows.forEach((r: any) => {
         const sim = (r.similarity * 100).toFixed(0);
-        const conf = r.effective_confidence ? `${r.effective_confidence} (eff)` : r.confidence;
         const author = r.author_model ? ` | via ${r.author_model}` : '';
 
-        formatted += `[#${r.id}] [${r.fact_type}] (imp: ${r.importance}, conf: ${conf}, sim: ${sim}%${author})\n`;
+        formatted += `[#${r.id}] [${r.fact_type}] (imp: ${r.importance}, conf: ${r.confidence}, sim: ${sim}%${author})\n`;
         if (r.subject_name) formatted += `Subject: ${r.subject_name}`;
         if (r.project_name) formatted += ` | Project: ${r.project_name}`;
         if (r.subject_name || r.project_name) formatted += `\n`;

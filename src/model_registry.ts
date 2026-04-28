@@ -93,9 +93,10 @@ const DEFAULTS: Record<Role, ModelSpec> = {
 /**
  * Infer provider from a model name's prefix. Used when a user sets
  * <ROLE>_MODEL without an accompanying <ROLE>_PROVIDER — common for
- * .env files migrated from the pre-PROVIDER schema.
+ * .env files migrated from the pre-PROVIDER schema. Also reused by
+ * librarian's auto-registration of unknown author models.
  */
-function inferProvider(modelName: string): Provider | null {
+export function inferProvider(modelName: string): Provider | null {
   const lower = modelName.toLowerCase();
   for (const [provider, prefixes] of Object.entries(KNOWN_PREFIXES) as [Provider, string[]][]) {
     if (prefixes.some((p) => lower.startsWith(p))) return provider;
