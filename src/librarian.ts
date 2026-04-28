@@ -61,9 +61,11 @@ export interface ProvenanceInfo {
   platform?: string;
   /**
    * Curator identity — the agent that called memory_add. Distinct from
-   * Producer (author_model). Server-populated from process.env.AGENT_PLATFORM
-   * and process.env.AGENT_MODEL; not user-overridable.
-   * Two fields because some platforms (e.g. OpenClaw) have no default model.
+   * Producer (author_model).
+   * agent_platform: server-populated from process.env.AGENT_PLATFORM (harness identity).
+   * agent_model: per-call value from args.curator_model (or fallback to args.author_model).
+   * Captures the actual model running at save time, which env can't track because
+   * /model swaps mid-session.
    */
   agent_platform?: string;
   agent_model?: string;

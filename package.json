@@ -1,6 +1,6 @@
 {
   "name": "mcp-agents-memory",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Long-term memory for AI agents with provenance and trust weights",
   "main": "build/index.js",
   "type": "module",

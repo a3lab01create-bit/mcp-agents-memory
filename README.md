@@ -93,15 +93,14 @@ Claude Desktop / Claude Code / any MCP-aware client:
       "command": "mcp-agents-memory",
       "env": {
         "AGENT_KEY": "agent_claude",
-        "AGENT_PLATFORM": "claude-code",
-        "AGENT_MODEL": "claude-opus-4-7"
+        "AGENT_PLATFORM": "claude-code"
       }
     }
   }
 }
 ```
 
-`AGENT_PLATFORM` and `AGENT_MODEL` are recorded on every memory_add call as the **Curator** identity (the agent that saved the fact), separate from the **Producer** (`author_model`, the model that generated the content). For platforms without a fixed model (e.g. OpenClaw, generic agent runtimes), set `AGENT_MODEL` to whatever model is actually backing the session.
+`AGENT_PLATFORM` is recorded as the Curator's harness identity on every memory_add call. The Curator's model is captured per-call (defaulting to the Producer's author_model) — set explicitly via the curator_model argument when an orchestrator saves memories on behalf of a different model (e.g. delegating to a subagent). This avoids the staleness that env-static model values would introduce when /model swaps mid-session.
 
 ### Cross-machine memory
 

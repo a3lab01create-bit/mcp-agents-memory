@@ -205,17 +205,16 @@ export function registerTools(server: McpServer) {
         subject_key: z.string().optional().default(process.env.MEMORY_DEFAULT_SUBJECT || "default_user").describe("Primary subject key."),
         project_key: z.string().optional().describe("Project key if relevant."),
         author_model: z.string().optional().describe("Model name or alias (e.g., 'sonnet', 'opus', 'gemini')."),
+        curator_model: z.string().optional().describe('Curator model override — the model running memory_add. Defaults to author_model (Producer == Curator solo case).'),
         platform: z.string().optional().describe("Platform (e.g., 'antigravity', 'claude-code')."),
         session_id: z.string().optional().describe("Unique session identifier."),
       }
     },
     async (args) => {
-      // Curator identity — read from env at call time, never user-overridable.
-      // AGENT_PLATFORM = harness/CLI ("claude-code", "openclaw", "gemini-cli")
-      // AGENT_MODEL    = underlying model ("claude-opus-4-7", "gpt-5"). Required
-      //                  for platforms without a fixed model (e.g. OpenClaw).
+      // Curator identity: agent_platform stays env-driven (harness identity is stable).
+      // agent_model is captured per-call via args.curator_model (defaults to
+      // args.author_model) — env was wrong because /model can switch mid-session.
       const agentPlatform = process.env.AGENT_PLATFORM;
-      const agentModel = process.env.AGENT_MODEL;
 
       const subjectId = await getOrCreateSubject(args.subject_key, 'person');
 
@@ -224,10 +223,11 @@ export function registerTools(server: McpServer) {
         projectId = await getOrCreateSubject(args.project_key, 'project');
       }
 
-      // Default Producer to Curator's model when caller doesn't specify.
-      // Producer == Curator is the common case; explicit override is for
+      // Default Curator to Producer's model when caller doesn't specify.
+      // Producer == Curator is the common case; explicit curator_model is for
       // delegation scenarios (orchestrator saving subagent output).
-      const authorModel = args.author_model ?? agentModel;
+      const authorModel = args.author_model ?? null;
+      const curatorModel = args.curator_model ?? args.author_model ?? null;
       const platform = args.platform ?? agentPlatform;
 
       const result = await processBatch(
@@ -239,7 +239,7 @@ export function registerTools(server: McpServer) {
           author_model: authorModel,
           platform,
           agent_platform: agentPlatform,
-          agent_model: agentModel,
+          agent_model: curatorModel,
           session_id: args.session_id
         }
       );
