@@ -102,6 +102,8 @@ Claude Desktop / Claude Code / any MCP-aware client:
 
 `AGENT_PLATFORM` is recorded as the Curator's harness identity on every memory_add call. The Curator's model is captured per-call (defaulting to the Producer's author_model) — set explicitly via the curator_model argument when an orchestrator saves memories on behalf of a different model (e.g. delegating to a subagent). This avoids the staleness that env-static model values would introduce when /model swaps mid-session.
 
+`agent_key` (optional): Agent persona key for multi-persona harnesses (OpenClaw, Hermes, Opencode). Single-persona setups can ignore — `AGENT_KEY` env is the default. Applies to `memory_add`, `memory_save_skill`, and `memory_curator_run`.
+
 ### Cross-machine memory
 
 On a second computer, run `npm i -g mcp-agents-memory` and `mcp-agents-memory setup` pointing to the **same** `DATABASE_URL`. Memory shares automatically — the database is the source of truth and the MCP server is stateless.

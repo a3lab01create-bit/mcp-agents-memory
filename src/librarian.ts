@@ -69,6 +69,13 @@ export interface ProvenanceInfo {
    */
   agent_platform?: string;
   agent_model?: string;
+  /**
+   * agent_curator_id: FK to subjects(id) for the agent persona that called
+   * memory_add (or memory_save_skill / memory_curator_run via the skill path).
+   * Resolved per-call (args.agent_key) with env AGENT_KEY as fallback.
+   * NULL for connector-sourced and auto-promotion writes.
+   */
+  agent_curator_id?: number | null;
   session_id?: string;
   /**
    * Override for `memories.source` column. Defaults to 'librarian' when omitted.
@@ -540,10 +547,10 @@ export async function processBatch(
            subject_id, project_subject_id, content, fact_type,
            confidence, importance, tags, embedding, validation_status,
            author_model, platform, session_id,
-           agent_platform, agent_model,
+           agent_platform, agent_model, agent_curator_id,
            author_model_id, platform_id, effective_confidence, source
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
          RETURNING id`,
         [
           subjectId, projectId, fact.content, fact.fact_type,
@@ -552,6 +559,7 @@ export async function processBatch(
           validationStatus,
           provenance.author_model, provenance.platform, provenance.session_id,
           provenance.agent_platform, provenance.agent_model,
+          provenance.agent_curator_id ?? null,
           resolvedModel?.id ?? null,
           resolvedPlatform?.id ?? null,
           effectiveConfidence,

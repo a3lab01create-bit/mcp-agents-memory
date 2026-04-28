@@ -152,7 +152,8 @@ export async function recordSkillExposure(skillIds: number[]): Promise<void> {
 
 export async function updateOrCreateSkill(
   candidate: SkillCandidate,
-  audit?: AuditedSkillCandidate
+  audit?: AuditedSkillCandidate,
+  agentCuratorId?: number | null
 ): Promise<SkillUpdateResult> {
   const persisted = getPersistedSkillFields(candidate, audit);
   const embedding = await generateEmbedding(`${candidate.title}\n\n${persisted.content}`);
@@ -182,9 +183,9 @@ export async function updateOrCreateSkill(
       await client.query(
         `INSERT INTO skill_changelog (
            skill_id, change_type, content_diff, source_memory_ids,
-           author_model_id, platform_id, metadata
+           author_model_id, platform_id, metadata, agent_curator_id
          )
-         VALUES ($1, 'append', $2, $3, $4, $5, $6)`,
+         VALUES ($1, 'append', $2, $3, $4, $5, $6, $7)`,
         [
           match.id,
           persisted.content,
@@ -197,6 +198,7 @@ export async function updateOrCreateSkill(
             similarity,
             audit: persisted.auditMetadata,
           }),
+          agentCuratorId ?? null,
         ]
       );
 
@@ -242,9 +244,9 @@ export async function updateOrCreateSkill(
       await client.query(
         `INSERT INTO skill_changelog (
            skill_id, change_type, content_diff, source_memory_ids,
-           author_model_id, platform_id, metadata
+           author_model_id, platform_id, metadata, agent_curator_id
          )
-         VALUES ($1, 'branched', $2, $3, $4, $5, $6)`,
+         VALUES ($1, 'branched', $2, $3, $4, $5, $6, $7)`,
         [
           skillId,
           persisted.content,
@@ -256,6 +258,7 @@ export async function updateOrCreateSkill(
             similarity,
             audit: persisted.auditMetadata,
           }),
+          agentCuratorId ?? null,
         ]
       );
 
@@ -292,9 +295,9 @@ export async function updateOrCreateSkill(
     await client.query(
       `INSERT INTO skill_changelog (
          skill_id, change_type, content_diff, source_memory_ids,
-         author_model_id, platform_id, metadata
+         author_model_id, platform_id, metadata, agent_curator_id
        )
-       VALUES ($1, 'created', $2, $3, $4, $5, $6)`,
+       VALUES ($1, 'created', $2, $3, $4, $5, $6, $7)`,
       [
         skillId,
         persisted.content,
@@ -306,6 +309,7 @@ export async function updateOrCreateSkill(
           similarity,
           audit: persisted.auditMetadata,
         }),
+        agentCuratorId ?? null,
       ]
     );
 

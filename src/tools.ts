@@ -206,6 +206,7 @@ export function registerTools(server: McpServer) {
         project_key: z.string().optional().describe("Project key if relevant."),
         author_model: z.string().optional().describe("Model name or alias (e.g., 'sonnet', 'opus', 'gemini')."),
         curator_model: z.string().optional().describe('Curator model override — the model running memory_add. Defaults to author_model (Producer == Curator solo case).'),
+        agent_key: z.string().optional().describe("Agent persona key (e.g., 'agent_openclaw_reviewer'). Multi-persona harnesses pass this per-call to differentiate personas in calibration data. Defaults to env AGENT_KEY."),
         platform: z.string().optional().describe("Platform (e.g., 'antigravity', 'claude-code')."),
         session_id: z.string().optional().describe("Unique session identifier."),
       }
@@ -215,6 +216,10 @@ export function registerTools(server: McpServer) {
       // agent_model is captured per-call via args.curator_model (defaults to
       // args.author_model) — env was wrong because /model can switch mid-session.
       const agentPlatform = process.env.AGENT_PLATFORM;
+      const agentKeyRaw = args.agent_key ?? process.env.AGENT_KEY ?? null;
+      const agentCuratorId = agentKeyRaw
+        ? await getOrCreateSubject(agentKeyRaw, 'agent')
+        : null;
 
       const subjectId = await getOrCreateSubject(args.subject_key, 'person');
 
@@ -240,6 +245,7 @@ export function registerTools(server: McpServer) {
           platform,
           agent_platform: agentPlatform,
           agent_model: curatorModel,
+          agent_curator_id: agentCuratorId,
           session_id: args.session_id
         }
       );
@@ -282,6 +288,7 @@ export function registerTools(server: McpServer) {
         source_memory_ids: z.array(z.number()).optional().describe("Memory IDs that produced this skill."),
         author_model: z.string().optional().describe("Model name or alias that authored the skill."),
         platform: z.string().optional().describe("Platform where the skill was authored."),
+        agent_key: z.string().optional().describe("Agent persona key. See memory_add for details."),
         audit: z.boolean().optional().default(true).describe("Run Skill Auditor before saving. Default: true."),
       }
     },
@@ -293,8 +300,12 @@ export function registerTools(server: McpServer) {
         author_model: args.author_model,
         platform: args.platform,
       };
+      const agentKeyRaw = args.agent_key ?? process.env.AGENT_KEY ?? null;
+      const agentCuratorId = agentKeyRaw
+        ? await getOrCreateSubject(agentKeyRaw, 'agent')
+        : null;
       const audited = args.audit !== false ? await auditSkill(candidate) : undefined;
-      const result = await updateOrCreateSkill(candidate, audited);
+      const result = await updateOrCreateSkill(candidate, audited, agentCuratorId);
       const validationTier = audited?.validation_tier ?? 'unvalidated';
       const auditReasoning = audited?.audit_reasoning ?? 'audit disabled';
       const sourcesCount = audited?.sources.length ?? 0;
@@ -335,9 +346,15 @@ export function registerTools(server: McpServer) {
         similarity_threshold: z.number().optional().describe("Minimum cosine similarity for cluster membership."),
         min_importance: z.number().optional().describe("Minimum average importance for accepted clusters."),
         max_clusters: z.number().optional().describe("Maximum clusters to analyze in one run."),
+        agent_key: z.string().optional().describe("Agent persona key for the curator caller. Auto-promotion loop passes none (NULL)."),
       }
     },
     async (args) => {
+      const agentKeyRaw = args.agent_key ?? process.env.AGENT_KEY ?? null;
+      const agentCuratorId = agentKeyRaw
+        ? await getOrCreateSubject(agentKeyRaw, 'agent')
+        : null;
+
       const result = await runCurator({
         subjectKey: args.subject_key,
         projectKey: args.project_key,
@@ -346,6 +363,7 @@ export function registerTools(server: McpServer) {
         similarityThreshold: args.similarity_threshold,
         minImportance: args.min_importance,
         maxClusters: args.max_clusters,
+        agentCuratorId,
       });
 
       const lines: string[] = [];

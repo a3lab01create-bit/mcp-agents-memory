@@ -31,6 +31,7 @@ export interface CuratorOptions {
   similarityThreshold?: number;
   minImportance?: number;
   maxClusters?: number;
+  agentCuratorId?: number | null;
 }
 
 export interface ClusterMember {
@@ -380,7 +381,7 @@ export async function runCurator(options: CuratorOptions = {}): Promise<CuratorR
 
       let skillResult: SkillUpdateResult | null = null;
       if (!normalized.dryRun) {
-        skillResult = await updateOrCreateSkill(candidate, audited);
+        skillResult = await updateOrCreateSkill(candidate, audited, options.agentCuratorId ?? null);
         result.skills_saved++;
       }
 
