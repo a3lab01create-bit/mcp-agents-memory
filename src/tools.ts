@@ -256,14 +256,18 @@ export function registerTools(server: McpServer) {
       const lines: string[] = [];
       lines.push(`📚 Librarian Report (v${PACKAGE_VERSION})`);
       lines.push(`──────────────────────────────────────────`);
-      lines.push(`Extracted: ${result.extracted} | Saved: ${result.saved} | Contradictions: ${result.contradictions_resolved} | Edges: ${result.edges_saved} | Audited: ${result.audited}`);
+      lines.push(`Extracted: ${result.extracted} | Saved: ${result.saved} | Deduped: ${result.deduped} | Contradictions: ${result.contradictions_resolved} | Edges: ${result.edges_saved} | Audited: ${result.audited}`);
 
       if (result.facts.length > 0) {
         lines.push("");
         lines.push("Saved Facts:");
         result.facts.forEach(f => {
-          const superseded = f.superseded ? ` (superseded #${f.superseded})` : '';
-          lines.push(`  [${f.fact_type}] ${f.content}${superseded}`);
+          const tag = f.deduped
+            ? ` (deduped → access_count++ on #${f.id})`
+            : f.superseded
+              ? ` (superseded #${f.superseded})`
+              : '';
+          lines.push(`  [${f.fact_type}] ${f.content}${tag}`);
         });
       }
 

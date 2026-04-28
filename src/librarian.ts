@@ -88,6 +88,7 @@ export interface ProvenanceInfo {
 export interface ProcessResult {
   extracted: number;
   saved: number;
+  deduped: number;
   contradictions_resolved: number;
   edges_saved: number;
   audited: number;
@@ -97,7 +98,7 @@ export interface ProcessResult {
     snippet: string;
     engine: 'tavily' | 'exa';
   }>;
-  facts: Array<{ id: number; content: string; fact_type: FactType; superseded: number | null }>;
+  facts: Array<{ id: number; content: string; fact_type: FactType; superseded: number | null; deduped?: boolean }>;
   errors: string[];
 }
 
@@ -347,6 +348,43 @@ export async function resolveModel(name: string | undefined | null): Promise<Res
   }
 }
 
+// Phase A dedup: skip INSERT when an existing active memory of the same subject + fact_type
+// is at or above DEDUP_SIMILARITY_THRESHOLD cosine similarity. Duplicate becomes a retention
+// signal (access_count bump) instead of clutter — pairs with Auto Forgetting's decay curve.
+const DEDUP_SIMILARITY_THRESHOLD = 0.95;
+
+export async function findNearDuplicate(
+  fact: ExtractedFact,
+  subjectId: number,
+  embedding: number[]
+): Promise<{ id: number; content: string; similarity: number } | null> {
+  try {
+    const maxDistance = 1 - DEDUP_SIMILARITY_THRESHOLD;
+    const result = await db.query(
+      `SELECT id, content, (embedding <=> $1::vector) AS distance
+       FROM memories
+       WHERE subject_id = $2
+         AND fact_type = $3
+         AND is_active = TRUE
+         AND embedding IS NOT NULL
+         AND (embedding <=> $1::vector) <= $4
+       ORDER BY distance ASC
+       LIMIT 1`,
+      [vectorToSql(embedding), subjectId, fact.fact_type, maxDistance]
+    );
+    if (result.rows.length === 0) return null;
+    const row = result.rows[0];
+    return {
+      id: Number(row.id),
+      content: row.content,
+      similarity: 1 - parseFloat(row.distance),
+    };
+  } catch (err) {
+    console.error("⚠️ [Librarian] findNearDuplicate failed (continuing without precheck):", err);
+    return null;
+  }
+}
+
 async function resolveContradiction(
   newFact: ExtractedFact,
   subjectId: number,
@@ -480,7 +518,7 @@ export async function processBatch(
   rawSource: string,
   provenance: ProvenanceInfo = {}
 ): Promise<ProcessResult> {
-  const result: ProcessResult = { extracted: 0, saved: 0, contradictions_resolved: 0, edges_saved: 0, audited: 0, sources: [], facts: [], errors: [] };
+  const result: ProcessResult = { extracted: 0, saved: 0, deduped: 0, contradictions_resolved: 0, edges_saved: 0, audited: 0, sources: [], facts: [], errors: [] };
 
   try {
     const segments = await triageTranscript(text);
@@ -530,6 +568,28 @@ export async function processBatch(
       }
 
       const emb = await generateEmbedding(fact.content);
+
+      // Phase A: near-duplicate precheck. If an active memory of the same subject + fact_type
+      // is ≥ DEDUP_SIMILARITY_THRESHOLD cosine similarity, skip INSERT and bump retention signal.
+      if (emb) {
+        const dup = await findNearDuplicate(fact, subjectId, emb);
+        if (dup) {
+          await db.query(
+            `UPDATE memories SET access_count = access_count + 1, last_accessed_at = NOW() WHERE id = $1`,
+            [dup.id]
+          );
+          result.deduped++;
+          result.facts.push({
+            id: dup.id,
+            content: dup.content,
+            fact_type: fact.fact_type,
+            superseded: null,
+            deduped: true,
+          });
+          continue;
+        }
+      }
+
       const { supersedes_id } = await resolveContradiction(fact, subjectId, emb || undefined);
 
       if (supersedes_id) {
