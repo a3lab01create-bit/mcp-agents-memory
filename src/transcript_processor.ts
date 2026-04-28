@@ -57,12 +57,16 @@ function parseSeconds(raw: string | undefined, fallback: number, label: string):
  * happen when shutdown captures size mid-write).
  */
 function extractTextFromJsonl(filePath: string, startByte: number, endByte: number): string {
+  // pg returns BIGINT columns as strings; coerce so fs.readSync's `position`
+  // arg gets a real number (it throws on string).
+  const start = Number(startByte);
+  const end = Number(endByte);
   const fd = fs.openSync(filePath, "r");
   try {
-    const length = Math.max(0, endByte - startByte);
+    const length = Math.max(0, end - start);
     if (length === 0) return "";
     const buf = Buffer.alloc(length);
-    fs.readSync(fd, buf, 0, length, startByte);
+    fs.readSync(fd, buf, 0, length, start);
     const raw = buf.toString("utf-8");
     const lines = raw.split("\n");
 
@@ -147,7 +151,19 @@ async function processOneInternal(row: QueueRow): Promise<void> {
     source: "transcript",
   };
 
-  await processBatch(text, subjectId, projectId, "transcript", provenance);
+  const result = await processBatch(text, subjectId, projectId, "transcript", provenance);
+
+  // Fail-loud: don't let the queue claim 'done' when Librarian extracted nothing
+  // from a non-trivial transcript. triageTranscript / extractFacts swallow LLM
+  // errors gracefully, so without this check zero-fact rows would be invisible.
+  if (result.extracted === 0 && text.length >= 200) {
+    const errMsg = `Librarian produced 0 facts from ${text.length} chars (errors: ${result.errors.join("; ").slice(0, 400) || "none recorded — likely silent triage/extract failure"})`;
+    await db.query(
+      `UPDATE transcript_queue SET status='failed', error=$2, processed_at=NOW() WHERE id=$1`,
+      [row.id, errMsg.slice(0, 500)]
+    );
+    return;
+  }
 
   await db.query(
     `UPDATE transcript_queue SET status='done', processed_at=NOW() WHERE id=$1`,

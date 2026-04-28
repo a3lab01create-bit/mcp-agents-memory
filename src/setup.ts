@@ -349,7 +349,7 @@ export async function applyBaseSchema() {
         tags TEXT[] DEFAULT '{}',
         embedding vector(1536),
         source VARCHAR(20) NOT NULL DEFAULT 'librarian'
-            CHECK (source IN ('librarian', 'user', 'agent', 'system', 'migration')),
+            CHECK (source IN ('librarian', 'user', 'agent', 'system', 'migration', 'connector', 'transcript')),
         access_count INTEGER NOT NULL DEFAULT 0,
         last_accessed_at TIMESTAMPTZ,
         superseded_by INTEGER REFERENCES memories(id),
