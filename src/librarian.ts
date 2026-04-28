@@ -592,11 +592,6 @@ export async function processBatch(
 
       const { supersedes_id } = await resolveContradiction(fact, subjectId, emb || undefined);
 
-      if (supersedes_id) {
-        await db.query(`UPDATE memories SET is_active = FALSE WHERE id = $1`, [supersedes_id]);
-        result.contradictions_resolved++;
-      }
-
       // Resolve model + platform → provenance FK ids
       const resolvedModel = await resolveModel(provenance.author_model);
       const resolvedPlatform = await resolvePlatform(provenance.platform);
@@ -605,31 +600,50 @@ export async function processBatch(
       const auditedStatus = auditResult ? tierToStatus(auditResult.validation_tier) : null;
       const validationStatus = auditedStatus ?? (fact.importance > 7 ? 'pending' : 'valid');
 
-      const insertRes = await db.query(
-        `INSERT INTO memories (
-           subject_id, project_subject_id, content, fact_type,
-           confidence, importance, tags, embedding, validation_status,
-           author_model, platform, session_id,
-           agent_platform, agent_model, agent_curator_id,
-           author_model_id, platform_id, source
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-         RETURNING id`,
-        [
-          subjectId, projectId, fact.content, fact.fact_type,
-          fact.confidence, fact.importance, fact.tags,
-          emb ? vectorToSql(emb) : null,
-          validationStatus,
-          provenance.author_model, provenance.platform, provenance.session_id,
-          provenance.agent_platform, provenance.agent_model,
-          provenance.agent_curator_id ?? null,
-          resolvedModel?.id ?? null,
-          resolvedPlatform?.id ?? null,
-          provenance.source ?? 'librarian'
-        ]
-      );
+      // Atomicity fix: supersede UPDATE + INSERT must be one transaction. Without this,
+      // a CHECK-constraint failure on INSERT (e.g. invalid `source` value) commits the
+      // supersede but leaves no replacement — silent data loss. Surfaced 2026-04-28
+      // when test harness used `source='phase_a_test'` and lost memory #240.
+      const client = await db.getClient();
+      let newId: number;
+      try {
+        await client.query('BEGIN');
+        if (supersedes_id) {
+          await client.query(`UPDATE memories SET is_active = FALSE WHERE id = $1`, [supersedes_id]);
+        }
+        const insertRes = await client.query(
+          `INSERT INTO memories (
+             subject_id, project_subject_id, content, fact_type,
+             confidence, importance, tags, embedding, validation_status,
+             author_model, platform, session_id,
+             agent_platform, agent_model, agent_curator_id,
+             author_model_id, platform_id, source
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+           RETURNING id`,
+          [
+            subjectId, projectId, fact.content, fact.fact_type,
+            fact.confidence, fact.importance, fact.tags,
+            emb ? vectorToSql(emb) : null,
+            validationStatus,
+            provenance.author_model, provenance.platform, provenance.session_id,
+            provenance.agent_platform, provenance.agent_model,
+            provenance.agent_curator_id ?? null,
+            resolvedModel?.id ?? null,
+            resolvedPlatform?.id ?? null,
+            provenance.source ?? 'librarian'
+          ]
+        );
+        await client.query('COMMIT');
+        newId = insertRes.rows[0].id;
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw err;
+      } finally {
+        client.release();
+      }
 
-      const newId = insertRes.rows[0].id;
+      if (supersedes_id) result.contradictions_resolved++;
       result.saved++;
       result.facts.push({ id: newId, content: fact.content, fact_type: fact.fact_type, superseded: supersedes_id });
 
