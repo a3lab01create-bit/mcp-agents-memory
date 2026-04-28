@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.8.1 — 2026-04-28
+
+### Skill injection eval harness (dev tool)
+
+Adds `npm run eval` — a curated scenario suite for `getInjectableSkills` filter behavior. Runs 6 multi-axis scenarios (project × model × platform intersections, multi-project unions, status filtering) against the live DB. Cleanup via `applicable_to.eval_run_id` metadata tag — no test fixtures can leak into production data.
+
+This is a development tool, not user-facing API. No schema change, no MCP tool exposure, no metric → behavior wiring. Decision basis: 3-way design meeting #2 + advisor surfaced that v0.8 ships multi-axis filter logic that has never executed against real production data (all 4 existing skills are `applicable_to = '{}'`). The harness exercises the unrun code paths.
+
+Discriminator before scope finalization: 4 production skills, all match-all shape, 2 distinct sessions across 148 memories. Production telemetry counters (the lighter alternative path) would yield no signal for months. Eval harness produces signal in the first run.
+
+### Added
+- `src/eval/runner.ts`, `src/eval/scenarios.ts`, `src/eval/index.ts` — scenario runner and initial 6-scenario suite
+- `npm run eval` script (compiles via existing `npm run build` esbuild pipeline, then runs)
+- `build.mjs` extended to bundle eval entry point alongside index + migrations
+
+### Out of scope (settled)
+- Coverage of full `memory_startup` briefing assembly (`tools.ts:140-163` wrap) — eval harness exercises `getInjectableSkills` filter only
+- Single-axis scenarios (project-only, model-only, platform-only) — already covered by `scratch/test_v08_project_scoping.ts`. The harness focuses on intersections to earn its keep
+- Production telemetry: counters, use_count auto-increment, agent self-reporting — all deferred until real-user signal exists
+
+### No npm publish
+0.8.1 ships to git only. No user-facing API change, so no registry update warranted. 0.8.0 remains the latest published version.
+
 ## 0.8.0 — 2026-04-28
 
 ### Project scoping for skills (Phase 1 of Project Rules Engine)

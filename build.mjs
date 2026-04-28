@@ -87,8 +87,12 @@ async function bundle(entryPoint, outfile, options = {}) {
   });
 }
 
+const evalSrcDir = path.join(srcDir, "eval");
+const evalOutDir = path.join(buildDir, "eval");
+
 await rm(buildDir, { recursive: true, force: true });
 await mkdir(migrationsOutDir, { recursive: true });
+await mkdir(evalOutDir, { recursive: true });
 
 const results = [];
 results.push(
@@ -102,6 +106,10 @@ for (const entryPoint of await listMigrationEntries()) {
   const outName = `${path.basename(entryPoint, ".ts")}.js`;
   results.push(await bundle(entryPoint, path.join(migrationsOutDir, outName)));
 }
+
+results.push(
+  await bundle(path.join(evalSrcDir, "index.ts"), path.join(evalOutDir, "index.js"))
+);
 
 await chmod(path.join(buildDir, "index.js"), 0o755);
 
