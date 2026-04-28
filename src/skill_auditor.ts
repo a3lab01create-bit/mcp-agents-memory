@@ -8,6 +8,9 @@ export type ValidationTier = 'validated_external' | 'validated_internal' | 'unva
 export interface SkillApplicability {
   models?: string[];
   platforms?: string[];
+  // v0.8: project scope. Set deterministically by curator from cluster's projectKey
+  // (auditor does NOT infer this — see v08 spec §2 for principled deferral rationale).
+  projects?: string[];
 }
 
 export interface AuditedSkillCandidate extends SkillCandidate {

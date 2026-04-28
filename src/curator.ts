@@ -352,6 +352,9 @@ export async function runCurator(options: CuratorOptions = {}): Promise<CuratorR
         source_memory_ids: cluster.member_ids,
         author_model: 'curator',
         platform: 'system',
+        // v0.8: propagate project scope from cluster context to the skill.
+        // Cross-project clusters (projectKey unset) leave applicable_to.projects unset → match-all.
+        project_key: options.projectKey,
       };
 
       let audit:

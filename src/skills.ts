@@ -12,6 +12,7 @@ export interface SkillCandidate {
   source_memory_ids?: number[];
   author_model?: string;
   platform?: string;
+  project_key?: string;
 }
 
 export type SkillUpdateAction = 'accumulated' | 'branched' | 'created';
@@ -27,6 +28,7 @@ export interface SkillUpdateResult {
 export interface InjectorContext {
   author_model?: string;
   platform?: string;
+  project_key?: string;
   limit?: number;
 }
 
@@ -58,30 +60,42 @@ function singletonArray(value: number | null | undefined): number[] {
   return typeof value === 'number' ? [value] : [];
 }
 
+function mergeProjectIntoApplicableTo(
+  base: import("./skill_auditor.js").SkillApplicability,
+  projectKey: string | undefined
+): import("./skill_auditor.js").SkillApplicability {
+  if (!projectKey) return base;
+  // Auditor already specified projects → respect it (Phase 2 might override).
+  if (Array.isArray(base.projects)) return base;
+  return { ...base, projects: [projectKey] };
+}
+
 function getPersistedSkillFields(
   candidate: SkillCandidate,
   audit?: AuditedSkillCandidate
 ): PersistedSkillFields {
   if (!audit) {
+    const applicable = mergeProjectIntoApplicableTo({}, candidate.project_key);
     return {
       content: candidate.content,
       sources: JSON.stringify([]),
       validationTier: 'unvalidated',
-      applicableTo: JSON.stringify({}),
+      applicableTo: JSON.stringify(applicable),
       auditMetadata: {},
     };
   }
 
+  const merged = mergeProjectIntoApplicableTo(audit.applicable_to ?? {}, candidate.project_key);
   return {
     content: audit.reconciled_content,
     sources: JSON.stringify(audit.sources),
     validationTier: audit.validation_tier,
-    applicableTo: JSON.stringify(audit.applicable_to ?? {}),
+    applicableTo: JSON.stringify(merged),
     auditMetadata: {
       validation_tier: audit.validation_tier,
       audit_reasoning: audit.audit_reasoning,
       sources: audit.sources,
-      applicable_to: audit.applicable_to ?? {},
+      applicable_to: merged,
     },
   };
 }
@@ -123,11 +137,14 @@ export async function getInjectableSkills(ctx: InjectorContext): Promise<Injecta
            AND
            ($2::text IS NULL OR NOT (applicable_to ? 'platforms')
              OR applicable_to->'platforms' @> to_jsonb($2::text))
+           AND
+           ($3::text IS NULL OR NOT (applicable_to ? 'projects')
+             OR applicable_to->'projects' @> to_jsonb($3::text))
          )
        )
      ORDER BY use_count DESC, last_used_at DESC NULLS LAST, created_at DESC
-     LIMIT $3`,
-    [ctx.author_model ?? null, ctx.platform ?? null, limit]
+     LIMIT $4`,
+    [ctx.author_model ?? null, ctx.platform ?? null, ctx.project_key ?? null, limit]
   );
 
   return res.rows.map((row) => ({
@@ -172,12 +189,25 @@ export async function updateOrCreateSkill(
     await client.query('BEGIN');
 
     if (match && similarity >= ACCUMULATE_THRESHOLD) {
+      // Merge project_key into existing skill's applicable_to.projects.
+      // Rules (preserve scope semantics, don't narrow):
+      //   - $2 (new project_key) is NULL  → don't touch (ambiguous cluster)
+      //   - existing has no 'projects' key → don't narrow a match-all skill
+      //   - existing already includes $2  → no-op
+      //   - else                         → union: append $2 to projects array
       await client.query(
         `UPDATE skills
          SET use_count = use_count + 1,
-             last_used_at = NOW()
+             last_used_at = NOW(),
+             applicable_to = CASE
+               WHEN $2::text IS NULL THEN applicable_to
+               WHEN NOT (applicable_to ? 'projects') THEN applicable_to
+               WHEN applicable_to->'projects' @> to_jsonb($2::text) THEN applicable_to
+               ELSE jsonb_set(applicable_to, '{projects}',
+                              applicable_to->'projects' || to_jsonb($2::text))
+             END
          WHERE id = $1`,
-        [match.id]
+        [match.id, candidate.project_key ?? null]
       );
 
       await client.query(

@@ -34,6 +34,7 @@ export function registerTools(server: McpServer) {
         user_key: z.string().optional().default(process.env.MEMORY_DEFAULT_SUBJECT || "default_user").describe("User subject key."),
         author_model: z.string().optional().describe("Caller's author model (for skill filtering)."),
         platform: z.string().optional().describe("Caller's platform (for skill filtering)."),
+        project_key: z.string().optional().describe("Active project key. Skills scoped to specific projects only inject when this matches; unscoped skills (applicable_to.projects unset) inject regardless."),
       }
     },
     async (args) => {
@@ -140,6 +141,7 @@ export function registerTools(server: McpServer) {
         const skills = await getInjectableSkills({
           author_model: args.author_model,
           platform: args.platform,
+          project_key: args.project_key,
           limit: 5,
         });
         if (skills.length > 0) {
@@ -288,6 +290,7 @@ export function registerTools(server: McpServer) {
         source_memory_ids: z.array(z.number()).optional().describe("Memory IDs that produced this skill."),
         author_model: z.string().optional().describe("Model name or alias that authored the skill."),
         platform: z.string().optional().describe("Platform where the skill was authored."),
+        project_key: z.string().optional().describe("Project subject key. If set, skill is scoped to this project (only injects when memory_startup gets matching project_key). Omit for cross-project skills."),
         agent_key: z.string().optional().describe("Agent persona key. See memory_add for details."),
         audit: z.boolean().optional().default(true).describe("Run Skill Auditor before saving. Default: true."),
       }
@@ -299,6 +302,7 @@ export function registerTools(server: McpServer) {
         source_memory_ids: args.source_memory_ids,
         author_model: args.author_model,
         platform: args.platform,
+        project_key: args.project_key,
       };
       const agentKeyRaw = args.agent_key ?? process.env.AGENT_KEY ?? null;
       const agentCuratorId = agentKeyRaw
