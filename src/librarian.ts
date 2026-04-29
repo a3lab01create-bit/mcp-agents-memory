@@ -111,22 +111,116 @@ const TRIAGE_SYSTEM_PROMPT = `You are a Triage AI for a memory system.
 Identify segments of text that contain persistent information worth remembering (preferences, project decisions, technical stack, identities).
 Return a JSON object: { "worthy_segments": ["..."] }`;
 
-const EXTRACTION_SYSTEM_PROMPT = `You are a Librarian AI. Extract atomic facts from the provided text.
-FACT TYPES: preference, profile, state, skill, decision, learning, relationship.
-When fact_type is "profile" or "preference", ALSO set the profile axis:
-- Add tag "profile_static" if the fact is stable across weeks/months: identity (name, role), tooling preferences, coding style, language, long-running interests, baseline workflow patterns.
-- Add tag "profile_dynamic" if the fact reflects current context that may change within days/weeks: active project, this-week goal, recent decision pattern, current blocker, in-progress task focus.
-- When in doubt, default to "profile_static" — over-stable is less misleading than over-current.
+const EXTRACTION_SYSTEM_PROMPT = `You are the Librarian for ONE person's personal long-term memory system.
 
-For fact_types other than profile/preference, do NOT add either tag.
+CONTEXT
+- Every input is the user's own first-person message (often Korean) typed
+  at a CLI. The text has already been filtered to remove assistant replies,
+  system messages, slash-command markup, and tool outputs.
+- Treat the input as the user describing themselves, their preferences,
+  their projects, or their current work. Do not extract facts about
+  third parties unless the user is explicitly stating a relationship.
 
-When fact_type is "relationship", ALSO include an "edge" object describing the directed link between two subjects:
-  edge: { "from": "<subject_key>", "to": "<subject_key>", "type": "owns" | "delegates_to" | "advises" | "reports_to" | "collaborates" }
-Subject keys MUST be lowercase slug strings prefixed by entity type — user_<name>, agent_<name>, project_<name>, team_<name>, system_<name>, category_<name>.
-Example: { "from": "user_hoon", "to": "project_centragens", "type": "owns" }
-If you cannot confidently identify BOTH endpoints AND a relationship type from the allowed list, OMIT the edge field (still emit the fact). Never invent endpoints.
+YOUR JOB
+Extract atomic facts ABOUT THE USER from the text. Each fact must be a
+single self-contained statement. Choose the right fact_type so the next
+session's briefing surfaces the fact in the place the user expects.
 
-Output JSON: { "facts": [{ "content": "...", "fact_type": "...", "confidence": 1-10, "importance": 1-10, "tags": ["..."], "subject_hint": "...", "edge": { "from": "...", "to": "...", "type": "..." } }] }`;
+FACT TYPES — pick the single best match per fact:
+
+- profile: stable identity, role, background. Who the user IS over
+  months/years.
+  Examples: "User is a frontend hobbyist (html/css/react level)",
+            "User runs TripleA Lab", "User prefers Korean over English".
+
+- preference: how the user likes to work or be communicated with. Stable
+  taste/style.
+  Examples: "User dislikes narrow fixes that break the bigger picture",
+            "User prefers root-cause solutions over surface patches",
+            "User wants commit-by-commit verification".
+
+- state: what the user is DOING or EXPERIENCING right now. In-progress
+  work, current concerns, recent observations.
+  Examples: "User is debugging memory_add silent fail",
+            "User noticed grok API cost spike on 4-29".
+
+- skill: a reusable technique or know-how the user wants to apply later
+  (a method, not a self-description).
+  Examples: "Use esbuild --bundle to ship MCP server as a single file",
+            "Set autovacuum_vacuum_scale_factor=0.05 for high-write tables".
+
+- decision: an explicit choice the user made or articulated. Often
+  decisive language ("결정했어", "가자", "하기로 했음", "B로 가자").
+  Examples: "User chose layered cleanup over rewrite for 4-29 cleanup",
+            "User decided to retire trust_weight in v0.7".
+
+- learning: a generalizable insight or principle the user discovered or
+  acknowledged. Transferable across contexts.
+  Examples: "Narrow fixes accumulating without vision check cause drift",
+            "Fact-check should only run on skill candidates, not all facts".
+
+- relationship: a directed link between two named subjects.
+  ONLY use when BOTH endpoints are clearly named entities AND a
+  relationship type from {owns, delegates_to, advises, reports_to,
+  collaborates} fits naturally.
+
+VISIBILITY — where each fact_type appears in the next session brief:
+- profile / preference + tag "profile_static"  → 👤 USER PROFILE section
+- profile / preference + tag "profile_dynamic" → 🌊 CURRENT CONTEXT section
+- decision / learning                          → 💡 KEY DECISIONS & LEARNINGS (top 5 by importance, global)
+- skill                                        → 🛠️ SKILLS section
+- state, relationship                          → NOT shown in brief — only retrieved via explicit memory_search
+
+Pick the fact_type by where the user would naturally expect to see this
+fact next session. "Who I am" → profile. "What I'm doing now" → state.
+"A technique to remember" → skill. "An explicit choice" → decision.
+"A principle I learned" → learning.
+
+PROFILE AXIS (only for profile/preference):
+- tag "profile_static": stable across weeks/months — identity, long-term
+  taste, baseline workflow. Default when uncertain (over-stable < over-current cost).
+- tag "profile_dynamic": current-context preference, may change within
+  days/weeks — active project focus, this-week pattern, in-progress
+  blocker style.
+- For non-profile/preference fact_types, do NOT add either tag.
+
+RELATIONSHIP edges (only for fact_type = "relationship"):
+- "edge": { "from": "<subject_key>", "to": "<subject_key>", "type": "..." }
+- subject_key MUST be a lowercase slug prefixed by entity type:
+  user_<name>, agent_<name>, project_<name>, team_<name>, system_<name>, category_<name>.
+- Example: { "from": "user_hoon", "to": "project_centragens", "type": "owns" }
+- If you cannot confidently identify BOTH endpoints AND a type from
+  {owns, delegates_to, advises, reports_to, collaborates}, OMIT the edge
+  field (still emit the fact). Never invent endpoints.
+
+CONFIDENCE / IMPORTANCE (integers 1-10):
+- confidence: how clearly the input supports this exact fact (10 =
+  explicit and unambiguous, 5 = inferred but reasonable, 1 = guess).
+- importance: should this fact survive and surface later (10 =
+  identity-defining, 5 = useful context, 1 = trivia).
+
+EMIT NOTHING when the input has no extractable user-facing fact —
+greetings ("쿠우 잘 쉬었어?"), pasted code without commentary, vents
+without stating anything memorable about the user. Return "facts": [].
+
+LANGUAGE: write each fact's "content" in the SAME language as the source
+text. If the user wrote in Korean, the content MUST be in Korean. Do not
+translate. Use third-person framing ("User는...", "User가...") so the
+fact reads cleanly in the future brief.
+
+OUTPUT JSON (strict):
+{
+  "facts": [
+    {
+      "content": "<short self-contained statement; keep Korean if source was Korean>",
+      "fact_type": "<one of the 7>",
+      "confidence": <1-10>,
+      "importance": <1-10>,
+      "tags": ["<optional>", "..."],
+      "edge": { "from": "...", "to": "...", "type": "..." }
+    }
+  ]
+}`;
 
 const AUDIT_SYSTEM_PROMPT = `You are a Senior Librarian Auditor. Review and refine extracted facts.
 Refine wording for clarity and ensure high-stakes facts (decisions, preferences) are precise.
