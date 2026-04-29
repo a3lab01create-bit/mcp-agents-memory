@@ -5,15 +5,11 @@ import { db } from "./db.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { registerTools, getOrCreateSubject } from "./tools.js";
-import { maybeStartPromotionLoop, stopPromotionLoop } from "./promotion.js";
-import { maybeStartForgettingLoop, stopForgettingLoop } from "./forgetting.js";
-import { maybeStartTranscriptProcessor, stopTranscriptProcessor } from "./transcript_processor.js";
-import { captureSessionStart, captureSessionEnd, backfillExistingTranscripts } from "./transcript_capture.js";
+import { registerTools } from "./tools.js";
 import { PACKAGE_VERSION } from "./version.js";
 import fs from "fs";
 
-export let connectedClient: { name: string, version: string } | null = null;
+export let connectedClient: { name: string; version: string } | null = null;
 
 let isShuttingDown = false;
 async function shutdown(reason: string): Promise<void> {
@@ -21,20 +17,7 @@ async function shutdown(reason: string): Promise<void> {
   isShuttingDown = true;
   console.error(`🛑 Shutting down (${reason})...`);
 
-  try { stopPromotionLoop(); } catch {}
-  try { stopForgettingLoop(); } catch {}
-  try { stopTranscriptProcessor(); } catch {}
-
-  // Capture transcript before db.close — INSERT only, no LLM call.
-  // Bounded to 2s so it can't push us past the 3s db.close race.
-  try {
-    await Promise.race([
-      captureSessionEnd(),
-      new Promise<void>((resolve) => setTimeout(resolve, 2000)),
-    ]);
-  } catch (err) {
-    console.error("Transcript capture error (non-blocking):", err);
-  }
+  // Phase D will add: stopColdPathWorker() + stopLibrarianWorker() here.
 
   try {
     await Promise.race([
@@ -50,12 +33,11 @@ async function shutdown(reason: string): Promise<void> {
 
 function installShutdownHandlers(): void {
   process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
-  process.on("SIGINT", () => { void shutdown("SIGINT"); });
-  process.on("SIGHUP", () => { void shutdown("SIGHUP"); });
+  process.on("SIGINT",  () => { void shutdown("SIGINT");  });
+  process.on("SIGHUP",  () => { void shutdown("SIGHUP");  });
 
   // Parent closing stdin = parent process died (MCP stdio convention).
-  // Without this, an orphaned tunnel-ssh socket keeps the event loop alive forever.
-  process.stdin.on("end", () => { void shutdown("stdin-end"); });
+  process.stdin.on("end",   () => { void shutdown("stdin-end");   });
   process.stdin.on("close", () => { void shutdown("stdin-close"); });
 }
 
@@ -73,20 +55,26 @@ Configuration is loaded from (first hit wins):
 
 Required settings:
   DATABASE_URL=postgres://user:pass@host:5432/db?sslmode=require   (or DB_HOST + DB_USER + DB_PASS + DB_NAME)
-  OPENAI_API_KEY=sk-...                                            (semantic search + Librarian fact extraction)`);
+  OPENAI_API_KEY=sk-...                                            (embedding text-embedding-3-large)
+  GEMINI_API_KEY=...                                               (Cold Path tagger gemini-2.5-flash)`);
 }
 
 async function runMcpServer() {
-  const server = new McpServer({
-    name: "mcp-agents-memory",
-    version: PACKAGE_VERSION,
-  }, {
-    instructions: `This server provides long-term memory and autonomous context management.
-- ALWAYS call 'memory_startup' once at the beginning of a session to load user profile and recent state.
-- Use 'memory_search' before answering questions that might rely on past interactions or preferences.
-- Use 'memory_add' to store new atomic facts, decisions, or project updates discovered during the conversation.
-- If multiple conflicting facts are found (status: 'contested'), ask the user for clarification.`,
-  });
+  const server = new McpServer(
+    {
+      name: "mcp-agents-memory",
+      version: PACKAGE_VERSION,
+    },
+    {
+      instructions: `Long-term memory MCP server (RESPEC v1).
+
+Tools:
+  - search_memory     : 과거 기억 조회/검색 통합 (의미 + 키워드 fallback)
+  - manage_knowledge  : 명시 저장/수정/삭제 통합 (강제 기억은 is_pinned, archive 면제)
+
+Hot Path (자동 저장)는 caller가 raw 메시지 발생 시 직접 호출 — 사람의 기억처럼 시간 순서로 raw 보존, Cold Path가 백그라운드에서 태깅+임베딩.`,
+    }
+  );
 
   const originalConnect = server.connect.bind(server);
   server.connect = async (transport: any) => {
@@ -97,10 +85,6 @@ async function runMcpServer() {
   registerTools(server);
 
   installShutdownHandlers();
-
-  // Snapshot cwd at startup so captureSessionEnd can find the right
-  // ~/.claude/projects/<slug>/ directory at shutdown without re-deriving.
-  captureSessionStart(process.cwd());
 
   console.error("🚀 Starting Memory MCP Server...");
 
@@ -114,32 +98,23 @@ async function runMcpServer() {
   try {
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error(`🧠 Memory MCP Server (v${PACKAGE_VERSION}) running on stdio — Librarian Engine Active`);
+    console.error(`🧠 Memory MCP Server (v${PACKAGE_VERSION}) running on stdio — RESPEC v1 fresh impl`);
 
-    db.connect().then(() => {
-      console.error("✅ Database connected in background.");
-      if (process.env.AGENT_KEY) {
-        getOrCreateSubject(process.env.AGENT_KEY, "agent").then(() => {
-          console.error(`🤖 Agent registered: ${process.env.AGENT_KEY}`);
-        }).catch((err) => console.error("Failed to register agent:", err));
-      }
-      // Backfill all existing transcripts in the active project dir.
-      // UNIQUE constraint handles idempotency — re-runs are no-ops.
-      backfillExistingTranscripts().catch((err) =>
-        console.error("📝 [Backfill] fatal:", err)
-      );
-    }).catch((err) => {
-      console.error("❌ Background DB connection failed:", err);
-      console.error("   Run `mcp-agents-memory setup` if this is a fresh install.");
-    });
+    db.connect()
+      .then(() => {
+        console.error("✅ Database connected in background.");
+      })
+      .catch((err) => {
+        console.error("❌ Background DB connection failed:", err);
+        console.error("   Run `mcp-agents-memory setup` if this is a fresh install.");
+      });
   } catch (err) {
     console.error("❌ Fatal error during startup:", err);
     process.exit(1);
   }
 
-  maybeStartPromotionLoop();
-  maybeStartForgettingLoop();
-  maybeStartTranscriptProcessor();
+  // Phase D will start Cold Path worker here.
+  // Phase E will start Librarian (memory→user) worker here.
 }
 
 async function cli() {

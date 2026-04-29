@@ -1,22 +1,24 @@
 /**
- * Role-based Model Registry
- * 
- * Single source of truth for "which model handles which role"
- * and "which provider serves which model".
- * 
- * Goal: prevent Grok-endpoint-with-OpenAI-model class of bugs at boundary.
+ * Role-based Model Registry — RESPEC v1.
+ *
+ * Providers: openai + google only (RESPEC §결정 — gemini + gpt만 유지).
+ * Roles:
+ *   - tagger    (Cold Path: predefined p_tag + dynamic d_tag 추출)
+ *   - librarian (memory → user.core/sub_profile promote)
+ *
+ * Embedding은 role 아니라 별도 모듈 (src/embeddings.ts)에서 OpenAI
+ * embeddings API 직접 호출. 본 모듈의 EMBEDDING_MODEL 상수만 참조.
  */
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 
 // ─────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────
 
-export type Provider = 'openai' | 'anthropic' | 'google' | 'xai';
-export type Role = 'triage' | 'extract' | 'audit' | 'contradiction' | 'skill_curator' | 'skill_auditor' | 'memory_auditor';
+export type Provider = 'openai' | 'google';
+export type Role = 'tagger' | 'librarian';
 
 export interface ModelSpec {
   provider: Provider;
@@ -28,74 +30,29 @@ export interface CallOptions {
   user: string;
   responseFormat?: 'json' | 'text';
   maxTokens?: number;
-  /**
-   * When true on Anthropic calls, marks the system prompt with
-   * `cache_control: { type: 'ephemeral' }`. Subsequent calls with the SAME
-   * system prompt within the cache TTL (~5min) are billed at the cache-hit
-   * rate (~10× cheaper). The first call pays a ~25% write premium, so set
-   * this only on roles whose system prompt is stable AND likely to repeat
-   * within the session (e.g. memory_auditor / skill_auditor across a batch
-   * of facts). Anthropic only — ignored for other providers. Anthropic
-   * additionally requires the cached portion to exceed a minimum token
-   * count (~1024 for Sonnet), so very short prompts get no benefit.
-   */
-  cache?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────
-// Provider validation (the assertion layer)
+// Provider validation
 // ─────────────────────────────────────────────────────────────
 
 const KNOWN_PREFIXES: Record<Provider, string[]> = {
-  openai:    ['gpt-', 'o1-', 'o3-', 'text-embedding-'],
-  anthropic: ['claude-'],
-  google:    ['gemini-'],
-  xai:       ['grok-'],
+  openai: ['gpt-', 'o1-', 'o3-', 'text-embedding-'],
+  google: ['gemini-'],
 };
 
 export function assertModelProvider(spec: ModelSpec): void {
   const m = spec.model_name.toLowerCase();
   const valid = KNOWN_PREFIXES[spec.provider];
-  if (!valid.some(p => m.startsWith(p))) {
+  if (!valid.some((p) => m.startsWith(p))) {
     throw new Error(
       `[ModelRegistry] Provider mismatch: model "${spec.model_name}" ` +
-      `cannot be served by provider "${spec.provider}". ` +
-      `Expected prefix: ${valid.join(' | ')}`
+        `cannot be served by provider "${spec.provider}". ` +
+        `Expected prefix: ${valid.join(' | ')}`
     );
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// Role Registry — defaults + per-role env override
-//
-// Each role reads BOTH provider and model from env:
-//   <ROLE>_PROVIDER  — 'openai' | 'anthropic' | 'google' | 'xai'
-//   <ROLE>_MODEL     — exact model identifier passed to that provider
-//
-// Defaults below are tuned for cost/quality balance:
-//   - High-frequency roles (triage/extract/audit/contradiction) → cheap models
-//   - Opt-in grounding roles (skill/memory auditor) → quality models
-//
-// Users wanting "OpenAI only" or "Anthropic only" override via the wizard,
-// which sets all 7 <ROLE>_PROVIDER + <ROLE>_MODEL pairs at once.
-// ─────────────────────────────────────────────────────────────
-
-const DEFAULTS: Record<Role, ModelSpec> = {
-  triage:        { provider: 'google',    model_name: 'gemini-2.5-flash-lite' },
-  extract:       { provider: 'openai',    model_name: 'gpt-4o-mini' },
-  audit:         { provider: 'openai',    model_name: 'gpt-4o-mini' },
-  contradiction: { provider: 'openai',    model_name: 'gpt-4o-mini' },
-  skill_curator: { provider: 'openai',    model_name: 'gpt-4o-mini' },
-  skill_auditor: { provider: 'anthropic', model_name: 'claude-sonnet-4-6' },
-  memory_auditor: { provider: 'anthropic', model_name: 'claude-sonnet-4-6' },
-};
-
-/**
- * Infer provider from a model name's prefix. Used when a user sets
- * <ROLE>_MODEL without an accompanying <ROLE>_PROVIDER — common for
- * .env files migrated from the pre-PROVIDER schema. Also reused by
- * librarian's auto-registration of unknown author models.
- */
 export function inferProvider(modelName: string): Provider | null {
   const lower = modelName.toLowerCase();
   for (const [provider, prefixes] of Object.entries(KNOWN_PREFIXES) as [Provider, string[]][]) {
@@ -103,6 +60,15 @@ export function inferProvider(modelName: string): Provider | null {
   }
   return null;
 }
+
+// ─────────────────────────────────────────────────────────────
+// Role registry
+// ─────────────────────────────────────────────────────────────
+
+const DEFAULTS: Record<Role, ModelSpec> = {
+  tagger:    { provider: 'google', model_name: 'gemini-2.5-flash' },
+  librarian: { provider: 'google', model_name: 'gemini-2.5-flash' },
+};
 
 function envEnvelope(role: Role): ModelSpec {
   const upper = role.toUpperCase();
@@ -113,12 +79,11 @@ function envEnvelope(role: Role): ModelSpec {
     return { provider: explicitProvider, model_name: explicitModel };
   }
   if (explicitModel && !explicitProvider) {
-    // Migration friendliness: pre-existing .env files set MODEL only.
     const inferred = inferProvider(explicitModel);
     if (!inferred) {
       console.error(
         `⚠️  [ModelRegistry] ${upper}_MODEL=${explicitModel} but no ${upper}_PROVIDER set, ` +
-          `and the model prefix doesn't match any known provider. Falling back to default.`
+          `and the model prefix doesn't match openai/google. Falling back to default.`
       );
       return DEFAULTS[role];
     }
@@ -131,13 +96,8 @@ function envEnvelope(role: Role): ModelSpec {
 }
 
 export const ROLE_REGISTRY: Record<Role, ModelSpec> = {
-  triage:        envEnvelope('triage'),
-  extract:       envEnvelope('extract'),
-  audit:         envEnvelope('audit'),
-  contradiction: envEnvelope('contradiction'),
-  skill_curator: envEnvelope('skill_curator'),
-  skill_auditor: envEnvelope('skill_auditor'),
-  memory_auditor: envEnvelope('memory_auditor'),
+  tagger:    envEnvelope('tagger'),
+  librarian: envEnvelope('librarian'),
 };
 
 // Validate at module load — surfaces provider/model mismatch immediately.
@@ -150,16 +110,14 @@ for (const [role, spec] of Object.entries(ROLE_REGISTRY)) {
   }
 }
 
-/** Embedding model is not a "role" but follows the same env override pattern. */
-export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small';
+/** Embedding model — OpenAI text-embedding-3-large (3072 dim) per RESPEC §2.e. */
+export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL ?? 'text-embedding-3-large';
 
 // ─────────────────────────────────────────────────────────────
-// Client Factories (lazy)
+// Lazy clients
 // ─────────────────────────────────────────────────────────────
 
 let _openaiClient: OpenAI | null = null;
-let _anthropicClient: Anthropic | null = null;
-let _grokClient: OpenAI | null = null;
 let _googleClient: GoogleGenerativeAI | null = null;
 
 function getOpenAIClient(): OpenAI {
@@ -168,22 +126,6 @@ function getOpenAIClient(): OpenAI {
     _openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   }
   return _openaiClient;
-}
-
-function getAnthropicClient(): Anthropic {
-  if (!_anthropicClient) {
-    if (!process.env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY missing");
-    _anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  }
-  return _anthropicClient;
-}
-
-function getGrokClient(): OpenAI {
-  if (!_grokClient) {
-    if (!process.env.GROK_API_KEY) throw new Error("GROK_API_KEY missing");
-    _grokClient = new OpenAI({ apiKey: process.env.GROK_API_KEY, baseURL: "https://api.x.ai/v1" });
-  }
-  return _grokClient;
 }
 
 function getGoogleClient(): GoogleGenerativeAI {
@@ -195,7 +137,7 @@ function getGoogleClient(): GoogleGenerativeAI {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Unified Dispatcher
+// Unified dispatcher
 // ─────────────────────────────────────────────────────────────
 
 /**
@@ -204,15 +146,14 @@ function getGoogleClient(): GoogleGenerativeAI {
  */
 export async function callRole(role: Role, opts: CallOptions): Promise<string> {
   const spec = ROLE_REGISTRY[role];
-  assertModelProvider(spec); // belt-and-suspenders: also enforced at call time
+  assertModelProvider(spec);
 
   const maxTokens = opts.maxTokens ?? 4096;
   const useJson = opts.responseFormat === 'json';
 
   switch (spec.provider) {
-    case 'openai':
-    case 'xai': {
-      const client = spec.provider === 'openai' ? getOpenAIClient() : getGrokClient();
+    case 'openai': {
+      const client = getOpenAIClient();
       const res = await client.chat.completions.create({
         model: spec.model_name,
         messages: [
@@ -224,19 +165,6 @@ export async function callRole(role: Role, opts: CallOptions): Promise<string> {
         max_tokens: maxTokens,
       });
       return res.choices[0]?.message?.content || "";
-    }
-    case 'anthropic': {
-      const client = getAnthropicClient();
-      const systemBlock = opts.cache
-        ? [{ type: "text" as const, text: opts.system, cache_control: { type: "ephemeral" as const } }]
-        : opts.system;
-      const res = await client.messages.create({
-        model: spec.model_name,
-        max_tokens: maxTokens,
-        system: systemBlock as any,
-        messages: [{ role: "user", content: opts.user }],
-      });
-      return (res.content[0] as any).text || "";
     }
     case 'google': {
       const client = getGoogleClient();
