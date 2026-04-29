@@ -13,9 +13,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerManageKnowledge } from "./tools/manage_knowledge.js";
 import { registerSearchMemory } from "./tools/search_memory.js";
 import { registerMemoryStartup } from "./tools/memory_startup.js";
+import { registerSaveMessage } from "./auto_save/save_message_tool.js";
 
 export function registerTools(server: McpServer): void {
   registerManageKnowledge(server);
   registerSearchMemory(server);
   registerMemoryStartup(server);
+  registerSaveMessage(server);
 }

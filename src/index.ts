@@ -8,6 +8,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { registerTools } from "./tools.js";
 import { startColdPathWorker, stopColdPathWorker } from "./cold_path/worker.js";
 import { collectBrief, formatBriefMarkdown } from "./briefing.js";
+import { captureSessionStart, captureSessionEnd } from "./auto_save/jsonl_capture.js";
 import { PACKAGE_VERSION } from "./version.js";
 import fs from "fs";
 
@@ -61,6 +62,16 @@ async function shutdown(reason: string): Promise<void> {
   console.error(`🛑 Shutting down (${reason})...`);
 
   try { stopColdPathWorker(); } catch {}
+
+  // §4 fix: SessionEnd 시 Claude Code JSONL 자동 캡처. 2초 timeout (shutdown 막지 않게).
+  try {
+    await Promise.race([
+      captureSessionEnd(),
+      new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+    ]);
+  } catch (err) {
+    console.error("📝 [JSONL] capture error (non-blocking):", err);
+  }
   // Phase E will add: stopLibrarianWorker() here.
 
   try {
@@ -124,6 +135,10 @@ async function runMcpServer() {
   registerTools(server);
 
   installShutdownHandlers();
+
+  // §4 fix: Claude Code JSONL 캡처 cursor 기록. SessionEnd 시 그 이후만 INSERT.
+  // 비-Claude Code (Gemini CLI / Codex 등)는 jsonlPath 없으므로 no-op.
+  captureSessionStart(process.cwd());
 
   console.error("🚀 Starting Memory MCP Server...");
 
