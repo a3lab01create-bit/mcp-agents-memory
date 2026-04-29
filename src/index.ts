@@ -7,8 +7,50 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerTools } from "./tools.js";
 import { startColdPathWorker, stopColdPathWorker } from "./cold_path/worker.js";
+import { collectBrief, formatBriefMarkdown } from "./briefing.js";
 import { PACKAGE_VERSION } from "./version.js";
 import fs from "fs";
+
+const BRIEF_DB_TIMEOUT_MS = 5000;
+
+const STATIC_INSTRUCTIONS = `Long-term memory MCP server (RESPEC v1).
+
+Tools:
+  - memory_startup    : 시작 brief (user profile + 최근 활성 프로젝트 + 최근 메모리). 세션 시작 시 첫 호출 권장.
+  - search_memory     : 과거 기억 조회/검색 통합 (의미 + 키워드 fallback)
+  - manage_knowledge  : 명시 저장/수정/삭제 통합 (강제 기억은 is_pinned, archive 면제)
+
+Hot Path (자동 저장)는 caller가 raw 메시지 발생 시 직접 호출 — 사람의 기억처럼 시간 순서로 raw 보존, Cold Path가 백그라운드에서 태깅+임베딩.
+
+manage_knowledge 호출 시 caller convention:
+  - agent_model: 명시 권장 (생략 시 'unknown' 저장)
+  - subagent (optional): true면 subagent_model + subagent_role 함께 명시`;
+
+/**
+ * DB 5초 타임아웃 시도 → 성공 시 brief 포함 instructions, 실패 시 static.
+ * MCP server는 instructions가 construct 시점 고정이라 DB pre-connect 필요.
+ */
+async function buildInstructions(): Promise<string> {
+  try {
+    const dbReady = Promise.race([
+      (async () => {
+        const { db } = await import("./db.js");
+        await db.connect();
+        return true;
+      })(),
+      new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error("DB connect timeout")), BRIEF_DB_TIMEOUT_MS)),
+    ]);
+    await dbReady;
+
+    const brief = await collectBrief();
+    const briefMd = formatBriefMarkdown(brief);
+    return `${STATIC_INSTRUCTIONS}\n\n---\n\n${briefMd}`;
+  } catch (err) {
+    console.error("⚠️ Brief 동적 주입 실패 (DB 연결 timeout 또는 collect 오류):", err instanceof Error ? err.message : err);
+    console.error("   instructions에 brief 없이 정적 안내만 포함. 세션 시작 시 memory_startup 호출 권장.");
+    return STATIC_INSTRUCTIONS;
+  }
+}
 
 export let connectedClient: { name: string; version: string } | null = null;
 
@@ -62,20 +104,15 @@ Required settings:
 }
 
 async function runMcpServer() {
+  // §1 fix: brief 동적 주입을 위해 DB 먼저 연결 (5s timeout). 실패 시 static 폴백.
+  const instructions = await buildInstructions();
+
   const server = new McpServer(
     {
       name: "mcp-agents-memory",
       version: PACKAGE_VERSION,
     },
-    {
-      instructions: `Long-term memory MCP server (RESPEC v1).
-
-Tools:
-  - search_memory     : 과거 기억 조회/검색 통합 (의미 + 키워드 fallback)
-  - manage_knowledge  : 명시 저장/수정/삭제 통합 (강제 기억은 is_pinned, archive 면제)
-
-Hot Path (자동 저장)는 caller가 raw 메시지 발생 시 직접 호출 — 사람의 기억처럼 시간 순서로 raw 보존, Cold Path가 백그라운드에서 태깅+임베딩.`,
-    }
+    { instructions }
   );
 
   const originalConnect = server.connect.bind(server);
@@ -101,15 +138,8 @@ Hot Path (자동 저장)는 caller가 raw 메시지 발생 시 직접 호출 —
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error(`🧠 Memory MCP Server (v${PACKAGE_VERSION}) running on stdio — RESPEC v1 fresh impl`);
-
-    db.connect()
-      .then(() => {
-        console.error("✅ Database connected in background.");
-      })
-      .catch((err) => {
-        console.error("❌ Background DB connection failed:", err);
-        console.error("   Run `mcp-agents-memory setup` if this is a fresh install.");
-      });
+    // DB는 buildInstructions()에서 이미 connect 시도. 실패해도 server는 떴음.
+    // Hot Path / Cold Path / tools는 DB 필요할 때 db.connect() 자동 호출 (idempotent).
   } catch (err) {
     console.error("❌ Fatal error during startup:", err);
     process.exit(1);
