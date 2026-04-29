@@ -49,6 +49,16 @@ interface ColdRow {
  * Lock + claim a batch of rows needing tag or embed. SKIP LOCKED prevents
  * multi-worker contention. Returns the claimed rows; the lock is held until
  * the surrounding transaction COMMIT/ROLLBACK.
+ *
+ * Priority order (RESPEC PROBLEMS.md §4 fix — 4-30 큐 head 정합):
+ *   1. is_active=TRUE row 우선 (사용자 현재 작업 중 메시지 즉시 처리)
+ *   2. archived row는 cold_error 1시간 cooldown 적용 (Phase F drain quota
+ *      초과 같은 사고 시 무한 retry 방지)
+ *   3. 그 외엔 created_at ASC
+ *
+ * 효과: archived legacy + errored row가 큐 head를 막아서 새 active row가
+ * 처리 안 되던 사고 (Phase F drain quota 초과 + 큐 정체) 방지. Active는
+ * cooldown 무시 — 사용자 현재 작업 즉시 retry.
  */
 async function claimBatch(client: any, batch: number): Promise<ColdRow[]> {
   const r = await client.query(
@@ -57,7 +67,12 @@ async function claimBatch(client: any, batch: number): Promise<ColdRow[]> {
             (embedding IS NULL) AS needs_embed
        FROM memory
       WHERE (embedding IS NULL OR p_tag_id IS NULL)
-      ORDER BY created_at ASC
+        AND (
+          is_active = TRUE
+          OR cold_error IS NULL
+          OR updated_at < NOW() - INTERVAL '1 hour'
+        )
+      ORDER BY is_active DESC, created_at ASC
       LIMIT $1
         FOR UPDATE SKIP LOCKED`,
     [batch]
@@ -73,44 +88,92 @@ async function claimBatch(client: any, batch: number): Promise<ColdRow[]> {
   }));
 }
 
+/**
+ * Tag와 Embed를 독립 처리. 한 쪽 실패해도 다른 쪽은 시도/저장.
+ * Tagger fail (Gemini quota) → embedding은 정상 채움. 다음 cycle에 tagger만 재시도.
+ *
+ * Returns void on success. Throws if both tag AND embed failed (tick의
+ * recordError가 cold_error 박음). 한 쪽만 실패면 throw 안 하고, error를
+ * cold_error 컬럼에 부분 기록 (caller가 다음 cycle에 미완성 부분 재시도).
+ */
 async function processOne(client: any, row: ColdRow): Promise<void> {
-  let p_tag_id: number | null | undefined;
-  let d_tag: string[] | undefined;
-  let embedding: number[] | undefined;
+  type TagResult = { p_tag_id: number | null; d_tag: string[] };
+  let tagResult: TagResult | null = null;
+  let tagError: any = null;
+  let embedding: number[] | null = null;
+  let embedError: any = null;
 
+  // Tag와 Embed를 병렬 시도 — 둘 다 LLM/API 호출이라 sequential 이점 없음
+  const promises: Promise<void>[] = [];
   if (row.needs_tag) {
-    const tag = await tagMessage({
-      message: row.message,
-      role: row.role,
-      agent_platform: row.agent_platform,
-      agent_model: row.agent_model,
-    });
-    p_tag_id = tag.p_tag_id;
-    d_tag = tag.d_tag;
+    promises.push(
+      (async () => {
+        try {
+          tagResult = await tagMessage({
+            message: row.message,
+            role: row.role,
+            agent_platform: row.agent_platform,
+            agent_model: row.agent_model,
+          });
+        } catch (err) {
+          tagError = err;
+        }
+      })()
+    );
   }
-
   if (row.needs_embed) {
-    embedding = await embedMessage(row.message);
+    promises.push(
+      (async () => {
+        try {
+          embedding = await embedMessage(row.message);
+        } catch (err) {
+          embedError = err;
+        }
+      })()
+    );
+  }
+  await Promise.all(promises);
+
+  // 둘 다 실패면 row 처리 실패로 간주 (caller가 cold_error 박음)
+  const tagFailed = row.needs_tag && tagError;
+  const embedFailed = row.needs_embed && embedError;
+  if (tagFailed && embedFailed) {
+    throw new Error(`tag+embed both failed: tag=${tagError?.message?.slice(0,80)} embed=${embedError?.message?.slice(0,80)}`);
   }
 
-  // SET 절 동적 구성 (필요한 컬럼만)
+  // 부분 성공/실패 → 채워진 부분만 UPDATE
   const sets: string[] = [];
   const params: any[] = [];
   let i = 1;
-  if (row.needs_tag) {
+  if (row.needs_tag && tagResult !== null) {
+    const tag: TagResult = tagResult;
     sets.push(`p_tag_id = $${i++}`);
-    params.push(p_tag_id ?? null);
+    params.push(tag.p_tag_id);
     sets.push(`d_tag = $${i++}::text[]`);
-    params.push(d_tag ?? []);
+    params.push(tag.d_tag);
   }
-  if (row.needs_embed) {
+  if (row.needs_embed && embedding) {
     sets.push(`embedding = $${i++}::halfvec`);
-    params.push(embedding ? vectorToHalfvecSql(embedding) : null);
+    params.push(vectorToHalfvecSql(embedding));
   }
-  sets.push(`cold_error = NULL`);
+  // cold_error 갱신: 일부 실패면 이유 기록, 다 성공이면 NULL
+  if (tagError || embedError) {
+    const parts: string[] = [];
+    if (tagError) parts.push(`tag: ${String(tagError?.message ?? tagError).slice(0, 200)}`);
+    if (embedError) parts.push(`embed: ${String(embedError?.message ?? embedError).slice(0, 200)}`);
+    sets.push(`cold_error = $${i++}`);
+    params.push(parts.join(' | '));
+  } else {
+    sets.push(`cold_error = NULL`);
+  }
   sets.push(`updated_at = NOW()`);
-  params.push(row.id);
 
+  if (sets.length === 1) {
+    // updated_at만 set 할 게 아무것도 없는 경우 (이미 done이었음). skip.
+    return;
+  }
+
+  params.push(row.id);
   await client.query(
     `UPDATE memory SET ${sets.join(', ')} WHERE id = $${i}`,
     params
