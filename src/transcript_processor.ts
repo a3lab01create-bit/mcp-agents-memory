@@ -51,10 +51,67 @@ function parseSeconds(raw: string | undefined, fallback: number, label: string):
   return parsed;
 }
 
+// XML-ish wrapper blocks injected by Claude Code into user-type entries that
+// are NOT form's authoring (slash command bookkeeping, system reminders, task
+// notifications, local command outputs). Stripped before fact extraction so
+// the librarian only sees form's natural-language input.
+const NOISE_BLOCK_TAGS = [
+  "system-reminder",
+  "command-name",
+  "command-message",
+  "command-args",
+  "local-command-stdout",
+  "local-command-stderr",
+  "task-notification",
+  "user-prompt-submit-hook",
+  "session-start-hook",
+  "session-end-hook",
+];
+
+const NOISE_BLOCK_REGEX = new RegExp(
+  `<(${NOISE_BLOCK_TAGS.join("|")})>[\\s\\S]*?</\\1>`,
+  "g"
+);
+
+// Standalone Claude Code internal markers that show up as plain text inside
+// user entries — drop them entirely.
+const INTERNAL_MARKERS = new Set([
+  "[Request interrupted by user for tool use]",
+  "[Request interrupted by user]",
+]);
+
 /**
- * Read a byte range from a jsonl file and pull out user/assistant text.
- * Skips permission-mode / snapshot lines and partial trailing lines (these
- * happen when shutdown captures size mid-write).
+ * Strip non-authoring markup from a user-entry text block. Keeps form's
+ * natural-language remainder.
+ */
+function stripNoise(text: string): string {
+  let cleaned = text.replace(NOISE_BLOCK_REGEX, "");
+  cleaned = cleaned
+    .split("\n")
+    .filter((line) => !INTERNAL_MARKERS.has(line.trim()))
+    .join("\n");
+  return cleaned.trim();
+}
+
+/**
+ * Read a byte range from a jsonl file and pull out FORM-AUTHORED text only.
+ *
+ * Form vision (spec.md §11): transcript drain should feed the librarian only
+ * form's actual natural-language input — assistant replies, tool results,
+ * system reminders, slash command bookkeeping, and task notifications must
+ * not become memory facts (this was the root of "User is a Staff Engineer"
+ * style hallucinations being saved as form profile).
+ *
+ * Filters applied:
+ *   - type !== "user"            → drop (assistant entries excluded entirely)
+ *   - entry.isMeta === true       → drop
+ *   - tool_result content blocks  → drop (already filtered by stringifyMessageContent)
+ *   - <system-reminder>, <command-*>, <local-command-stdout>,
+ *     <task-notification> wrappers → stripped from text
+ *   - "[Request interrupted ...]" markers → dropped
+ *   - empty after stripping       → drop
+ *
+ * Partial trailing lines (mid-write at shutdown) are silently skipped.
  */
 function extractTextFromJsonl(filePath: string, startByte: number, endByte: number): string {
   // pg returns BIGINT columns as strings; coerce so fs.readSync's `position`
@@ -81,12 +138,13 @@ function extractTextFromJsonl(filePath: string, startByte: number, endByte: numb
         // Partial line (last one truncated mid-write) — skip silently.
         continue;
       }
-      if (entry.type !== "user" && entry.type !== "assistant") continue;
-      const text = stringifyMessageContent(entry.message?.content);
-      if (text) {
-        const role = entry.type === "user" ? "User" : "Assistant";
-        parts.push(`${role}: ${text}`);
-      }
+      if (entry.type !== "user") continue;
+      if (entry.isMeta === true) continue;
+      const rawText = stringifyMessageContent(entry.message?.content);
+      if (!rawText) continue;
+      const cleaned = stripNoise(rawText);
+      if (!cleaned) continue;
+      parts.push(cleaned);
     }
     return parts.join("\n\n");
   } finally {
