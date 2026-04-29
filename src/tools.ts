@@ -139,13 +139,19 @@ export function registerTools(server: McpServer) {
       } catch (e) { /* silent fallback */ }
 
       // 3. Key Decisions & Learnings
+      // Scoped to the current user_key (default_user) — global query previously
+      // mixed in facts about other subjects. spec.md §11 cleanup.
       try {
+        const userId = await getOrCreateSubject(args.user_key, 'person');
         const decisionRes = await db.query(
           `SELECT content, fact_type, tags, created_at
            FROM memories
-           WHERE fact_type IN ('decision', 'learning') AND is_active = TRUE
+           WHERE fact_type IN ('decision', 'learning')
+             AND is_active = TRUE
+             AND subject_id = $1
            ORDER BY importance DESC, created_at DESC
-           LIMIT 5`
+           LIMIT 5`,
+          [userId]
         );
         if (decisionRes.rows.length > 0) {
           sections.push("💡 KEY DECISIONS & LEARNINGS");
@@ -187,14 +193,21 @@ export function registerTools(server: McpServer) {
         }
       } catch (e) { /* silent fallback — skills table may not exist yet */ }
 
-      // 4. Skills
+      // 4. Skills (legacy — fact_type='skill' rows in memories table; the new
+      // skills system uses the dedicated skills table shown in section 4.5).
+      // Scoped to user_key — global query previously mixed in third-party
+      // skill descriptions ingested from transcripts. spec.md §11 cleanup.
       try {
+        const userId = await getOrCreateSubject(args.user_key, 'person');
         const skillRes = await db.query(
           `SELECT content, tags
            FROM memories
-           WHERE fact_type = 'skill' AND is_active = TRUE
+           WHERE fact_type = 'skill'
+             AND is_active = TRUE
+             AND subject_id = $1
            ORDER BY importance DESC
-           LIMIT 6`
+           LIMIT 6`,
+          [userId]
         );
         if (skillRes.rows.length > 0) {
           sections.push("🛠️ SKILLS & TECH STACK");
