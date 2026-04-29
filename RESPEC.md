@@ -115,7 +115,16 @@ TAG
 
 *predefined 의 경우는 대화시 진행하는 프로젝트 기준으로 등록 predefined tag 도 모델이 생성
 
+old_error 메세지 d_tag 관련
 
+tag: [GoogleGenerativeAI Error]: Error fetching from https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent: [429 Too Many Requests] You exceeded your current quota, pleas...
+
+
+### grok-4-1-fast-reasoning / grok-4-1-fast-non-reasoning
+#### Input
+Tokens $0.20/ 1M tokens Cached tokens $0.05/ 1M tokens
+#### Output
+Tokens $0.50/ 1M tokens
 
 
 

@@ -109,10 +109,13 @@ function printHelp() {
   console.log(`mcp-agents-memory v${PACKAGE_VERSION}
 
 Usage:
-  mcp-agents-memory             Run the MCP server (stdio).
-  mcp-agents-memory setup       Interactive setup — write config to ~/.config/mcp-agents-memory/.env and run migrations.
-  mcp-agents-memory migrate     Apply any pending DB migrations against the configured database.
-  mcp-agents-memory help        Show this message.
+  mcp-agents-memory                 Run the MCP server (stdio).
+  mcp-agents-memory setup           Interactive setup — write config to ~/.config/mcp-agents-memory/.env and run migrations.
+  mcp-agents-memory migrate         Apply any pending DB migrations against the configured database.
+  mcp-agents-memory install-hooks   Register Claude Code Stop hook (~/.claude/settings.json) for real-time auto-save.
+  mcp-agents-memory uninstall-hooks Remove the Stop hook entry from ~/.claude/settings.json.
+  mcp-agents-memory capture-session Stop hook entry point (stdin: hook payload). Not for manual use.
+  mcp-agents-memory help            Show this message.
 
 Configuration is loaded from (first hit wins):
   $MEMORY_CONFIG_PATH > ./.env > ~/.config/mcp-agents-memory/.env > <package>/../.env
@@ -200,6 +203,30 @@ async function cli() {
     const { runAllMigrations } = await import("./migrations/runner.js");
     await runAllMigrations();
     process.exit(0);
+  }
+
+  if (cmd === "install-hooks") {
+    const { installHooks } = await import("./auto_save/install_hooks.js");
+    installHooks();
+    process.exit(0);
+  }
+
+  if (cmd === "uninstall-hooks") {
+    const { uninstallHooks } = await import("./auto_save/install_hooks.js");
+    uninstallHooks();
+    process.exit(0);
+  }
+
+  if (cmd === "capture-session") {
+    const { runCaptureSession } = await import("./auto_save/capture_session.js");
+    try {
+      await runCaptureSession();
+    } catch (err) {
+      console.error("📝 [capture-session] unexpected error:", err);
+    } finally {
+      // hook latency 안 늘게 강제 종료 (DB pool drain 안 기다림)
+      process.exit(0);
+    }
   }
 
   console.error(`❌ Unknown command: ${cmd}`);

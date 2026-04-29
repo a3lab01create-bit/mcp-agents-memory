@@ -79,7 +79,7 @@ export function captureSessionStart(cwd: string): void {
   console.error(`📝 [JSONL] capture armed: session=${sessionId} from byte=${stat.size}`);
 }
 
-interface ParsedEntry {
+export interface ParsedEntry {
   uuid: string;
   role: 'user' | 'assistant';
   message: string;
@@ -90,7 +90,7 @@ interface ParsedEntry {
 }
 
 /** Claude Code JSONL entry → ParsedEntry. parse 실패 / type 무효 시 null. */
-function parseEntry(line: string): ParsedEntry | null {
+export function parseEntry(line: string): ParsedEntry | null {
   let entry: any;
   try {
     entry = JSON.parse(line);
