@@ -17,7 +17,7 @@ import OpenAI from "openai";
 // Types
 // ─────────────────────────────────────────────────────────────
 
-export type Provider = 'openai' | 'google';
+export type Provider = 'openai' | 'google' | 'xai';
 export type Role = 'tagger' | 'librarian';
 
 export interface ModelSpec {
@@ -39,6 +39,7 @@ export interface CallOptions {
 const KNOWN_PREFIXES: Record<Provider, string[]> = {
   openai: ['gpt-', 'o1-', 'o3-', 'text-embedding-'],
   google: ['gemini-'],
+  xai:    ['grok-'],
 };
 
 export function assertModelProvider(spec: ModelSpec): void {
@@ -119,6 +120,7 @@ export const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL ?? 'text-embedding-3-
 
 let _openaiClient: OpenAI | null = null;
 let _googleClient: GoogleGenerativeAI | null = null;
+let _xaiClient: OpenAI | null = null;
 
 function getOpenAIClient(): OpenAI {
   if (!_openaiClient) {
@@ -126,6 +128,15 @@ function getOpenAIClient(): OpenAI {
     _openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   }
   return _openaiClient;
+}
+
+function getXaiClient(): OpenAI {
+  if (!_xaiClient) {
+    if (!process.env.XAI_API_KEY) throw new Error("XAI_API_KEY missing");
+    // xAI는 OpenAI-compat API (baseURL만 다름)
+    _xaiClient = new OpenAI({ apiKey: process.env.XAI_API_KEY, baseURL: 'https://api.x.ai/v1' });
+  }
+  return _xaiClient;
 }
 
 function getGoogleClient(): GoogleGenerativeAI {
@@ -175,6 +186,21 @@ export async function callRole(role: Role, opts: CallOptions): Promise<string> {
       ]);
       const raw = (await res.response).text();
       return raw.replace(/```json|```/g, "").trim();
+    }
+    case 'xai': {
+      // xAI는 OpenAI-compat API. Grok-reasoning 모델은 reasoning_tokens 별도 청구.
+      const client = getXaiClient();
+      const res = await client.chat.completions.create({
+        model: spec.model_name,
+        messages: [
+          { role: "system", content: opts.system },
+          { role: "user", content: opts.user },
+        ],
+        ...(useJson ? { response_format: { type: "json_object" as const } } : {}),
+        temperature: 0.1,
+        max_tokens: maxTokens,
+      });
+      return (res.choices[0]?.message?.content || "").replace(/```json|```/g, "").trim();
     }
   }
 }
