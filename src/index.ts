@@ -6,7 +6,7 @@ import { db } from "./db.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerTools } from "./tools.js";
-import { startColdPathWorker, stopColdPathWorker } from "./cold_path/worker.js";
+import { startColdPathWorker, stopColdPathWorker, drainColdPath } from "./cold_path/worker.js";
 import { collectBrief, formatBriefMarkdown } from "./briefing.js";
 import { captureSessionStart, captureSessionEnd } from "./auto_save/jsonl_capture.js";
 import { PACKAGE_VERSION } from "./version.js";
@@ -70,17 +70,33 @@ async function shutdown(reason: string): Promise<void> {
   isShuttingDown = true;
   console.error(`🛑 Shutting down (${reason})...`);
 
-  try { stopColdPathWorker(); } catch {}
+  // 부모 죽은 게 의심되는 종료라도 watchdog 다시 trigger 안 되게 즉시 정지
+  stopParentWatchdog();
 
-  // §4 fix: SessionEnd 시 Claude Code JSONL 자동 캡처. 2초 timeout (shutdown 막지 않게).
+  // 1. Final JSONL flush — INSERT raw rows. fs.watch 살아있는 동안 대부분
+  //    이미 들어왔지만 마지막 1-2건 잡힘.
   try {
     await Promise.race([
       captureSessionEnd(),
-      new Promise<void>((resolve) => setTimeout(resolve, 2000)),
+      new Promise<void>((resolve) => setTimeout(resolve, 3000)),
     ]);
   } catch (err) {
     console.error("📝 [JSONL] capture error (non-blocking):", err);
   }
+
+  // 2. Drain ColdPath — 방금 INSERT된 row + 기존 pending 모두 tag+embed.
+  //    8s hard cap (대부분 0~3 batch면 끝, batch=5 × ~1.5s).
+  try {
+    await Promise.race([
+      drainColdPath(),
+      new Promise<void>((resolve) => setTimeout(resolve, 8000)),
+    ]);
+  } catch (err) {
+    console.error("🔵 [ColdPath] drain error (non-blocking):", err);
+  }
+
+  // 3. Worker timer 정지 (drain 후라 race 없음)
+  try { stopColdPathWorker(); } catch {}
   // Phase E will add: stopLibrarianWorker() here.
 
   try {
@@ -93,6 +109,41 @@ async function shutdown(reason: string): Promise<void> {
   }
 
   process.exit(0);
+}
+
+// --- Parent watchdog ---
+// Claude Code parent가 SIGKILL 등 비정상 종료되면 stdin close 이벤트가 fire
+// 안 될 수 있음. ppid 변화로 부모 사망 감지 → 자동 shutdown. 이거 없으면
+// 우리가 어젯밤 본 7시간 idle MCP 고아 프로세스 재발.
+let _initialPpid: number | null = null;
+let _parentWatchdog: NodeJS.Timeout | null = null;
+const PARENT_CHECK_INTERVAL_MS = 30_000;
+
+function startParentWatchdog(): void {
+  _initialPpid = process.ppid;
+  // ppid가 1 (init/launchd)이면 처음부터 부모 없음 — watchdog 무의미
+  if (!_initialPpid || _initialPpid === 1) {
+    console.error(`👻 [Watchdog] no parent to watch (ppid=${_initialPpid}) — skip`);
+    return;
+  }
+  console.error(`👻 [Watchdog] parent ppid=${_initialPpid}, check every ${PARENT_CHECK_INTERVAL_MS / 1000}s`);
+  _parentWatchdog = setInterval(() => {
+    const current = process.ppid;
+    if (current !== _initialPpid) {
+      console.error(`👻 [Watchdog] parent died (ppid ${_initialPpid} → ${current}) — auto shutdown`);
+      stopParentWatchdog();
+      void shutdown("parent-died");
+    }
+  }, PARENT_CHECK_INTERVAL_MS);
+  // setInterval만으로 process alive 유지 안 되도록 unref (event loop 마지막 작업이면 자연 exit)
+  _parentWatchdog.unref();
+}
+
+function stopParentWatchdog(): void {
+  if (_parentWatchdog) {
+    clearInterval(_parentWatchdog);
+    _parentWatchdog = null;
+  }
 }
 
 function installShutdownHandlers(): void {
@@ -144,8 +195,9 @@ async function runMcpServer() {
   registerTools(server);
 
   installShutdownHandlers();
+  startParentWatchdog();
 
-  // §4 fix: Claude Code JSONL 캡처 cursor 기록. SessionEnd 시 그 이후만 INSERT.
+  // §4 fix: Claude Code JSONL 캡처 cursor 기록 + fs.watch arm (real-time).
   // 비-Claude Code (Gemini CLI / Codex 등)는 jsonlPath 없으므로 no-op.
   captureSessionStart(process.cwd());
 

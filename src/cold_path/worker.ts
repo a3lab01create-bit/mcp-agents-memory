@@ -195,8 +195,9 @@ async function recordError(client: any, rowId: number, err: any): Promise<void> 
   );
 }
 
-async function tick(): Promise<void> {
-  if (running) return; // re-entry guard (이전 tick이 아직 진행 중)
+/** @returns 이번 tick에 처리한 row 수 (drain loop용 stop signal). */
+async function tick(): Promise<number> {
+  if (running) return 0; // re-entry guard (이전 tick이 아직 진행 중)
   running = true;
 
   const batchSize = envInt('COLD_PATH_BATCH_SIZE', DEFAULT_BATCH);
@@ -207,7 +208,7 @@ async function tick(): Promise<void> {
     const rows = await claimBatch(client, batchSize);
     if (rows.length === 0) {
       await client.query('COMMIT');
-      return;
+      return 0;
     }
     for (const row of rows) {
       try {
@@ -222,9 +223,11 @@ async function tick(): Promise<void> {
     if (rows.length > 0) {
       console.error(`🔵 [ColdPath] processed ${rows.length} row(s)`);
     }
+    return rows.length;
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch {}
     console.error("❌ [ColdPath] tick failed:", err);
+    return 0;
   } finally {
     client.release();
     running = false;
@@ -261,8 +264,23 @@ export function stopColdPathWorker(): void {
 
 /**
  * 직접 호출용 — worker 활성 상태와 무관하게 1회 batch 처리.
- * 테스트/스크립트 용.
+ * @returns 처리한 row 수. drain loop는 0 반환 시 stop.
  */
-export async function runColdPathOnce(): Promise<void> {
-  await tick();
+export async function runColdPathOnce(): Promise<number> {
+  return await tick();
+}
+
+/**
+ * shutdown drain — pending row 모두 처리 시도. batch 단위 반복.
+ * 안전 cap (MAX_TICKS) + caller 측 timeout race로 무한루프 방지.
+ * @returns 총 처리 row 수
+ */
+export async function drainColdPath(maxTicks = 12): Promise<number> {
+  let total = 0;
+  for (let i = 0; i < maxTicks; i++) {
+    const n = await tick();
+    if (n === 0) break;
+    total += n;
+  }
+  return total;
 }
