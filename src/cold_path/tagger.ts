@@ -27,11 +27,23 @@ export interface TagResult {
   newly_created_p_tag_name?: string;
 }
 
+// 후보 cache: 5분 TTL. project_tags가 자주 바뀌지 않아 매 call DB select 불필요.
+let _candidateCache: { rows: Array<{ id: number; name: string; description: string | null }>; expires: number } | null = null;
+const CANDIDATE_CACHE_TTL_MS = 5 * 60 * 1000;
+
 /**
  * 기존 project_tags 후보 가져오기 (alias_of 그룹 대표 = alias_of IS NULL row).
  * Tagger prompt에 후보 list로 주입해 explosion 방어.
+ *
+ * RESPEC §3 cost fix: candidate list cap 50 → 20 (안전한 slim).
+ * alias_of 그룹화로 동의어 묶임 → 20개 대표만으로도 대부분 매칭 커버.
+ * 5분 cache로 매 call DB select 안 함.
  */
-async function listProjectTagCandidates(limit = 50): Promise<Array<{ id: number; name: string; description: string | null }>> {
+async function listProjectTagCandidates(limit = 20): Promise<Array<{ id: number; name: string; description: string | null }>> {
+  const now = Date.now();
+  if (_candidateCache && _candidateCache.expires > now) {
+    return _candidateCache.rows;
+  }
   const r = await db.query(
     `SELECT id, name, description
        FROM project_tags
@@ -40,66 +52,49 @@ async function listProjectTagCandidates(limit = 50): Promise<Array<{ id: number;
       LIMIT $1`,
     [limit]
   );
-  return r.rows.map((row: any) => ({
+  const rows = r.rows.map((row: any) => ({
     id: Number(row.id),
     name: row.name,
     description: row.description,
   }));
+  _candidateCache = { rows, expires: now + CANDIDATE_CACHE_TTL_MS };
+  return rows;
 }
 
-const SYSTEM_PROMPT = `You are the Tagger for a personal long-term memory system.
-
-YOUR JOB
-For each input message, output:
-1. ONE predefined project tag (p_tag) — pick from the existing candidate list,
-   OR propose a NEW one ONLY when the message clearly belongs to a brand-new
-   project topic that none of the candidates fit.
-2. UP TO 3 dynamic tags (d_tag) — short keywords/phrases describing the
-   message content (e.g. ["bug-fix", "memory_add", "schema"]).
-
-CONTEXT
-- The user is one person managing personal memory across AI agents
-  (Claude Code, Codex, Gemini, etc.).
-- Existing project_tag CANDIDATES are listed below — STRONGLY prefer matching
-  one of these to avoid tag explosion. Synonyms or near-matches MUST map to
-  the existing candidate (e.g. "Centrazen project" → "centragens" if it
-  exists).
-- A new p_tag should only be proposed when the message is clearly about a
-  NEW, distinct project topic absent from candidates.
-
-ROLE-AWARENESS
-- The message is tagged with role='user' or role='assistant'. When
-  role='assistant', remember: this is the AI's own reply, NOT a fact about
-  the user. Tag the TOPIC, not as if the user said it.
-
-OUTPUT JSON STRICTLY:
-{
-  "p_tag": "<existing-name>" | "NEW:<proposed-name>" | null,
-  "d_tag": ["<keyword1>", "<keyword2>", ...]
+/** Cache invalidate — 새 p_tag 생성 시 호출해서 즉시 후보 list 갱신. */
+function invalidateCandidateCache(): void {
+  _candidateCache = null;
 }
+
+// RESPEC §3 cost fix: slim 적용. 핵심 룰 (explosion / role-awareness)은 keep.
+// 토큰 ~3K → ~1.8K 목표.
+const SYSTEM_PROMPT = `Tagger for one user's personal long-term memory across AI agents.
+
+OUTPUT (strict JSON):
+{ "p_tag": "<existing-name>" | "NEW:<slug>" | null, "d_tag": ["<kw>", ...] }
+
+p_tag: ONE project tag. STRONGLY prefer matching the candidate list below —
+  synonyms / near-matches MUST map to an existing candidate (e.g. "Centrazen project" → "centragens").
+  Use "NEW:<slug>" only when the message is clearly about a brand-new project
+  absent from candidates. null when the message is too short / generic to project-tag.
+
+d_tag: 0-3 short keywords (lowercase, hyphenated) about the topic.
+  e.g. ["bug-fix", "schema", "memory_add"]. Skip if message has no signal.
+
+ROLE: input includes role='user' or role='assistant'. For role='assistant',
+  tag the topic — DO NOT treat the assistant's reply as a fact about the user.
 
 Examples:
-- Input: "memory_add silent fail 진단 중. fba498c dedup이 의심" + candidates ["mcp-agents-memory", "centragens"]
-  → {"p_tag": "mcp-agents-memory", "d_tag": ["memory_add", "silent-fail", "diagnosis"]}
-
-- Input: "Centrazen 브랜드 패키지 디자인 시안 검토" + candidates ["centragens"]
+- "Centrazen 브랜드 패키지 디자인 시안 검토" + candidates ["centragens"]
   → {"p_tag": "centragens", "d_tag": ["package-design", "review", "branding"]}
-
-- Input: "OpenClaw 새 페르소나 설정해야 함" + candidates does NOT contain anything OpenClaw-related
-  → {"p_tag": "NEW:openclaw", "d_tag": ["persona-config", "setup"]}
-
-- Input: "응 ㅋㅋ" (정보 거의 없음)
-  → {"p_tag": null, "d_tag": []}`;
+- "응 ㅋㅋ" → {"p_tag": null, "d_tag": []}`;
 
 function buildUserPrompt(input: TagInput, candidates: Array<{ name: string; description: string | null }>): string {
+  // Slim user prompt — description (보통 길고 가변) 제거, 이름만 (~50% 토큰 절감)
   const candList = candidates.length > 0
-    ? candidates.map((c) => `- ${c.name}${c.description ? ` (${c.description})` : ''}`).join("\n")
-    : "(no existing project_tags yet)";
-  return `EXISTING project_tag CANDIDATES:
-${candList}
-
-MESSAGE (role=${input.role}, agent_platform=${input.agent_platform}, agent_model=${input.agent_model}):
-${input.message}`;
+    ? candidates.map((c) => c.name).join(", ")
+    : "(none)";
+  return `candidates: ${candList}\nrole=${input.role}\nmessage: ${input.message}`;
 }
 
 /**
@@ -128,6 +123,8 @@ async function getOrCreateProjectTag(name: string): Promise<number> {
        RETURNING id`,
     [slug]
   );
+  // 새 p_tag 생성 → 다음 call이 즉시 후보 list에서 보도록 cache invalidate
+  invalidateCandidateCache();
   return Number(inserted.rows[0].id);
 }
 
