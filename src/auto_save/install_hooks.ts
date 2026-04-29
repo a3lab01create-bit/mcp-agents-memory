@@ -59,17 +59,20 @@ function writeSettings(settings: ClaudeSettings): void {
   fs.writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n", "utf-8");
 }
 
-/** 현재 실행 중인 binary 경로로 hook command 결정 — npm global / npx / local dev 모두 cover. */
+/** 현재 실행 중인 binary 경로로 hook command 결정 — npm global / npx / local dev 모두 cover.
+ *
+ * advisor catch: process.argv[1]이 'build/index.js' 같은 relative일 수 있어 양쪽
+ * branch 모두 path.resolve()로 절대화. relative 박히면 Stop hook이 다른 cwd에서
+ * fire 시 silent no-op (capture-session이 exit 0이라 에러조차 안 보임). */
 function resolveHookCommand(): string {
-  // process.execPath = node 경로, process.argv[1] = 현재 스크립트 (build/index.js 등)
-  // npm bin 설치 시: argv[1] = .../bin/mcp-agents-memory → 직접 실행 가능
   const argv1 = process.argv[1] ?? "";
-  if (argv1.endsWith("mcp-agents-memory") || argv1.endsWith("mcp-agents-memory.js")) {
-    // bin shim — 그대로 호출
-    return `${argv1} capture-session`;
+  const absArgv1 = argv1 ? path.resolve(argv1) : "";
+  if (absArgv1.endsWith("mcp-agents-memory") || absArgv1.endsWith("mcp-agents-memory.js")) {
+    // bin shim 경로 (예: /usr/local/bin/mcp-agents-memory) — 직접 실행 가능
+    return `${absArgv1} capture-session`;
   }
-  // build/index.js / src/index.ts 직접 실행 케이스 — node + 절대경로
-  return `${process.execPath} ${argv1} capture-session`;
+  // build/index.js / src/index.ts 직접 실행 — node + 절대경로
+  return `${process.execPath} ${absArgv1} capture-session`;
 }
 
 function isOurEntry(e: any): boolean {

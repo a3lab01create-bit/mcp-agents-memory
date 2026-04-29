@@ -160,6 +160,9 @@ async function callFlash(sample: Sample, candidates: Candidate[]): Promise<CallR
   }
 }
 
+/** advisor catch: xAI usage shape 첫 응답 한 번만 dump — completion_tokens가 reasoning 포함인지 별도 필드인지 확인용. */
+let _grokUsageLogged = false;
+
 async function callGrok(sample: Sample, candidates: Candidate[]): Promise<CallResult> {
   const userPrompt = buildUserPrompt(sample, candidates);
   const start = Date.now();
@@ -178,6 +181,12 @@ async function callGrok(sample: Sample, candidates: Candidate[]): Promise<CallRe
     const latency_ms = Date.now() - start;
     const raw = (res.choices[0]?.message?.content ?? "").replace(/```json|```/g, "").trim();
     const usage = res.usage as any;
+    if (!_grokUsageLogged) {
+      _grokUsageLogged = true;
+      console.log(`\n🔍 [grok-usage-debug] 첫 응답 usage 전체 — completion_tokens가 reasoning 포함인지 별도 reasoning_tokens 필드인지 확인:`);
+      console.log(JSON.stringify(usage, null, 2));
+      console.log(`(OpenAI 호환 스펙: completion_tokens가 visible+reasoning 합산. 만약 xAI가 별도 reporting이면 보고서 cost는 5-10x 낮게 나오니 합산 로직 수동 보정 필요.)\n`);
+    }
     return analyzeResult({
       raw,
       latency_ms,
