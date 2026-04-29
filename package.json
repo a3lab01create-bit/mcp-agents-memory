@@ -20,7 +20,8 @@
     "start": "node build/index.js",
     "dev": "ts-node --esm src/index.ts",
     "setup": "npm run build && node build/index.js setup",
-    "migrate": "npm run build && node build/index.js migrate"
+    "migrate": "npm run build && node build/index.js migrate",
+    "bench:tagger": "npx tsx scripts/ab_tagger.ts"
   },
   "keywords": [
     "mcp",
