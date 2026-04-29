@@ -13,9 +13,9 @@
 **현재 상태**: scope/acceptance 명문화 완료. 단계 0 (윗 layer 격리) 진입 대기 중 — form 확인 후 시작 예정.
 
 **단계 진행** (각 commit 분리, 안 되면 멈춤):
-- [ ] **Step 0** — 윗 layer 호출 path 격리 (env flag)
-- [ ] **Step 1** — transcript source 분리 (User만, system/skill/slash 텍스트 거름)
-- [ ] **Step 2** — EXTRACTION_SYSTEM_PROMPT 정합성
+- [x] **Step 0** — 윗 layer 호출 path 격리 (commit `9208d86`). PROMOTION/MEMORY_AUDIT/FORGETTING/RELATIONSHIP_GRAPH 4 flag 명시 OFF, librarian.ts:654 upsertSubjectEdge gate 추가.
+- [x] **Step 1** — transcript source 분리 (commit `92d8f2f`). assistant entry 통째 drop, isMeta drop, XML 노이즈 wrapper strip, "[Request interrupted...]" drop. 현재 세션 jsonl 45KB→2.6KB (94% 감소), 이전 세션 16KB→9.6KB (41% 감소). sanity 양쪽 ✅.
+- [ ] **Step 2** — EXTRACTION_SYSTEM_PROMPT 정합성 (다음)
 - [ ] **Step 3** — TRIAGE_SYSTEM_PROMPT 정합성
 - [ ] **Step 4** — Brief 필터 정합성
 - [ ] **Step 5** — 기존 hallucination row cleanup (form 직접 검토)

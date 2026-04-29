@@ -11,7 +11,7 @@
     "build",
     ".env.example",
     "README.md",
-    "README_KR.md",
+    "RESPEC.md",
     "LICENSE"
   ],
   "scripts": {
@@ -20,8 +20,7 @@
     "start": "node build/index.js",
     "dev": "ts-node --esm src/index.ts",
     "setup": "npm run build && node build/index.js setup",
-    "migrate": "npm run build && node build/index.js migrate",
-    "eval": "npm run build && node build/eval/index.js"
+    "migrate": "npm run build && node build/index.js migrate"
   },
   "keywords": [
     "mcp",

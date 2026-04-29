@@ -1,166 +1,214 @@
-# mcp-agents-memory (v0.6.0)
+# mcp-agents-memory
 
-Multi-agent Shared Long-term Memory MCP Server.  
-An MCP server that enables AI agents (Claude, Gemini, GPT, etc.) to **autonomously manage memory** and evolve knowledge into **validated operational rules (Skills)**.
+> 사람의 기억을 모티브로 한, AI 에이전트들이 공유하는 장기 기억 MCP 서버.
 
-## 🌟 New in v0.6: Knowledge Evolution
+여러 에이전트(Claude, Codex, ChatGPT, Hermes-Agent, OpenClaw 등)가 세션을 넘어 동일한 메모리 풀을 공유하며, 시간 순서대로 기억을 축적·회상하도록 설계.
 
-- **🧠 Memory Tiering**: Intelligent loading strategy mimicking human memory. Full detail for the **last 30 days** (short-term) and metadata/important summaries for older records (long-term).
-- **🦾 Skill Evolution**: Repetitive patterns and project know-how automatically evolve into **Skills**. These rules are injected into the agent's system prompt to guide future actions.
-- **🌐 Authority Grounding**: High-value facts are reconciled against external authority sources (**Tavily** for recency, **Exa** for authority/docs) before storage.
-- **⚡ MCP Prompts (Slash Commands)**: Direct interaction via `/briefing`, `/recall <query>`, and `/save <text>` for a premium UX.
-- **🔐 Cross-MCP Ready**: Standardized context hooks to share `subject_key` and `session_id` with other MCPs (Vision, Audio, etc.).
+> **현재 fresh implementation 진행 중**. 이전 v0.x 시리즈는 `fact_type` 분류 axis로 짜여있어 form vision (시간 + 태그 + 임베딩)과 wrong axis. 상세 → [`RESPEC.md`](./RESPEC.md)
 
-## Features
+---
 
-- **📚 Librarian Engine**: Multi-model pipeline (Triage → Extract → Audit) for zero-config fact extraction.
-- **⚡ Contradiction Resolution**: Detects and updates conflicting information (e.g., "Lives in Seoul" → "Moved to Busan").
-- **🧠 Smart Briefing**: Dynamic session startup with user profile, project context, and applicable **Skills**.
-- **🔍 Semantic Search**: Vector embedding-based retrieval with automatic tier-up for matching long-term memories.
-- **🔐 Unified Provenance**: Every fact is tagged with `author_model`, `platform`, and `session_id` for perfect traceability.
+## 모티브
 
-## 🧠 Hybrid Intelligence Tech Stack
+- [**supermemory**](https://supermemory.io) — 시맨틱 그래프 기반 보편적 메모리 레이어
+- [**Hermes Agent**](https://github.com/NousResearch/hermes-agent) — MEMORY.md 스타일 자동 갱신, 스킬·규칙 시스템
 
-v0.6 employs a sophisticated multi-role architecture using the best models for each specialized task.
+이 두 프로젝트의 핵심을 합친 형태가 본 프로젝트의 목표.
 
-| Role | Technology | Description |
-|----------|------------|-------------|
-| **Skill Auditor** | Anthropic `Sonnet` / `Gemini Pro` | **Grounding**: Reconciles facts with external docs using Tavily + Exa. |
-| **Skill Curator** | Google `Gemini Flash` | **Promotion**: Monitors memory clusters to identify skill candidates. |
-| **Fact Extractor** | OpenAI `gpt-4o-mini` | **Extraction**: Efficient atomic fact generation from text. |
-| **Embedding** | OpenAI `text-embedding-3-small` | **Standard**: 1536-dim vector indexing for semantic search. |
-| **Search (Required)** | **Tavily + Exa** | **The Two Pillars**: Tavily (Recency) + Exa (Authority/Research). |
-| **Database** | PostgreSQL + pgvector | **Tiered Storage**: Tier-aware partitioning (Short/Long term). |
+---
 
-## Architecture
+## 핵심 설계
+
+1. **사람 기억처럼 시간 순서**: 모든 대화가 시간 순서로 raw 저장. 별도 분류(fact_type) X. 시간이 지나면 태그 기반 요약 + 오래된 건 archive.
+2. **자동 모델별 분리**: `agent_platform` / `agent_model` 컬럼만으로 모델별 기억 자동 분리. 별도 카테고리 만들 필요 없음.
+3. **두 트랙 비동기**: Hot Path (raw 즉시 저장, 응답 빠름) ↔ Cold Path (백그라운드 사서가 1분 / 5메시지 단위로 태깅 + 임베딩).
+4. **태그 중심 회상**: 단기는 최근 2-3일 raw, 장기는 태그 중심 요약. 과거 기록 필요 시 날짜 / 태그 / 키워드로 archive에서 retrieval.
+
+---
+
+## 아키텍처
+
+### 두 트랙 비동기
 
 ```
-┌─────────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Claude Code   │     │   Gemini     │     │     GPT      │
-│ (Zero-Config)   │     │ (Autonomous) │     │ (Autonomous) │
-└────────┬────────┘     └──────┬───────┘     └──────┬───────┘
-         │                     │                    │
-         └─────────────────────┼────────────────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │   MCP Protocol      │
-                    │ (w/ instructions)   │  ← Zero-Config Entry
-                    └──────────┬──────────┘
-                               │
-                    ┌──────────▼──────────┐      ┌──────────────────┐
-                    │  mcp-agents-memory  │      │  Skill Track     │
-                    │  ┌───────────────┐  │ ───▶ │  Curator/Auditor │
-                    │  │   Librarian   │  │      │  (Knowledge/Web) │
-                    │  │   Engine      │  │      └────────┬─────────┘
-                    │  └───────┬───────┘  │               │
-                    └──────────┼──────────┘      ┌────────▼─────────┐
-                               │                 │   Skills Table   │
-                    ┌──────────▼──────────┐      │ (Operational)    │
-                    │  PostgreSQL + pgvec │      └──────────────────┘
-                    │  (Tiered Memories)  │
-                    └─────────────────────┘
+┌─────────────────┐      ┌─────────────────────────┐
+│  Agent          │      │ MCP Server              │
+│  (Claude Code,  │ ───▶ │ ▶ Hot Path (즉시 저장)  │ ──▶ memory 테이블
+│   Codex, ...)   │      └─────────────────────────┘     (raw + role + platform/model)
+└─────────────────┘                  │
+                                     │  p_tag/d_tag/embedding NULL인 row 누적
+                                     ▼
+                        ┌─────────────────────────────┐
+                        │ Cold Path (1분 / 5메시지)   │
+                        │  ├─ Tagger (gemini-2.5-flash)│ ──▶ p_tag, d_tag
+                        │  └─ Embedder (3-large)      │ ──▶ embedding
+                        └─────────────────────────────┘
+                                     │  빈칸 UPDATE
+                                     ▼
+                        ┌─────────────────────────────┐
+                        │ Librarian (memory → user)   │ ──▶ user 테이블
+                        │  핵심 사용자 정보 promote   │     (core_profile / sub_profile)
+                        └─────────────────────────────┘
 ```
 
-## Setup
+### 데이터 모델
 
-### Install
+**`memory` 테이블** — 시간 순서 raw 대화 저장 (단일 테이블, soft delete 아카이브)
+
+| 컬럼 | 설명 |
+|---|---|
+| `user_id` | 사용자 식별 |
+| `agent_platform` | claude-code / codex / chatgpt / hermes-agent / openclaw 등 |
+| `agent_model` | opus-4-7 / gemini-3-pro / gpt-5.5 등 |
+| `subagent` | yes / no (1-level만 추적) |
+| `subagent_model` / `subagent_role` | sub일 때 채움. role은 free-form (lowercase normalize) |
+| `role` | `user` / `assistant` |
+| `message` | raw 본문 |
+| `p_tag` | predefined (프로젝트 태그, `project_tags` 참조) |
+| `d_tag` | dynamic (문맥 태그) |
+| `embedding` | `vector(3072)` — text-embedding-3-large |
+| `is_active` / `archived_at` | soft delete (무손실 보존) |
+| `is_pinned` | `manage_knowledge`로 강제 기억된 row, archive 면제 |
+| `created_at` / `updated_at` | |
+
+**`user` 테이블** — Librarian이 memory에서 핵심 정보 promote
+
+| 컬럼 | 설명 |
+|---|---|
+| `user_id` / `user_name` | |
+| `core_profile` | 아주 중요한 핵심 사용자 정보 |
+| `sub_profile` | 그 외 기억해야 할 사용자 정보 |
+| `created_at` / `updated_at` | |
+
+**`project_tags` 테이블** — 프로젝트 태그 누적 (Cold Path가 동적 추가)
+
+| 컬럼 | 설명 |
+|---|---|
+| `id` / `name` / `description` | |
+| `alias_of` | 동의어 사후 병합용 (예: "centragens" ↔ "Centrazen 프로젝트") |
+
+---
+
+## 메모리 로드 룰
+
+- **단기 메모리**: 최근 2-3일 raw 그대로, 또는 8000 토큰(약 12000-16000자) 중 먼저 도달하는 것
+  - 토큰 측정은 char-approximate (`char_count / 1.7`) — Hot Path latency 보호
+  - 단기/장기 전환 기간은 env로 tunable (form이 직접 조정 가능)
+- **모델 분리**: 기본 = 같은 `agent_platform` / `agent_model` 기억만. `p_tag` 매칭 시 (= 같은 프로젝트) 협업 agent 기억까지 포함
+- **archive 검색**: 사용자 발화 컨텍스트 ("며칠 전에...") 또는 과거 기록 필요 판단 시 → 날짜 / 태그 / 키워드로 archive에서 retrieval
+- **검색 fallback**: 의미 검색 (cosine) 결과 임계값 미만 시 ILIKE로 fallback (env tunable, 시작 0.3)
+
+---
+
+## API (Tool 2개)
+
+### `search_memory` — 조회/검색 통합
+
+```ts
+search_memory({
+  query?: string,        // 의미 검색 (vector + ILIKE fallback)
+  p_tag?: string,        // 특정 프로젝트로 한정
+  date_range?: string,   // 기간 한정 (예: "2026-04-29..", "last_week")
+  role?: 'user' | 'assistant',  // form 발화만 / assistant 발화만 (기본 둘 다)
+})
+```
+
+> "기억 안 나면 무조건 이거 하나만 써" — 에이전트가 파라미터 조합만 바꿔서 검색.
+
+### `manage_knowledge` — 저장/수정 통합
+
+```ts
+manage_knowledge({
+  action: 'add' | 'update' | 'remove',
+  target: 'sub_profile' | 'memory',
+  content: string,
+})
+```
+
+> 사용자가 명시적으로 "이건 기억해" / "이건 지워" 할 때 사용.
+> `target='memory'` 호출 = 강제 기억 (`is_pinned=true`, importance bump, archive 면제).
+> `manage_knowledge`만큼은 Cold Path 거치지 않고 **즉시 sync tag + embed**. ("기억했어요" 답한 직후 바로 검색 가능 보장)
+
+---
+
+## 기술 스택
+
+| 역할 | 사용 기술 |
+|---|---|
+| **Embedding** | OpenAI `text-embedding-3-large` (3072 dim) |
+| **Tagger (Cold Path)** | Google `gemini-2.5-flash` (predefined + dynamic) |
+| **검색 fallback** | PostgreSQL `ILIKE` (cosine 임계값 미만 시) |
+| **DB** | PostgreSQL + pgvector |
+| **Librarian (memory → user)** | TBD (form vision 결정 후) |
+| **Skill 시스템** | TBD (다음 라운드) |
+
+---
+
+## 환경변수 (계획)
 
 ```bash
-npm i -g mcp-agents-memory
+# DB
+DB_HOST=...
+DB_PORT=5432
+DB_USER=...
+DB_PASS=...
+DB_NAME=...
+
+# SSH tunnel (옵션)
+SSH_ENABLED=true
+SSH_HOST=...
+
+# 모델
+EMBEDDING_MODEL=text-embedding-3-large
+TAGGER_MODEL=gemini-2.5-flash
+OPENAI_API_KEY=...
+GEMINI_API_KEY=...
+
+# Hot/Cold path 제어
+COLD_PATH_INTERVAL_SEC=60          # 1분 단위 스케줄
+COLD_PATH_BATCH_SIZE=5             # 또는 5메시지 단위
+
+# 메모리 로드 tunable
+SHORT_TERM_DAYS=3                  # 단기 메모리 윈도우
+SHORT_TERM_TOKEN_LIMIT=8000        # 토큰 리밋 (char-approx)
+SEARCH_FALLBACK_THRESHOLD=0.3      # cosine 미만 시 ILIKE fallback
+
+# Agent 식별 (caller가 self-report)
+AGENT_PLATFORM=claude-code
+AGENT_MODEL=opus-4-7
+AGENT_KEY=...                      # 옵션, multi-persona 구분용
 ```
 
-### Configure
+---
 
-```bash
-mcp-agents-memory setup
-```
+## 상태
 
-The interactive wizard:
-- Prompts for your Postgres connection (cloud provider with `pgvector` recommended — [Neon](https://neon.tech) and [Supabase](https://supabase.com) both have free tiers; URL must end with `?sslmode=require`).
-- Asks for the required OpenAI key (embeddings).
-- Lets you pick a Librarian model preset (see below).
-- Writes config to `~/.config/mcp-agents-memory/.env`.
-- Applies the base schema and runs all migrations idempotently.
+| 항목 | 상태 |
+|---|---|
+| `RESPEC.md` 작성 (vision + 결정사항 + nuance + 살릴 자산 / 폐기 코드) | ✅ Done |
+| 새 schema SQL 초안 | ⏳ TBD |
+| Hot Path / Cold Path / Librarian / search / manage 시퀀스 | ⏳ TBD |
+| Migration 1회 작업 (옛 fact_type='profile' 핵심 → user.core_profile) | ⏳ TBD |
+| Fresh impl 작업 단계 break-down | ⏳ TBD |
+| Skill 트랙 정리 | ⏳ form 결정 보류, 차후 |
 
-### Add to your MCP client
+---
 
-Claude Desktop / Claude Code / any MCP-aware client:
+## 참조 문서
 
-```json
-{
-  "mcpServers": {
-    "memory": {
-      "command": "mcp-agents-memory",
-      "env": {
-        "AGENT_KEY": "agent_claude",
-        "AGENT_PLATFORM": "claude-code"
-      }
-    }
-  }
-}
-```
+- [`RESPEC.md`](./RESPEC.md) — 현재 vision + 회의 결정사항 + 구현 detail (단일 진실 원천)
+- [`SPEC.md`](./SPEC.md) — 구 SPEC (v0.x 역사 보존, 일부 §3.4 Memory Tier가 본 vision의 원형)
+- [`PROBLEMS.md`](./PROBLEMS.md) — 현재 진행 중 cleanup 단계 / 진단 결과
 
-`AGENT_PLATFORM` is recorded as the Curator's harness identity on every memory_add call. The Curator's model is captured per-call (defaulting to the Producer's author_model) — set explicitly via the curator_model argument when an orchestrator saves memories on behalf of a different model (e.g. delegating to a subagent). This avoids the staleness that env-static model values would introduce when /model swaps mid-session.
+---
 
-`agent_key` (optional): Agent persona key for multi-persona harnesses (OpenClaw, Hermes, Opencode). Single-persona setups can ignore — `AGENT_KEY` env is the default. Applies to `memory_add`, `memory_save_skill`, and `memory_curator_run`.
+## 가이드 원칙
 
-### Cross-machine memory
+> 눈앞 문제 해결한다고 전체 구조가 망가지면 안 됨.
 
-On a second computer, run `npm i -g mcp-agents-memory` and `mcp-agents-memory setup` pointing to the **same** `DATABASE_URL`. Memory shares automatically — the database is the source of truth and the MCP server is stateless.
+매 작업/제안 시 RESPEC.md vision 정합 검증 → "이 fix가 큰 틀과 맞나?" 확인 후 진행.
+"일단 돌게만 만들자"는 멈춤 신호.
 
-### CLI
+---
 
-- `mcp-agents-memory` — run the MCP server (stdio).
-- `mcp-agents-memory setup` — interactive wizard (writes XDG config, applies schema + migrations).
-- `mcp-agents-memory migrate` — apply pending migrations against an already-configured database.
-- `mcp-agents-memory help` — show help.
-
-### Local development
-
-For self-hosted Postgres or working on the codebase directly:
-
-```bash
-git clone https://github.com/a3lab01create-bit/mcp-agents-memory.git
-cd mcp-agents-memory
-npm install
-npm run build
-npm run setup
-```
-
-Config search order: `$MEMORY_CONFIG_PATH` → `./.env` → `~/.config/mcp-agents-memory/.env` → `<package>/.env`. Project-root `.env` wins for dev workflows.
-
-### Requirements
-- PostgreSQL ≥ 14 with the `pgvector` extension.
-- **Required API key**: OpenAI (embeddings).
-- **Optional API keys**: depends on the wizard preset you pick (see below).
-
-### Model presets
-
-The wizard offers four presets for the always-on Librarian roles. Every role still accepts `<ROLE>_PROVIDER` and `<ROLE>_MODEL` env overrides if you want to mix and match.
-
-| Preset | Triage | Extract | Audit | Contradiction | Required keys |
-|---|---|---|---|---|---|
-| **Recommended** | gemini-2.5-flash-lite | gpt-4o-mini | gpt-4o-mini | gpt-4o-mini | OpenAI + Google |
-| OpenAI only | gpt-4o-mini | gpt-4o-mini | gpt-4o-mini | gpt-4o-mini | OpenAI |
-| Anthropic only | claude-haiku-4-5 | claude-haiku-4-5 | claude-haiku-4-5 | claude-haiku-4-5 | Anthropic |
-| Premium | gemini-2.5-flash | gpt-4o-mini | grok-4.20-0309-reasoning | grok-4.20-0309-reasoning | OpenAI + Google + xAI |
-
-Grounding roles (`skill_auditor` + `memory_auditor`) default to `claude-sonnet-4-6` and only fire when `PROMOTION_ENABLED` / `MEMORY_AUDIT_ENABLED` are on. Sonnet calls use prompt caching automatically — repeat audits within 5 minutes hit at ~10× cheaper rate.
-
-## Roadmap
-
-- [x] v0.4 — Librarian Engine (Auto extraction + resolution)
-- [x] v0.5 — Provenance Layer (Model/Platform tracking)
-- [x] v0.6 — **Knowledge Evolution**: Tiered Memory + Skill Grounding
-- [x] v4.5 — Skill System closure (Curator + Auditor + Promotion + Injector filtering)
-- [x] v5.0 — Memory Graph + External Knowledge Grounding + Auto Forgetting + memory_restore
-- [x] **Connectors v1**: Notion page ingestion (`connector_sync` MCP tool)
-- [ ] **Connectors v2**: Notion database iteration, GitHub, Drive
-- [ ] v1.0 — **Production Ready**: Full benchmark and stability
-
-## Credits
-
-Built by **Hoon** ([triplealab](https://github.com/a3lab01create-bit)) in collaboration with **Claude** (Anthropic) and **Codex** (OpenAI). Most of v0.5 / v0.6 / v4.5 / v5.0 was designed and implemented through iterative human-AI pair programming — eating our own dog food on the same memory and skill systems this server provides.
-
-## License
-MIT
+*Status: fresh implementation 준비 단계. 실제 구현은 form 결정 후 진행.*
