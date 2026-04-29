@@ -173,6 +173,7 @@ export async function captureSessionEnd(): Promise<{ inserted: number; skipped: 
 
   let inserted = 0;
   let skipped = 0;
+  let dedup = 0;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -182,22 +183,26 @@ export async function captureSessionEnd(): Promise<{ inserted: number; skipped: 
       skipped++;
       continue;
     }
+    // dedup 키: session_id + entry uuid (Claude Code JSONL 고유 식별)
+    const externalUuid = sessionId ? `claude-code:${sessionId}:${parsed.uuid}` : `claude-code:${parsed.uuid}`;
     try {
-      await insertRawMemory({
+      const result = await insertRawMemory({
         user_id: userId,
         agent_platform: CLIENT_PLATFORM,
         agent_model: parsed.agent_model ?? "unknown",
         role: parsed.role,
         message: parsed.message,
+        external_uuid: externalUuid,
       });
-      inserted++;
+      if (result.inserted) inserted++;
+      else dedup++; // ON CONFLICT skip — save_message 또는 이전 capture가 이미 저장
     } catch (err) {
       console.error(`⚠️ [JSONL] insert failed for entry ${parsed.uuid}:`, err);
       skipped++;
     }
   }
 
-  console.error(`📝 [JSONL] captured session=${sessionId}: inserted=${inserted}, skipped=${skipped}`);
+  console.error(`📝 [JSONL] captured session=${sessionId}: inserted=${inserted}, dedup=${dedup}, skipped=${skipped}`);
   return { inserted, skipped };
 }
 

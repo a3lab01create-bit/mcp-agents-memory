@@ -38,11 +38,19 @@ export interface HotPathInsertParams {
    * 일반 Hot Path는 NULL — Cold Path가 채움.
    */
   embedding?: number[] | null;
+  /**
+   * 외부 식별자 (예: Claude Code JSONL entry uuid). UNIQUE INDEX 적용된 컬럼.
+   * 같은 external_uuid로 INSERT 시 ON CONFLICT DO NOTHING 동작 — 중복 저장 방지.
+   * save_message tool / manage_knowledge는 NULL 사용 (자동 생성 not needed).
+   */
+  external_uuid?: string | null;
 }
 
 export interface HotPathInsertResult {
   id: number;
   created_at: Date;
+  /** true = INSERT 성공, false = external_uuid 중복으로 ON CONFLICT skip. */
+  inserted: boolean;
 }
 
 /**
@@ -65,11 +73,15 @@ export async function insertRawMemory(
     p_tag_id = null,
     d_tag = [],
     embedding = null,
+    external_uuid = null,
   } = params;
 
   const embeddingSql = embedding && embedding.length > 0
     ? `[${embedding.join(",")}]`
     : null;
+
+  // tag_processed: 사전 p_tag_id 채워졌으면 TRUE, 아니면 FALSE (Cold Path 처리 대상)
+  const tagProcessed = p_tag_id !== null;
 
   const result = await db.query(
     `INSERT INTO memory (
@@ -77,24 +89,40 @@ export async function insertRawMemory(
        subagent, subagent_model, subagent_role,
        role, message,
        p_tag_id, d_tag, embedding,
-       is_pinned
+       is_pinned, tag_processed, external_uuid
      ) VALUES (
        $1, $2, $3,
        $4, $5, $6,
        $7, $8,
        $9, $10::text[], $11::halfvec,
-       $12
+       $12, $13, $14
      )
+     ON CONFLICT (external_uuid) WHERE external_uuid IS NOT NULL
+       DO NOTHING
      RETURNING id, created_at`,
     [
       user_id, agent_platform, agent_model,
       subagent, subagent_model, subagent_role,
       role, message,
       p_tag_id, d_tag, embeddingSql,
-      is_pinned,
+      is_pinned, tagProcessed, external_uuid,
     ]
   );
 
+  if (result.rows.length === 0) {
+    // ON CONFLICT skip — 기존 row 가져오기
+    const existing = await db.query(
+      `SELECT id, created_at FROM memory WHERE external_uuid = $1 LIMIT 1`,
+      [external_uuid]
+    );
+    if (existing.rows.length > 0) {
+      const row = existing.rows[0];
+      return { id: Number(row.id), created_at: row.created_at, inserted: false };
+    }
+    // theoretically unreachable: conflict should have target row. fail-loud.
+    throw new Error(`insertRawMemory: ON CONFLICT triggered but no existing row found (external_uuid=${external_uuid})`);
+  }
+
   const row = result.rows[0];
-  return { id: Number(row.id), created_at: row.created_at };
+  return { id: Number(row.id), created_at: row.created_at, inserted: true };
 }

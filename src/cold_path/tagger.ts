@@ -159,7 +159,32 @@ export async function tagMessage(input: TagInput): Promise<TagResult> {
         newly_created_p_tag_name = newName;
       }
     } else {
-      p_tag_id = await getOrCreateProjectTag(parsed.p_tag);
+      // P2 fix: 모델이 후보 list 외 이름 (오타/hallucination) 반환 시 새 tag
+      // 자동 생성 막기. candidate 안에 정확히 매칭되거나 alias_of로 lookup 가능한
+      // 이름이어야만 사용. 그 외는 NULL (no p_tag) 반환 — explosion 방어 강화.
+      const slug = parsed.p_tag.toLowerCase().trim();
+      const candidateSlugs = new Set(candidates.map((c) => c.name.toLowerCase()));
+      if (candidateSlugs.has(slug)) {
+        p_tag_id = await getOrCreateProjectTag(parsed.p_tag);
+      } else {
+        // alias_of chain에 있으면 OK
+        const aliasCheck = await db.query(
+          `WITH RECURSIVE chain AS (
+             SELECT id, alias_of FROM project_tags WHERE name = $1
+             UNION ALL
+             SELECT pt.id, pt.alias_of FROM project_tags pt JOIN chain c ON pt.id = c.alias_of
+           )
+           SELECT id FROM chain WHERE alias_of IS NULL LIMIT 1`,
+          [slug]
+        );
+        if (aliasCheck.rows.length > 0) {
+          p_tag_id = Number(aliasCheck.rows[0].id);
+        } else {
+          // 후보에 없는 이름 — explosion 방어. NEW: prefix가 명시되지 않은 한 새로 만들지 않음.
+          console.error(`⚠️ [Tagger] 후보 외 이름 "${parsed.p_tag}" 거부 (NEW: prefix 없음). p_tag NULL 반환.`);
+          p_tag_id = null;
+        }
+      }
     }
   }
 

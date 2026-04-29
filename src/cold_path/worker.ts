@@ -52,25 +52,30 @@ interface ColdRow {
  *
  * Priority order (RESPEC PROBLEMS.md §4 fix — 4-30 큐 head 정합):
  *   1. is_active=TRUE row 우선 (사용자 현재 작업 중 메시지 즉시 처리)
- *   2. archived row는 cold_error 1시간 cooldown 적용 (Phase F drain quota
- *      초과 같은 사고 시 무한 retry 방지)
+ *   2. cold_error 차등 cooldown:
+ *      - active: 5분 (사용자 작업 신선도 유지하면서 quota 폭증 방지)
+ *      - archived: 1시간 (옛 legacy quota stuck 같은 사고 시 무한 retry 방지)
  *   3. 그 외엔 created_at ASC
  *
- * 효과: archived legacy + errored row가 큐 head를 막아서 새 active row가
- * 처리 안 되던 사고 (Phase F drain quota 초과 + 큐 정체) 방지. Active는
- * cooldown 무시 — 사용자 현재 작업 즉시 retry.
+ * 효과: archived legacy stuck row 큐 head 정체 + active row 무한 retry
+ * (4-30 quota 초과 시 매 tick 잡힘) 둘 다 방지.
  */
 async function claimBatch(client: any, batch: number): Promise<ColdRow[]> {
+  // needs_tag: tag_processed=FALSE인 row만. p_tag_id IS NULL은 정상 결과
+  // (tagger가 "이 메시지엔 p_tag 없음" 판정한 case)도 포함하므로 충분치 않음.
+  // → tag_processed 컬럼이 명시 상태 표식 (P1 fix migration 020).
   const r = await client.query(
     `SELECT id, message, role, agent_platform, agent_model,
-            (p_tag_id IS NULL) AS needs_tag,
+            (NOT tag_processed) AS needs_tag,
             (embedding IS NULL) AS needs_embed
        FROM memory
-      WHERE (embedding IS NULL OR p_tag_id IS NULL)
+      WHERE (embedding IS NULL OR NOT tag_processed)
         AND (
-          is_active = TRUE
-          OR cold_error IS NULL
-          OR updated_at < NOW() - INTERVAL '1 hour'
+          (is_active = TRUE
+            AND (cold_error IS NULL OR updated_at < NOW() - INTERVAL '5 minutes'))
+          OR
+          (is_active = FALSE
+            AND (cold_error IS NULL OR updated_at < NOW() - INTERVAL '1 hour'))
         )
       ORDER BY is_active DESC, created_at ASC
       LIMIT $1
@@ -151,6 +156,8 @@ async function processOne(client: any, row: ColdRow): Promise<void> {
     params.push(tag.p_tag_id);
     sets.push(`d_tag = $${i++}::text[]`);
     params.push(tag.d_tag);
+    // tag_processed=TRUE — 정상 NULL과 미처리 NULL 분리 (P1 fix)
+    sets.push(`tag_processed = TRUE`);
   }
   if (row.needs_embed && embedding) {
     sets.push(`embedding = $${i++}::halfvec`);

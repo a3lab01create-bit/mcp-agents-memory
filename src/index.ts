@@ -20,36 +20,45 @@ Tools:
   - memory_startup    : 시작 brief (user profile + 최근 활성 프로젝트 + 최근 메모리). 세션 시작 시 첫 호출 권장.
   - search_memory     : 과거 기억 조회/검색 통합 (의미 + 키워드 fallback)
   - manage_knowledge  : 명시 저장/수정/삭제 통합 (강제 기억은 is_pinned, archive 면제)
+  - save_message      : 매 user/assistant turn 끝나면 호출 — Hot Path 자동 저장
 
 Hot Path (자동 저장)는 caller가 raw 메시지 발생 시 직접 호출 — 사람의 기억처럼 시간 순서로 raw 보존, Cold Path가 백그라운드에서 태깅+임베딩.
 
-manage_knowledge 호출 시 caller convention:
-  - agent_model: 명시 권장 (생략 시 'unknown' 저장)
-  - subagent (optional): true면 subagent_model + subagent_role 함께 명시`;
+caller convention:
+  - 매 user/assistant turn 끝나면 save_message 호출 (또는 Claude Code는 SessionEnd JSONL 자동 캡처)
+  - manage_knowledge / save_message 호출 시 agent_model 명시 (생략 시 'unknown' 저장)
+  - subagent context면 subagent: true + subagent_model + subagent_role 함께`;
+
+const STATIC_INSTRUCTIONS_BRIEF_UNAVAILABLE = `\n\n---\n\n⚠️ 시작 brief를 불러오지 못했습니다 (DB 연결 또는 쿼리 timeout). \`memory_startup\` tool을 명시 호출해 brief를 받으세요.`;
 
 /**
- * DB 5초 타임아웃 시도 → 성공 시 brief 포함 instructions, 실패 시 static.
+ * DB connect + brief 쿼리 둘 다 5초 타임아웃 race로 감쌈. 실패 시 static + 안내.
  * MCP server는 instructions가 construct 시점 고정이라 DB pre-connect 필요.
+ *
+ * P2 fix (codex 지적): 이전엔 DB connect만 timeout 적용. brief 쿼리 자체는
+ * 무한 대기 가능했음 (큰 데이터셋 + 느린 쿼리 시 startup hang). 이제 둘 다 race.
  */
 async function buildInstructions(): Promise<string> {
   try {
-    const dbReady = Promise.race([
-      (async () => {
-        const { db } = await import("./db.js");
-        await db.connect();
-        return true;
-      })(),
-      new Promise<boolean>((_, reject) => setTimeout(() => reject(new Error("DB connect timeout")), BRIEF_DB_TIMEOUT_MS)),
-    ]);
-    await dbReady;
+    const work = (async () => {
+      const { db } = await import("./db.js");
+      await db.connect();
+      const brief = await collectBrief();
+      return formatBriefMarkdown(brief);
+    })();
 
-    const brief = await collectBrief();
-    const briefMd = formatBriefMarkdown(brief);
+    const briefMd = await Promise.race([
+      work,
+      new Promise<string>((_, reject) =>
+        setTimeout(() => reject(new Error("buildInstructions timeout")), BRIEF_DB_TIMEOUT_MS)
+      ),
+    ]);
+
     return `${STATIC_INSTRUCTIONS}\n\n---\n\n${briefMd}`;
   } catch (err) {
-    console.error("⚠️ Brief 동적 주입 실패 (DB 연결 timeout 또는 collect 오류):", err instanceof Error ? err.message : err);
-    console.error("   instructions에 brief 없이 정적 안내만 포함. 세션 시작 시 memory_startup 호출 권장.");
-    return STATIC_INSTRUCTIONS;
+    console.error("⚠️ Brief 동적 주입 실패 (DB connect 또는 brief 쿼리 timeout):", err instanceof Error ? err.message : err);
+    console.error("   static fallback + 'memory_startup 명시 호출 권장' 안내 포함.");
+    return STATIC_INSTRUCTIONS + STATIC_INSTRUCTIONS_BRIEF_UNAVAILABLE;
   }
 }
 
