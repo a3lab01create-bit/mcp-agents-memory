@@ -19,9 +19,10 @@
 - **silent**: VALIDATOR_MODEL이 .env에서 사라진 채 (`070ded7` schema migration). validator.ts:94 AUDIT_MODEL fallback → 4.20-reasoning. Form 의도는 4.1-fast.
 
 ### 시도 결과
-- chunking 40K → 15K + defer-large 500KB (4-29 uncommitted) — drain 일부 진행, 비용은 가속
+- chunking 40K → 15K + defer-large 500KB (4-29) — drain 일부 진행하다 비용 amplifier 발견하고 **revert** (uncommitted, 다음 진행 시 위험)
 - env CONTRADICTION_MODEL: grok-4.20 → 4.1-fast (form 직접) — contradiction path만 cheaper. audit/validator는 4.20 그대로
-- audit path 끊기 (librarian.ts:549, 663) — **미적용, uncommitted**
+- **audit path 끊기 (librarian.ts:549, 663) — commit `0fdd0cd`로 적용 완료** (4-29). transcript pipeline에서 grok 호출 0. dead code 잔존, 다시 호출 X.
+- 다음 step: MCP server restart 후 새 코드 로드 → drain 재개되면서 비용 0으로 큐 풀림 검증
 
 ### 조심
 - 모델 단가만 보고 진단 멈추면 호출수 폭증 root 놓침. 단가 × 호출수 × 토큰 × reasoning 곱셈으로 봐야.
@@ -113,10 +114,11 @@
 
 ## 미진단 사항 (다음 세션 pickup 후보)
 
-- memory_add silent fail의 정확한 위치 (Phase A dedup vs atomic supersede 진단)
-- self-watch hook이 captureSessionEnd 시 정상 INSERT하는지 라이브 검증
+- **다음 우선 (form 4-29 결정)**: memory_add silent fail 진단 (Phase A dedup `fba498c` vs atomic supersede `1be2c5b` 어느 쪽이 silent fail 원인인지). 직접 호출 + DB query로 새 fact INSERT 추적.
+- self-watch hook이 captureSessionEnd 시 정상 INSERT하는지 라이브 검증 (drain 풀린 후)
 - librarian이 "패턴 감지 → skill 후보 promote" 본래 vision대로 작동하는지
 - 짬뽕 코드 cleanup 방향 (form vision 재확인 필요)
+- audit/validate 함수 dead code 정리 (auditFacts, validateFact, auditMemory 함수 자체 제거할지 — 별도 architectural decision)
 
 ---
 
