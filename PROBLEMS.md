@@ -23,6 +23,8 @@
 | F — Migration (legacy ~3582 row → archive 보존) | ✓ | (data only, no code commit) |
 | G — End-to-end + 문서 closure | ✓ | (this commit) |
 
+**드레인 결과**: 3582 row 중 3545 fully done (embedding + p_tag), 37 partial (embedding ✓ but p_tag NULL — Gemini 2.5 Flash 일일 quota 10K 초과, 14h 후 자동 retry). Vector search는 모든 3582 row에 작동. ILIKE/manage_knowledge/Librarian/archive 검색 e2e 작동.
+
 **최종 시스템 상태**:
 - 옛 schema (subjects/memories/skills 등 11 테이블) → `_legacy_*`로 rename 보존
 - 새 schema (users/memory/project_tags 3 테이블) 운영
