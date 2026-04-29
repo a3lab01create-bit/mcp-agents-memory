@@ -11,8 +11,9 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerManageKnowledge } from "./tools/manage_knowledge.js";
+import { registerSearchMemory } from "./tools/search_memory.js";
 
 export function registerTools(server: McpServer): void {
   registerManageKnowledge(server);
-  // Phase E: registerSearchMemory(server);
+  registerSearchMemory(server);
 }
