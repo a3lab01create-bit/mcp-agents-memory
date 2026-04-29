@@ -651,7 +651,14 @@ export async function processBatch(
       result.facts.push({ id: newId, content: fact.content, fact_type: fact.fact_type, superseded: supersedes_id });
 
       // v5.0 Memory Graph — persist directed edge alongside the relationship fact.
-      if (fact.fact_type === 'relationship' && fact.edge) {
+      // Gated during cleanup (spec.md §11): RELATIONSHIP_GRAPH_ENABLED=false skips edge insert.
+      // The relationship fact itself still persists in memories — only the side effect on
+      // subject_relationships is suppressed.
+      if (
+        fact.fact_type === 'relationship' &&
+        fact.edge &&
+        process.env.RELATIONSHIP_GRAPH_ENABLED === 'true'
+      ) {
         const inserted = await upsertSubjectEdge(fact.edge);
         if (inserted) result.edges_saved++;
       }
