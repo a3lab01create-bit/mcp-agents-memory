@@ -19,6 +19,7 @@ import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId, updateUserProfile, getUserProfile } from "../users.js";
 import { generateEmbedding } from "../embeddings.js";
 import { tagMessage } from "../cold_path/tagger.js";
+import { resolveAgentIdentity } from "../agent_identity.js";
 
 function ok(payload: any) {
   return {
@@ -73,8 +74,11 @@ target='sub_profile' 사용 시:
         target: z.enum(['memory', 'sub_profile']).describe("'memory': 메모리 row | 'sub_profile': 사용자 프로필 부가 정보"),
         content: z.string().optional().describe("add/update 시 저장할 텍스트 (remove 시 무시)"),
         memory_id: z.number().int().optional().describe("update/remove(target='memory') 시 대상 row id"),
-        agent_platform: z.string().optional().describe("agent 식별 (default: env AGENT_PLATFORM)"),
-        agent_model: z.string().optional().describe("agent model (default: env AGENT_MODEL)"),
+        agent_platform: z.string().optional().describe("agent platform override (default: MCP clientInfo.name 자동)"),
+        agent_model: z.string().optional().describe("agent model 명시 (caller 책임). 없으면 'unknown' 저장"),
+        subagent: z.boolean().optional().describe("subagent context인 경우 true (caller convention)"),
+        subagent_model: z.string().optional().describe("subagent=true 일 때 sub의 model"),
+        subagent_role: z.string().optional().describe("subagent=true 일 때 role description (free-form, lowercase normalize)"),
       },
     },
     async (args) => {
@@ -164,15 +168,16 @@ target='sub_profile' 사용 시:
       if (!args.content) {
         return err("content is required for memory add");
       }
-      const platform = args.agent_platform ?? process.env.AGENT_PLATFORM ?? 'unknown';
-      const model = args.agent_model ?? process.env.AGENT_MODEL ?? 'unknown';
+
+      // §2 fix: clientInfo 자동 + caller args 우선. .env 폴백 폐기.
+      const id = resolveAgentIdentity(server, args);
 
       // sync tagger
       let p_tag_id: number | null = null;
       let d_tag: string[] = [];
       let tagged: 'ok' | 'pending' = 'pending';
       try {
-        const tagResult = await syncTagger(args.content, platform, model);
+        const tagResult = await syncTagger(args.content, id.agent_platform, id.agent_model);
         p_tag_id = tagResult.p_tag_id;
         d_tag = tagResult.d_tag;
         tagged = 'ok';
@@ -196,8 +201,11 @@ target='sub_profile' 사용 시:
 
       const inserted = await insertRawMemory({
         user_id: userId,
-        agent_platform: platform,
-        agent_model: model,
+        agent_platform: id.agent_platform,
+        agent_model: id.agent_model,
+        subagent: id.subagent,
+        subagent_model: id.subagent_model,
+        subagent_role: id.subagent_role,
         role: 'user', // manage_knowledge는 사용자 명시이므로 user
         message: args.content,
         is_pinned: true, // 강제 기억은 archive 면제

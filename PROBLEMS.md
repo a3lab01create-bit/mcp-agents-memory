@@ -1,110 +1,129 @@
-# PROBLEMS — historical reference
+# PROBLEMS — RESPEC v1 운영 이슈 (4-29~)
 
-> **본 파일은 v0.x 시리즈 운영 중 발견된 문제 + cleanup 진행 기록.**
-> **2026-04-29 RESPEC v1 fresh impl로 superseded.** 모든 v0.x cleanup 항목은 fresh impl이 폐기/재구현으로 해결.
->
-> 현재 active 문서:
->   - [`RESPEC.md`](./RESPEC.md) — 단일 진실 원천 (vision + 결정사항 + 구현 detail)
->   - [`README.md`](./README.md) — 사용자 진입점
->
-> 본 파일은 archive로 유지 (drift 사고 history reference).
+> RESPEC v1 fresh impl 후 form 직접 사용해보면서 catch한 항목들.
+> 솔루션 단정 X. 증상 + 원인 후보 + 시도 결과 + 조심할 패턴.
 
 ---
 
-## 🟢 4-29 RESPEC v1 fresh impl 완료 (Phase A-G)
+## 1. 시작 시 메모리 자동주입 (form vision missing)
 
-| Phase | 결과 | Commit |
+### 증상
+- Gemini CLI 새 세션 시작 → 빈 컨텍스트로 시작
+- 형 정체성 (Isaac CEO / frontend hobbyist / 쿠름 호칭 등)이 user 테이블에 박혀 있어도 자동 주입 안 됨
+- 최근 2-3일 raw 메모리도 자동 로드 안 됨
+- 에이전트가 직접 `search_memory({ include_archived: true })` 호출해야 가져올 수 있음
+
+### 원인
+- RESPEC v1 fresh impl에서 옛 `memory_startup` MCP tool 폐기됨 (Phase A에서 wrong-axis 코드로 분류)
+- 새 시퀀스 다이어그램에 **첫 접속 자동 brief 로드** 흐름 없음
+- 현재 흐름: caller (Gemini/Claude/Codex)가 첫 turn에 명시적으로 `search_memory` 호출하도록 instructions에만 의존
+
+### form vision (4-29 명시)
+- 단기 메모리 = 최근 2-3일 (또는 8000 토큰 limit) raw 자동 로드
+- user 테이블의 `core_profile` / `sub_profile` 자동 주입
+- 활성 p_tag 통계 등 brief에 포함
+
+### 시도 결과
+- 미진행. 새 entry point 설계 단계.
+
+### 후보 옵션
+| 옵션 | 장단 |
+|---|---|
+| (a) 새 MCP tool `memory_startup` (3번째 tool) | caller가 첫 turn에 명시 호출. instructions에 "MUST call first" 명시. RESPEC tool 2개 원칙엔 위배지만 entry point 1개라 수용 가능 |
+| (b) MCP `instructions` 필드에 동적 주입 | server connect 시 brief 작성해서 instructions 에 포함. caller가 system prompt로 자동 받음. 단 connect 1회 시점이라 update 어려움 |
+| (c) MCP `Prompts` endpoint (`/briefing` slash) | 사용자가 수동 호출. 자동 X |
+
+### 조심
+- "session 시작 시 자동 brief"는 SPEC.md §3.4 Memory Tier vision에 있던 것이 RESPEC.md로 명시 이동 안 됨. RESPEC §메모리 로드 룰 절은 query/필터 룰만 정의. **자동 주입 흐름은 RESPEC에 누락된 vision**. 이번 라운드에서 RESPEC.md 보완 필요.
+
+---
+
+## 2. agent_platform / agent_model / subagent 식별 — 자동 캡처 미완
+
+### 증상
+- Gemini CLI에서 `manage_knowledge` 호출 → 저장된 row의 `agent_platform='claude-code'`, `agent_model='opus-4-7'`로 잘못 박힘
+- 실제 호출자는 Gemini CLI인데 attribution이 잘못됨
+- subagent 컬럼은 default `false`로만 박힘 (실제 subagent context 식별 불가)
+
+### 원인
+- `.env`에 `AGENT_PLATFORM=claude-code` / `AGENT_MODEL=opus-4-7` 하드코딩
+- 서버 코드 (`tools/manage_knowledge.ts`): `args.agent_platform ?? process.env.AGENT_PLATFORM ?? 'unknown'` → caller가 args 안 넘기면 env 폴백 → 어떤 caller가 호출하든 .env 값으로 박힘
+- caller가 args 명시 안 한 게 1차 원인이지만, 서버가 `.env` 폴백을 default로 두는 것이 구조적 문제
+
+### MCP 프로토콜 한계
+- `clientInfo: {name, version}` 자동 교환 → `agent_platform` 자동 캡처 가능 (claude-code / gemini-cli / codex)
+- `model` 정보는 clientInfo에 **없음** → caller가 args로 명시 필요
+- `subagent` 컨텍스트는 MCP가 모름 → caller convention 필요
+
+### 후보 fix
+- (a) **MCP clientInfo 자동 감지** — server가 connect 시 client name 캡처 → `agent_platform` default. caller가 args.agent_platform로 override 가능.
+- (b) **`agent_model` args 필수화** — 명시 안 하면 'unknown' 저장 (env 폴백 폐기)
+- (c) **caller convention 정의** — claude-code main: `agent_model='opus-4-7'`. claude-code Task subagent: `subagent=true, subagent_model=...` 등 명시.
+- (d) `.env`의 `AGENT_PLATFORM` / `AGENT_MODEL` 폐기 (USER_NAME만 keep)
+
+### 조심
+- subagent 자동 감지 불가능 — caller가 책임. claude-code의 Task tool 사용 시 sub-context에서 어떻게 자동 명시될지 별도 설계 필요.
+
+---
+
+## 3. Cold Path tagger 비용 폭증 (4-29 drain 사고)
+
+### 증상
+- 4-29 드레인 작업 (3582 row 일괄 처리) 동안 Gemini 2.5 Flash에 ₩23,033 소비
+- 일일 quota 10K req/day 초과 → 마지막 37 row tagger 실패 (429 Quota Exceeded)
+- 예상 ($0.25)보다 ~70배 비싼 결과
+
+### 비용 분해 (form 가격표 기준 재계산)
+
+Gemini 2.5 Flash 가격: input $0.30/M, output $2.50/M (thinking 포함 단일 단가)
+
+| 항목 | 토큰 | 비용 |
 |---|---|---|
-| A — wrong-axis 폐기 | ✓ | a1-a4 (commits 90ce154 / b77ac53 / d715e9b / d44fbad) |
-| B — 새 schema (migration 019) | ✓ | b41064d |
-| C — Hot Path + manage_knowledge | ✓ | 0a5398c |
-| D — Cold Path (tagger/embedder/worker) | ✓ | 3bf6b2d |
-| E — search_memory + Librarian | ✓ | 18b95e9 |
-| F — Migration (legacy ~3582 row → archive 보존) | ✓ | (data only, no code commit) |
-| G — End-to-end + 문서 closure | ✓ | (this commit) |
+| Input (4K × 9729 calls) | ~39M | $11.7 |
+| Output (200 × 9729) | ~2M | $5.0 |
+| **합계** | | **~$17 ≈ ₩23K** (form 결제액 일치) |
 
-**드레인 결과**: 3582 row 중 3545 fully done (embedding + p_tag), 37 partial (embedding ✓ but p_tag NULL — Gemini 2.5 Flash 일일 quota 10K 초과, 14h 후 자동 retry). Vector search는 모든 3582 row에 작동. ILIKE/manage_knowledge/Librarian/archive 검색 e2e 작동.
+→ Input 70%, Output 30%. **Input이 주범.**
 
-**최종 시스템 상태**:
-- 옛 schema (subjects/memories/skills 등 11 테이블) → `_legacy_*`로 rename 보존
-- 새 schema (users/memory/project_tags 3 테이블) 운영
-- legacy ~3582 row → 새 memory에 archive 상태 + 3-large 재임베딩 + p_tag 재태깅 완료
-- form 핵심 정체성 → user_id=1 'hoon'의 core_profile / sub_profile에 promote (Librarian draft + form review)
+### 원인 후보
+- (a) **F.6b drain script에 `FOR UPDATE SKIP LOCKED` 빠짐** — 같은 row 여러 batch가 재 fetch해서 9729 calls (3582 rows × 2.7x). production `worker.ts`엔 박혀있는데 일회용 script에서 누락.
+- (b) **Tagger prompt 비대** — 시스템 프롬프트 + 기존 project_tags 후보 list (alias_of 그룹 대표 50개) 매 call 주입. 짧은 메시지에도 base 토큰 큼 (~4K input/call).
+- (c) **모델 선택** — 단순 분류 task에 `gemini-2.5-flash` 사용. `flash-lite`는 input $0.10/M / output $0.40/M로 ~5x 저렴.
+- (d) **Drain volume 자체** — 일회성 마이그레이션이라 평소 운영 비용과 무관.
 
-**legacy `_legacy_*` 테이블**: rename만, DROP 안 함. 1-2주 운영 후 form 결정 시 DROP 가능.
+### 잘못 잡혔던 가설 (4-29 정정)
+- ~~Thinking mode default-on이 output 단가 10x 폭증~~ — **무효**. form 가격표 보니 output은 thinking 포함 단일 단가. thinking 차단해도 cost 변화 없음. 쿠가 outdated 가격 인용한 잘못된 추정이었음.
 
----
+### 시도 결과
+- 미적용. 다음 라운드 fix 후보.
 
-## 📜 Historical (v0.x 시리즈) — archive
+### 조심
+- 마이그레이션 같은 일회성 batch 작업은 운영 cost와 분리 측정 필요. 평소 1분당 5건 운영은 일일 ~7K calls.
+- 가격 가정 검증 — model 가격표 정기적으로 직접 확인 (쿠가 인용한 가격 자주 outdated).
 
-이하는 v0.x 운영 중 발견된 문제 history. RESPEC v1로 superseded됐지만 **drift 사고 evidence + lesson** 보존을 위해 keep.
+### Fix 후보 (우선순위)
 
-### 1. 비용 폭증 (4-29 진단)
+| # | Fix | 효과 |
+|---|---|---|
+| 1 | **Tagger 모델 → `gemini-2.5-flash-lite`** | ~5x 절감 (input 3x + output 6x) |
+| 2 | **SKIP LOCKED** drain script 강제 | 호출 2.7x → 1x |
+| 3 | **Tagger prompt slim** (system 짧게 + 후보 list cache + 최소 예시) | input 4K → 1.5K 목표 |
+| 4 | **cost telemetry** (call/token/cost 누적 → memory_status 노출) | 실시간 모니터링 |
+| **합쳐서** | drain ₩23K → ~₩1.7K (13x), 운영 ~$3/year |
 
-#### 증상
-- 1년치 $10-20 예상이 2-3일에 약 $10 (xai grok)
-- 곱셈 폭증: 단가(50×) × 호출수(50-100×) × 토큰(5×) × reasoning_tokens(3-5×)
-
-#### 원인 후보
-- **메인**: `auditFacts` (librarian.ts:549) — 모든 transcript fact의 top-5를 grok-4.20-reasoning으로 audit
-- **silent**: VALIDATOR_MODEL이 .env에서 사라진 채 (`070ded7` schema migration). validator.ts:94 AUDIT_MODEL fallback → 4.20-reasoning. Form 의도는 4.1-fast.
-
-#### 조심 (lesson)
-- 모델 단가만 보고 진단 멈추면 호출수 폭증 root 놓침. **단가 × 호출수 × 토큰 × reasoning 곱셈으로 봐야**.
-- chunking 같은 narrow fix가 비용 곡선 가속 가능. ship 전 "호출수 영향 어떻게 변하나?" 검증 필수.
-
-**RESPEC v1 해결**: audit/validator/contradiction LLM path 전부 폐기. Cold Path는 gemini-2.5-flash (저렴) + openai 3-large embedding만.
-
----
-
-### 2. memory_add silent fail
-
-#### 증상
-- `memory_add` 호출 → 응답 OK
-- 새 세션 `memory_search` / `memory_startup` brief에 안 나옴
-
-#### 원인 (4-29 13:15 KST 진단)
-**brief 필터링이 root** — write 실패 아님:
-- USER PROFILE 섹션 = `profile/preference + profile_static` 필터, LIMIT 8
-- CURRENT CONTEXT 섹션 = `profile/preference + profile_dynamic` 필터, LIMIT 6
-- `state` / `relationship` fact_type은 어느 섹션에도 등장 불가
-- form 입력이 librarian에 의해 `state`로 분류되면 → DB 저장 정상이지만 brief 안 보임 (이번 세션 probe #2780/#2781로 재현)
-
-**RESPEC v1 해결**: fact_type 폐기. memory 테이블에 모든 발화 raw 저장 + tag/embedding으로 검색. brief 필터 자체를 시간/태그 기반 redesign.
-
----
-
-### 3. Hook (self-watch) 효과 미체감
-
-#### 증상
-- Form 시점: "hook 안 됨"
-- 실제: `transcript_queue`에 95+ pending — `captureSessionEnd` INSERT는 작동
-- drain이 막혀서 form 시점에 처리 결과 안 보임
-
-**RESPEC v1 해결**: transcript queue / captureSessionEnd 메커니즘 자체 폐기. Hot Path가 caller로부터 직접 INSERT 받음.
-
----
-
-### 4. 짬뽕 코드 — v0.7보다 regression 많음
-
-#### 증상 (form 4-29 진단)
-- "0.7보다 안되는 부분이 더 많고 오류난 부분도 더 많음"
-- "작은 목표가 큰 틀을 다 망가뜨려서 그 작은 목표만 완성"
-- audit 시스템 4개로 증식 (form vision은 1개 — skill 후보군에만)
-
-#### 원인
-- v0.7 (commit `ab4cc32`) 이후 narrow fix 누적이 큰 틀의 가정 침식
-
-**RESPEC v1 해결**: cleanup-in-place 포기, fresh impl로 전환. wrong-axis 코드 (librarian fact_type 분류, audit, validators, skills 시스템 등) 전부 폐기. 새 vision (시간 + 태그 + embedding) 기반 새 구조.
+운영 cost projection (일일 form ~30 + assistant ~30 = 60 메시지 가정):
+- 현재 (flash) → ~$18/year
+- flash-lite + slim → ~$3/year (form 예상치 $10-20/year 안)
 
 ---
 
 ## 반복 검출된 패턴 (메모리 cross-ref)
 
 - `feedback_root_cause_not_eyeball_fix.md` — narrow-first reflex
-- `feedback_drift_via_narrow_fix.md` — 작은 목표가 큰 틀 깨는 drift (4-29 신규)
-- `project_audit_only_for_skills.md` — Form vision 명문화 (4-29)
+- `feedback_drift_via_narrow_fix.md` — 작은 목표가 큰 틀 깨는 drift
+- `project_audit_only_for_skills.md` — Form vision 명문화
 - `feedback_phase_enforcement_recheck.md` — 매 ship 시 Phase 1 재검증
 - `feedback_fact_type_axis_drift.md` — 4-29 fact_type axis catch
 - `feedback_structure_over_local_fix.md` — 4-29 form 가이드 원칙
 - `project_basic_memory_real_vision.md` — RESPEC vision ground truth
+- `project_respec_v1_complete.md` — 4-29 RESPEC v1 fresh impl 완료 closure
