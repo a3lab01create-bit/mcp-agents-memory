@@ -546,7 +546,10 @@ export async function processBatch(
       audit_required: auditIdxSet.has(f._idx!),
     }));
 
-    const audited = await auditFacts(tagged);
+    // Form vision (PROBLEMS.md, 4-29): audit/fact-check는 skill 후보군에만
+    // (skill_auditor.ts). transcript fact 단위 audit는 drift — 호출 path 끊음.
+    // auditFacts 함수는 dead code로 잔존, 다시 호출 X.
+    const audited = tagged;
     result.extracted = audited.length;
 
     for (const fact of audited) {
@@ -653,15 +656,12 @@ export async function processBatch(
         if (inserted) result.edges_saved++;
       }
 
-      // Persist sync audit result OR fall back to async validation queue.
-      // Apply the same fact_type gate to async — subjective facts (preference / profile /
-      // state / relationship) should never be web-grounded regardless of importance.
-      if (auditResult) {
-        if (auditedStatus !== null) {
-          await persistAuditResult(newId, auditResult, originalContent);
-        }
-      } else if (fact.importance > 7 && AUDITABLE_FACT_TYPES.has(fact.fact_type)) {
-        scheduleValidation(fact.content, newId);
+      // Form vision (PROBLEMS.md, 4-29): web-grounded 검증은 skill 후보군에만.
+      // scheduleValidation 호출 끊음 — fact 단위 grok+Tavily+Exa 검증은 drift.
+      // validator.ts / validationQueue는 dead code로 잔존.
+      // auditMemory 결과 persist는 그대로 (memoryAuditEnabled gate OFF라 auditResult는 보통 null).
+      if (auditResult && auditedStatus !== null) {
+        await persistAuditResult(newId, auditResult, originalContent);
       }
     }
   } catch (err: any) {
