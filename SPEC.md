@@ -1,4 +1,17 @@
-# mcp-agents-memory — 기획서
+# mcp-agents-memory — 기획서 (v0.x archive)
+
+> ⚠️ **2026-04-29: 본 SPEC.md는 archive로 전환됨.**
+>
+> v0.x 시리즈의 fact_type 분류 axis가 form vision (시간 기반 + 태그 + embedding)과
+> wrong axis임이 4-29 catch됨. fresh impl로 전환 (RESPEC v1).
+>
+> **현재 active 단일 진실 원천**: [`RESPEC.md`](./RESPEC.md)
+>
+> 본 SPEC.md는 v0.x 운영 중의 기록 + drift 사고 evidence 보존을 위해 keep.
+> §3.4 Memory Tier (short_term / long_term / archive 무손실 캐시 계층)는
+> RESPEC v1에서 정확히 같은 vision으로 부활.
+
+---
 
 > 이 문서는 README와 별도로 유지되는 **단일 진실 원천(Single Source of Truth)** 기획서입니다.
 > AI 협업 중 비전이 표류하지 않도록 모든 작업은 이 문서를 기준점으로 삼습니다.

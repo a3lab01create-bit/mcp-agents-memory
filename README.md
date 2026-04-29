@@ -186,10 +186,13 @@ AGENT_KEY=...                      # 옵션, multi-persona 구분용
 | 항목 | 상태 |
 |---|---|
 | `RESPEC.md` 작성 (vision + 결정사항 + nuance + 살릴 자산 / 폐기 코드) | ✅ Done |
-| 새 schema SQL 초안 | ⏳ TBD |
-| Hot Path / Cold Path / Librarian / search / manage 시퀀스 | ⏳ TBD |
-| Migration 1회 작업 (옛 fact_type='profile' 핵심 → user.core_profile) | ⏳ TBD |
-| Fresh impl 작업 단계 break-down | ⏳ TBD |
+| 새 schema SQL (migration 019) | ✅ Done — `users` + `memory` + `project_tags` 3테이블 |
+| Hot Path 구현 (즉시 raw INSERT) | ✅ Done |
+| Cold Path 구현 (tagger gemini-2.5-flash + embedder 3-large + worker SKIP LOCKED) | ✅ Done |
+| Librarian 구현 (memory → user.core/sub_profile promote) | ✅ Done |
+| MCP Tools (`search_memory` + `manage_knowledge`) | ✅ Done |
+| Migration (legacy ~3582 row → archive 보존 + 재임베딩) | ✅ Done |
+| 핵심 정체성 promote (user.core_profile / sub_profile) | ✅ Done — Librarian draft + form review |
 | Skill 트랙 정리 | ⏳ form 결정 보류, 차후 |
 
 ---
