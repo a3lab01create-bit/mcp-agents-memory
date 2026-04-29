@@ -6,6 +6,7 @@ import { db } from "./db.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerTools } from "./tools.js";
+import { startColdPathWorker, stopColdPathWorker } from "./cold_path/worker.js";
 import { PACKAGE_VERSION } from "./version.js";
 import fs from "fs";
 
@@ -17,7 +18,8 @@ async function shutdown(reason: string): Promise<void> {
   isShuttingDown = true;
   console.error(`🛑 Shutting down (${reason})...`);
 
-  // Phase D will add: stopColdPathWorker() + stopLibrarianWorker() here.
+  try { stopColdPathWorker(); } catch {}
+  // Phase E will add: stopLibrarianWorker() here.
 
   try {
     await Promise.race([
@@ -113,7 +115,7 @@ Hot Path (자동 저장)는 caller가 raw 메시지 발생 시 직접 호출 —
     process.exit(1);
   }
 
-  // Phase D will start Cold Path worker here.
+  startColdPathWorker();
   // Phase E will start Librarian (memory→user) worker here.
 }
 

@@ -18,6 +18,7 @@ import { db } from "../db.js";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId, updateUserProfile, getUserProfile } from "../users.js";
 import { generateEmbedding } from "../embeddings.js";
+import { tagMessage } from "../cold_path/tagger.js";
 
 function ok(payload: any) {
   return {
@@ -32,17 +33,21 @@ function err(message: string, extra?: any) {
 }
 
 /**
- * Phase D에서 cold_path/tagger.ts로 추출 예정. 현 단계는 stub —
- * sync 처리 시 NULL 반환 (Cold Path가 다음 사이클에 처리).
- *
- * @returns null이면 tagger 미준비, Cold Path가 채울 거라는 의미.
+ * Phase D — sync tagger. 실패 시 throw (호출부가 catch해서 'pending' 처리).
+ * Cold Path가 사용하는 tagMessage()와 동일 모듈 — sync 강제만 차이.
  */
-async function syncTagger(_message: string): Promise<{
-  p_tag_id: number | null;
-  d_tag: string[];
-} | null> {
-  // Phase D에서 gemini-2.5-flash 호출 + project_tags lookup으로 채움.
-  return null;
+async function syncTagger(
+  message: string,
+  agent_platform: string,
+  agent_model: string
+): Promise<{ p_tag_id: number | null; d_tag: string[] }> {
+  const result = await tagMessage({
+    message,
+    role: 'user',
+    agent_platform,
+    agent_model,
+  });
+  return { p_tag_id: result.p_tag_id, d_tag: result.d_tag };
 }
 
 export function registerManageKnowledge(server: McpServer): void {
@@ -167,12 +172,10 @@ target='sub_profile' 사용 시:
       let d_tag: string[] = [];
       let tagged: 'ok' | 'pending' = 'pending';
       try {
-        const tagResult = await syncTagger(args.content);
-        if (tagResult) {
-          p_tag_id = tagResult.p_tag_id;
-          d_tag = tagResult.d_tag;
-          tagged = 'ok';
-        }
+        const tagResult = await syncTagger(args.content, platform, model);
+        p_tag_id = tagResult.p_tag_id;
+        d_tag = tagResult.d_tag;
+        tagged = 'ok';
       } catch (e) {
         // tagger 실패 — pending으로 두고 Cold Path가 처리
         tagged = 'pending';
