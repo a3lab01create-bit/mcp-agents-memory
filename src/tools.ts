@@ -1,17 +1,18 @@
 /**
- * MCP tool registration — RESPEC v1 fresh impl skeleton.
+ * MCP tool registration — RESPEC v1 fresh impl.
  *
- * Phase A2: Skeleton 상태. 실제 tool은 Phase C/E에서 등록:
- *   - Phase C: manage_knowledge (저장/수정 통합)
- *   - Phase E: search_memory (조회/검색 통합)
+ * Registered tools:
+ *   - manage_knowledge (Phase C) : 명시 저장/수정/삭제 통합
+ *   - search_memory    (Phase E) : 조회/검색 통합
  *
- * 옛 12개 tool (memory_startup, memory_add, memory_save_skill,
- * memory_curator_run, memory_search 구버전, memory_status, memory_restore,
- * connector_sync 등) 전부 폐기. RESPEC §1 Tool Consolidation 결정 정합.
+ * Hot Path 자동 저장 (raw INSERT)은 별도 함수 (`insertRawMemory` from
+ * src/hot_path.ts) — caller가 직접 호출. MCP tool 아님.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { registerManageKnowledge } from "./tools/manage_knowledge.js";
 
-export function registerTools(_server: McpServer): void {
-  // 비어있음 — Phase C / Phase E에서 채움.
+export function registerTools(server: McpServer): void {
+  registerManageKnowledge(server);
+  // Phase E: registerSearchMemory(server);
 }
