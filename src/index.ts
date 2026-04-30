@@ -84,20 +84,22 @@ async function shutdown(reason: string): Promise<void> {
     console.error("📝 [JSONL] capture error (non-blocking):", err);
   }
 
-  // 2. Drain ColdPath — 방금 INSERT된 row + 기존 pending 모두 tag+embed.
-  //    8s hard cap (대부분 0~3 batch면 끝, batch=5 × ~1.5s).
+  // 2. Worker timer 먼저 정지 — 정기 tick이 drain 직전에 fire되면 running=true
+  //    상태가 되어 drain의 첫 tick() 호출이 즉시 0 반환하고 break하는 race 방지.
+  try { stopColdPathWorker(); } catch {}
+  // Phase E will add: stopLibrarianWorker() here.
+
+  // 3. Drain ColdPath — 방금 INSERT된 row + 기존 pending 모두 tag+embed.
+  //    20s hard cap. Gemini tag (~1.5s/row) + OpenAI embed (~0.5s/row) +
+  //    첫 batch API cold start 고려. 5 row 첫 batch ~10s + 후속 ~5s × 2.
   try {
     await Promise.race([
       drainColdPath(),
-      new Promise<void>((resolve) => setTimeout(resolve, 8000)),
+      new Promise<void>((resolve) => setTimeout(resolve, 20000)),
     ]);
   } catch (err) {
     console.error("🔵 [ColdPath] drain error (non-blocking):", err);
   }
-
-  // 3. Worker timer 정지 (drain 후라 race 없음)
-  try { stopColdPathWorker(); } catch {}
-  // Phase E will add: stopLibrarianWorker() here.
 
   try {
     await Promise.race([

@@ -273,14 +273,29 @@ export async function runColdPathOnce(): Promise<number> {
 /**
  * shutdown drain — pending row 모두 처리 시도. batch 단위 반복.
  * 안전 cap (MAX_TICKS) + caller 측 timeout race로 무한루프 방지.
+ *
+ * 호출 전 stopColdPathWorker로 timer 정지 권장. timer fire와 race로
+ * `running=true` 상태에서 tick()이 즉시 0 반환해 drain이 조기 종료되는 사고 방지.
+ * 진행 중 tick은 polling으로 대기 (최대 3s).
+ *
  * @returns 총 처리 row 수
  */
 export async function drainColdPath(maxTicks = 12): Promise<number> {
+  // 진행 중 tick (정기 timer로 fire된 것) 마무리 대기
+  let waitCount = 0;
+  while (running && waitCount < 30) {
+    await new Promise((r) => setTimeout(r, 100));
+    waitCount++;
+  }
+
   let total = 0;
   for (let i = 0; i < maxTicks; i++) {
     const n = await tick();
     if (n === 0) break;
     total += n;
+  }
+  if (total > 0) {
+    console.error(`🔵 [ColdPath] drain done: ${total} row(s) processed`);
   }
   return total;
 }
