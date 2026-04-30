@@ -9,6 +9,14 @@ import { registerTools } from "./tools.js";
 import { startColdPathWorker, stopColdPathWorker, drainColdPath } from "./cold_path/worker.js";
 import { collectBrief, formatBriefMarkdown } from "./briefing.js";
 import { captureSessionStart, captureSessionEnd } from "./auto_save/jsonl_capture.js";
+import {
+  captureSessionStart as captureCodexStart,
+  captureSessionEnd as captureCodexEnd,
+} from "./auto_save/codex_capture.js";
+import {
+  captureSessionStart as captureGeminiStart,
+  captureSessionEnd as captureGeminiEnd,
+} from "./auto_save/gemini_capture.js";
 import { PACKAGE_VERSION } from "./version.js";
 import fs from "fs";
 
@@ -20,12 +28,14 @@ Tools:
   - memory_startup    : 시작 brief (user profile + 최근 활성 프로젝트 + 최근 메모리). 세션 시작 시 첫 호출 권장.
   - search_memory     : 과거 기억 조회/검색 통합 (의미 + 키워드 fallback)
   - manage_knowledge  : 명시 저장/수정/삭제 통합 (강제 기억은 is_pinned, archive 면제)
-  - save_message      : 매 user/assistant turn 끝나면 호출 — Hot Path 자동 저장
+  - save_message      : transcript 캡처 미지원 platform 한정 fallback (Cursor 등). Hot Path 직접 INSERT.
 
-Hot Path (자동 저장)는 caller가 raw 메시지 발생 시 직접 호출 — 사람의 기억처럼 시간 순서로 raw 보존, Cold Path가 백그라운드에서 태깅+임베딩.
+Hot Path (자동 저장) 룰:
+  - **Claude Code / Codex CLI / Gemini CLI**: server가 transcript 파일을 passive read해서 자동 캡처.
+    별도 save_message 호출 X. 호출하면 동일 메시지 중복 row 발생.
+  - **그 외 platform** (Cursor, Antigravity 등 transcript 비공개): 매 turn save_message 호출 — fallback.
 
 caller convention:
-  - 매 user/assistant turn 끝나면 save_message 호출 (또는 Claude Code는 SessionEnd JSONL 자동 캡처)
   - manage_knowledge / save_message 호출 시 agent_model 명시 (생략 시 'unknown' 저장)
   - subagent context면 subagent: true + subagent_model + subagent_role 함께`;
 
@@ -86,14 +96,18 @@ async function shutdown(reason: string): Promise<void> {
   stopParentWatchdog();
 
   // 1. Final JSONL flush — INSERT raw rows. fs.watch 살아있는 동안 대부분
-  //    이미 들어왔지만 마지막 1-2건 잡힘.
+  //    이미 들어왔지만 마지막 1-2건 잡힘. 세 platform (Claude Code / Codex / Gemini) 병렬.
   try {
     await Promise.race([
-      captureSessionEnd(),
+      Promise.allSettled([
+        captureSessionEnd(),
+        captureCodexEnd(),
+        captureGeminiEnd(),
+      ]),
       new Promise<void>((resolve) => setTimeout(resolve, 3000)),
     ]);
   } catch (err) {
-    console.error("📝 [JSONL] capture error (non-blocking):", err);
+    console.error("📝 capture error (non-blocking):", err);
   }
 
   // 2. Worker timer 먼저 정지 — 정기 tick이 drain 직전에 fire되면 running=true
@@ -211,9 +225,13 @@ async function runMcpServer() {
   installShutdownHandlers();
   startParentWatchdog();
 
-  // §4 fix: Claude Code JSONL 캡처 cursor 기록 + fs.watch arm (real-time).
-  // 비-Claude Code (Gemini CLI / Codex 등)는 jsonlPath 없으므로 no-op.
+  // §4/§5 fix: 세 platform passive 캡처 arm. 각자 transcript 파일 dir 없으면 no-op.
+  // - jsonl_capture: ~/.claude/projects/<slug>/*.jsonl
+  // - codex_capture: ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl (recursive watch)
+  // - gemini_capture: ~/.gemini/tmp/<projectKey>/chats/session-*.json
   captureSessionStart(process.cwd());
+  captureCodexStart(process.cwd());
+  captureGeminiStart(process.cwd());
 
   console.error("🚀 Starting Memory MCP Server...");
 
