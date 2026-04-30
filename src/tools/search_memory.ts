@@ -104,6 +104,9 @@ date_range 인식 형식:
         p_tag: z.string().optional().describe("특정 프로젝트로 한정 (project_tags.name)"),
         date_range: z.string().optional().describe("기간 한정 (today / last_week / last_month / 7_days_ago / YYYY-MM-DD)"),
         role: z.enum(['user', 'assistant']).optional().describe("발화자 한정 (생략 시 둘 다)"),
+        agent_platform: z.string().optional().describe(
+          "agent platform 한정 (예: 'claude-code', 'gemini-cli-mcp-client'). 생략 시 cross-platform."
+        ),
         limit: z.number().int().min(1).max(50).optional().describe(`최대 결과 수 (default ${DEFAULT_LIMIT})`),
         include_archived: z.boolean().optional().describe("archived 메모리도 포함 (default false)"),
       },
@@ -151,6 +154,10 @@ date_range 인식 형식:
       if (args.role) {
         filters.push(`m.role = $${p++}`);
         params.push(args.role);
+      }
+      if (args.agent_platform) {
+        filters.push(`m.agent_platform = $${p++}`);
+        params.push(args.agent_platform);
       }
       const whereSql = filters.join(' AND ');
 
@@ -218,6 +225,10 @@ date_range 인식 형식:
           if (args.role) {
             ilikeFilters.push(`m.role = $${q++}`);
             ilikeParams.push(args.role);
+          }
+          if (args.agent_platform) {
+            ilikeFilters.push(`m.agent_platform = $${q++}`);
+            ilikeParams.push(args.agent_platform);
           }
           ilikeFilters.push(`m.message ILIKE $${q++}`);
           ilikeParams.push(`%${args.query}%`);

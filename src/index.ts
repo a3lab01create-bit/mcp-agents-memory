@@ -38,12 +38,24 @@ const STATIC_INSTRUCTIONS_BRIEF_UNAVAILABLE = `\n\n---\n\n⚠️ 시작 brief를
  * P2 fix (codex 지적): 이전엔 DB connect만 timeout 적용. brief 쿼리 자체는
  * 무한 대기 가능했음 (큰 데이터셋 + 느린 쿼리 시 startup hang). 이제 둘 다 race.
  */
+/** boot 시점 env-based platform 감지 — clientInfo handshake 전에 brief 만들어야 해서.
+ * Claude Code만 안정적 detect 가능 (env AI_AGENT="claude-code/..."). Gemini/Codex는
+ * 표준 env 없어 null 반환 → cross-platform brief 폴백. */
+function detectBootPlatformFromEnv(): string | null {
+  const aiAgent = (process.env.AI_AGENT ?? "").toLowerCase();
+  if (aiAgent.startsWith("claude-code") || process.env.CLAUDE_CODE_ENTRYPOINT) {
+    return "claude-code";
+  }
+  return null;
+}
+
 async function buildInstructions(): Promise<string> {
   try {
     const work = (async () => {
       const { db } = await import("./db.js");
       await db.connect();
-      const brief = await collectBrief();
+      const currentPlatform = detectBootPlatformFromEnv();
+      const brief = await collectBrief({ currentPlatform });
       return formatBriefMarkdown(brief);
     })();
 

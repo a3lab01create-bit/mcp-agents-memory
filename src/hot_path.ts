@@ -12,7 +12,9 @@ import { db } from "./db.js";
 export interface HotPathInsertParams {
   user_id: number;                 // users.user_id FK
   agent_platform: string;          // 'claude-code' / 'codex' / ...
-  agent_model: string;             // 'opus-4-7' / 'gemini-3-pro' / ...
+  /** 'opus-4-7' / 'gemini-3-pro' / ... assistant 메시지 모델.
+   *  user role 메시지는 null (사람이 친 거라 model N/A — migration 021 이후). */
+  agent_model: string | null;
   subagent?: boolean;              // default false
   subagent_model?: string | null;
   subagent_role?: string | null;   // free-form, lowercase normalize 트리거가 자동 처리

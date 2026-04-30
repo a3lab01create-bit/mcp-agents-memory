@@ -211,11 +211,13 @@ async function flushDeltaForFile(
       continue;
     }
     const externalUuid = `claude-code:${fileState.sessionId}:${parsed.uuid}`;
+    // user role: agent_model = null (사람이 친 거, N/A). assistant: 모델 명 (없으면 'unknown').
+    const agentModel = parsed.role === 'user' ? null : (parsed.agent_model ?? 'unknown');
     try {
       const result = await insertRawMemory({
         user_id: userId,
         agent_platform: CLIENT_PLATFORM,
-        agent_model: parsed.agent_model ?? "unknown",
+        agent_model: agentModel,
         role: parsed.role,
         message: parsed.message,
         external_uuid: externalUuid,
