@@ -4,21 +4,32 @@
  * v0.x `transcript_capture.ts` 패턴 재도입. 단 새 `memory` 테이블에 직접 INSERT
  * (legacy `transcript_queue` X, librarian fact_type 추출 layer 없음).
  *
- * 흐름 (real-time, 4-30 fix):
- *   1. captureSessionStart(cwd) — server 시작 시 호출. 최신 JSONL 식별 +
- *      byte cursor 기록 + **fs.watch arm** (파일 grow 시 즉시 delta flush).
- *   2. 대화 중: JSONL append → fs.watch fire → debounce 200ms → flushDelta()
- *      가 cursor~EOF 읽고 INSERT, cursor 전진. ColdPath worker(60s tick)가
- *      살아있는 동안 자연스럽게 tag+embed 처리.
- *   3. captureSessionEnd() — server shutdown 시. watcher 닫고 final flush.
- *      (이 시점엔 대부분 이미 들어가있음, 마지막 1-2건만 잡힘)
+ * **Multi-file dir-watch 설계 (4-30 fix #2)**
  *
- * Claude Code 한정: ~/.claude/projects/<slug>/<session_id>.jsonl convention
- * 사용. Gemini CLI / Codex 등은 본 path 작동 안 함 — save_message tool로 대체.
+ * 단일 jsonl(latest-mtime)만 watch했더니 parallel 세션이 있을 때 엉뚱한 파일을
+ * 잡는 버그 발생 — 이 대화 jsonl이 mtime 더 최신이면 새로 띄운 세션 MCP가
+ * 자기 jsonl이 아닌 이 대화 jsonl을 봤음 → 자기 세션 entries 0건 INSERT.
+ *
+ * 해결: project dir 자체를 fs.watch + 디렉토리 안 모든 jsonl을 per-file cursor로
+ * 추적. 어느 jsonl이든 grow하면 delta INSERT. "내 세션 식별" 불필요.
+ *
+ * 흐름:
+ *   1. captureSessionStart(cwd) — projectDir 안 모든 jsonl 의 size 스냅샷
+ *      (각 파일 cursor = 시작 시점 size, 옛 entries는 backfill 안 함) +
+ *      dir 단위 fs.watch arm.
+ *   2. 대화 중: 어느 jsonl이든 append → fs.watch fire → 200ms debounce →
+ *      flushAllFiles() 가 dir 재 readdir, 각 jsonl 의 delta 읽고 INSERT,
+ *      per-file cursor 전진.
+ *   3. captureSessionEnd() — server shutdown 시 final flushAll. 보통 0건.
+ *
+ * 중복 안전망: external_uuid = `claude-code:<session_id>:<entry_uuid>` ON CONFLICT.
+ * parallel MCP 서버가 같은 jsonl 중복 캡처해도 dedup. 한 세션 = 1개 row.
+ *
+ * Claude Code 한정: ~/.claude/projects/<slug>/<session_id>.jsonl convention 사용.
+ * Gemini CLI / Codex 등은 본 path 작동 안 함 — save_message tool로 대체.
  *
  * Partial line 안전: fs.watch가 line 중간에 fire될 수 있어 마지막 \n까지만
- * parse + cursor 전진. \n 없는 trailing은 다음 flush에 남김. Dedup은
- * external_uuid (ON CONFLICT) 가 안전망.
+ * parse + cursor 전진. \n 없는 trailing은 다음 flush에 흡수.
  */
 
 import * as fs from "node:fs";
@@ -31,18 +42,23 @@ const CLIENT_PLATFORM = "claude-code"; // 본 모듈은 Claude Code 전용
 const PROJECTS_ROOT = path.join(os.homedir(), ".claude", "projects");
 const FLUSH_DEBOUNCE_MS = 200; // fs.watch 다중 fire coalescing
 
-interface SessionState {
-  cwd: string;
-  jsonlPath: string | null;
-  /** 다음 read 시작 byte offset. 초기값 = server 시작 시점 file size.
-   *  flushDelta 성공 후 마지막 \n 위치까지 전진. */
-  startByteOffset: number;
-  sessionId: string | null;
+interface FileState {
+  /** 다음 read 시작 byte offset. 초기값 = arm 시점 size (또는 신규 파일이면 0).
+   *  flushDeltaForFile 성공 후 마지막 \n 위치까지 전진. */
+  cursorBytes: number;
+  sessionId: string;
 }
 
-let _state: SessionState | null = null;
+interface DirState {
+  cwd: string;
+  projectDir: string | null;
+  /** jsonlPath → FileState. arm 시점에 존재한 파일 + 이후 발견된 신규 파일. */
+  files: Map<string, FileState>;
+}
 
-// --- live watcher state ---
+let _state: DirState | null = null;
+
+// --- watcher / mutex state ---
 let _watcher: fs.FSWatcher | null = null;
 let _flushInProgress = false;
 let _flushPending = false;
@@ -55,46 +71,38 @@ function deriveProjectDir(cwd: string): string {
 }
 
 /**
- * server 시작 시 호출. 현재 cwd의 최신 JSONL을 식별 + byte cursor 기록 +
- * fs.watch arm. 옛 entries는 backfill 안 함 (cursor = file size at start).
+ * server 시작 시 호출. projectDir 안 모든 jsonl size 스냅샷 + dir watcher arm.
+ * 옛 entries backfill 안 함 (cursor = 시작 시점 size).
  */
 export function captureSessionStart(cwd: string): void {
   const projectDir = deriveProjectDir(cwd);
+  _state = { cwd, projectDir: null, files: new Map() };
 
   if (!fs.existsSync(projectDir)) {
-    _state = { cwd, jsonlPath: null, startByteOffset: 0, sessionId: null };
+    return; // 비-Claude Code (Gemini / Codex) 또는 첫 세션 — no-op
+  }
+  _state.projectDir = projectDir;
+
+  // 기존 jsonl 모두 snapshot
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(projectDir, { withFileTypes: true });
+  } catch {
     return;
   }
 
-  // 최신 mtime jsonl 선택 (현재 active 세션)
-  let latest: { name: string; mtime: number } | null = null;
-  for (const entry of fs.readdirSync(projectDir, { withFileTypes: true })) {
+  for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
-    const stat = fs.statSync(path.join(projectDir, entry.name));
-    if (!latest || stat.mtimeMs > latest.mtime) {
-      latest = { name: entry.name, mtime: stat.mtimeMs };
-    }
+    const jsonlPath = path.join(projectDir, entry.name);
+    let stat: fs.Stats;
+    try { stat = fs.statSync(jsonlPath); } catch { continue; }
+    const sessionId = entry.name.replace(/\.jsonl$/, "");
+    _state.files.set(jsonlPath, { cursorBytes: stat.size, sessionId });
   }
 
-  if (!latest) {
-    _state = { cwd, jsonlPath: null, startByteOffset: 0, sessionId: null };
-    return;
-  }
+  console.error(`📝 [JSONL] capture armed: ${_state.files.size} jsonl(s) in ${path.basename(projectDir)}/`);
 
-  const jsonlPath = path.join(projectDir, latest.name);
-  const stat = fs.statSync(jsonlPath);
-  const sessionId = latest.name.replace(/\.jsonl$/, "");
-
-  _state = {
-    cwd,
-    jsonlPath,
-    startByteOffset: stat.size, // 시작 시점 size = 이후만 캡처
-    sessionId,
-  };
-
-  console.error(`📝 [JSONL] capture armed: session=${sessionId} from byte=${stat.size}`);
-
-  armWatcher();
+  armDirWatcher();
 }
 
 export interface ParsedEntry {
@@ -156,45 +164,43 @@ export function parseEntry(line: string): ParsedEntry | null {
 }
 
 /**
- * cursor부터 마지막 완성 line(`\n` 끝)까지 읽고 parse + INSERT, cursor 전진.
- * \n 없는 trailing partial은 그대로 남기고 다음 호출에 흡수.
+ * 한 jsonl 파일의 cursor부터 마지막 완성 line까지 읽고 INSERT, cursor 전진.
+ * \n 없는 trailing partial은 보류, 다음 호출에 흡수.
  */
-async function flushDelta(): Promise<{ inserted: number; skipped: number; dedup: number }> {
-  if (!_state || !_state.jsonlPath) return { inserted: 0, skipped: 0, dedup: 0 };
-  const { jsonlPath, sessionId } = _state;
-
+async function flushDeltaForFile(
+  jsonlPath: string,
+  fileState: FileState
+): Promise<{ inserted: number; skipped: number; dedup: number }> {
   if (!fs.existsSync(jsonlPath)) return { inserted: 0, skipped: 0, dedup: 0 };
 
-  const stat = fs.statSync(jsonlPath);
-  if (stat.size <= _state.startByteOffset) return { inserted: 0, skipped: 0, dedup: 0 };
+  let stat: fs.Stats;
+  try { stat = fs.statSync(jsonlPath); } catch { return { inserted: 0, skipped: 0, dedup: 0 }; }
 
-  const length = stat.size - _state.startByteOffset;
+  if (stat.size <= fileState.cursorBytes) return { inserted: 0, skipped: 0, dedup: 0 };
+
+  const length = stat.size - fileState.cursorBytes;
   const fd = fs.openSync(jsonlPath, "r");
   let raw: string;
   try {
     const buf = Buffer.alloc(length);
-    fs.readSync(fd, buf, 0, length, _state.startByteOffset);
+    fs.readSync(fd, buf, 0, length, fileState.cursorBytes);
     raw = buf.toString("utf-8");
   } finally {
     fs.closeSync(fd);
   }
 
-  // 마지막 \n 위치까지만 parse, 그 이후 partial은 보류
-  const lastNlInRaw = raw.lastIndexOf("\n");
-  if (lastNlInRaw === -1) {
-    // 완성 line 하나도 없음 — cursor 그대로 두고 next 호출 대기
-    return { inserted: 0, skipped: 0, dedup: 0 };
-  }
-  const parsableRaw = raw.slice(0, lastNlInRaw); // \n 미포함
-  const advanceBy = Buffer.byteLength(parsableRaw, "utf-8") + 1; // +1 = 그 \n
-  const newCursor = _state.startByteOffset + advanceBy;
+  // 마지막 \n까지만 parse, 그 이후 partial은 다음 호출에 보류
+  const lastNl = raw.lastIndexOf("\n");
+  if (lastNl === -1) return { inserted: 0, skipped: 0, dedup: 0 };
 
-  const lines = parsableRaw.split("\n");
+  const parsable = raw.slice(0, lastNl);
+  const advanceBy = Buffer.byteLength(parsable, "utf-8") + 1; // +1 = 그 \n
+  const newCursor = fileState.cursorBytes + advanceBy;
+
+  const lines = parsable.split("\n");
   const userId = await getDefaultUserId();
 
-  let inserted = 0;
-  let skipped = 0;
-  let dedup = 0;
+  let inserted = 0, skipped = 0, dedup = 0;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -204,7 +210,7 @@ async function flushDelta(): Promise<{ inserted: number; skipped: number; dedup:
       skipped++;
       continue;
     }
-    const externalUuid = sessionId ? `claude-code:${sessionId}:${parsed.uuid}` : `claude-code:${parsed.uuid}`;
+    const externalUuid = `claude-code:${fileState.sessionId}:${parsed.uuid}`;
     try {
       const result = await insertRawMemory({
         user_id: userId,
@@ -217,18 +223,54 @@ async function flushDelta(): Promise<{ inserted: number; skipped: number; dedup:
       if (result.inserted) inserted++;
       else dedup++;
     } catch (err) {
-      console.error(`⚠️ [JSONL] insert failed for entry ${parsed.uuid}:`, err);
+      console.error(`⚠️ [JSONL] insert failed for ${parsed.uuid}:`, err);
       skipped++;
     }
   }
 
-  // cursor 전진 (성공 INSERT 못해도 어차피 dedup 안전망 → re-read 무한루프 방지 위해 전진)
-  _state.startByteOffset = newCursor;
-
+  // cursor 전진 (성공 INSERT 못해도 dedup이 안전망 → 무한루프 방지 위해 전진)
+  fileState.cursorBytes = newCursor;
   return { inserted, skipped, dedup };
 }
 
-/** mutex로 직렬화된 flush — 동시 호출은 큐잉 (한 번 더 실행 약속). */
+/** dir 안 모든 jsonl 순회 + 신규 파일 발견 시 추가, 각각 flushDeltaForFile. */
+async function flushAllFiles(): Promise<{ inserted: number; skipped: number; dedup: number }> {
+  if (!_state || !_state.projectDir) return { inserted: 0, skipped: 0, dedup: 0 };
+  const projectDir = _state.projectDir;
+  if (!fs.existsSync(projectDir)) return { inserted: 0, skipped: 0, dedup: 0 };
+
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(projectDir, { withFileTypes: true });
+  } catch {
+    return { inserted: 0, skipped: 0, dedup: 0 };
+  }
+
+  let totalI = 0, totalS = 0, totalD = 0;
+
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+    const jsonlPath = path.join(projectDir, entry.name);
+
+    let fileState = _state.files.get(jsonlPath);
+    if (!fileState) {
+      // arm 이후 신규 jsonl — cursor 0부터 전체 캡처
+      const sessionId = entry.name.replace(/\.jsonl$/, "");
+      fileState = { cursorBytes: 0, sessionId };
+      _state.files.set(jsonlPath, fileState);
+      console.error(`📝 [JSONL] new session detected: ${entry.name}`);
+    }
+
+    const r = await flushDeltaForFile(jsonlPath, fileState);
+    totalI += r.inserted;
+    totalS += r.skipped;
+    totalD += r.dedup;
+  }
+
+  return { inserted: totalI, skipped: totalS, dedup: totalD };
+}
+
+/** mutex 직렬화된 flush — 동시 호출은 큐잉 (한 번 더 실행 약속). */
 async function flushWithMutex(): Promise<void> {
   if (_flushInProgress) {
     _flushPending = true;
@@ -236,9 +278,9 @@ async function flushWithMutex(): Promise<void> {
   }
   _flushInProgress = true;
   try {
-    const { inserted, skipped, dedup } = await flushDelta();
-    if (inserted > 0 || skipped > 0 || dedup > 0) {
-      console.error(`📝 [JSONL] live flush: inserted=${inserted}, dedup=${dedup}, skipped=${skipped}`);
+    const r = await flushAllFiles();
+    if (r.inserted > 0 || r.skipped > 0 || r.dedup > 0) {
+      console.error(`📝 [JSONL] live flush: inserted=${r.inserted}, dedup=${r.dedup}, skipped=${r.skipped}`);
     }
   } catch (err) {
     console.error("⚠️ [JSONL] live flush error:", err);
@@ -246,7 +288,6 @@ async function flushWithMutex(): Promise<void> {
     _flushInProgress = false;
     if (_flushPending) {
       _flushPending = false;
-      // 다음 microtask에 재진입 — 재귀 stack 회피
       setImmediate(() => { void flushWithMutex(); });
     }
   }
@@ -261,25 +302,23 @@ function scheduleFlush(): void {
   }, FLUSH_DEBOUNCE_MS);
 }
 
-function armWatcher(): void {
-  if (!_state || !_state.jsonlPath) return;
+function armDirWatcher(): void {
+  if (!_state || !_state.projectDir) return;
   if (_watcher) return; // 이미 arm됨
   try {
-    _watcher = fs.watch(_state.jsonlPath, (eventType) => {
-      if (eventType === "change") {
-        scheduleFlush();
-      } else if (eventType === "rename") {
-        // 파일 rotate/삭제 — watcher 닫음 (final flush는 captureSessionEnd가 처리)
-        disarmWatcher();
-      }
+    _watcher = fs.watch(_state.projectDir, (_eventType, filename) => {
+      // change: 파일 grow / rename: 파일 생성·삭제·이동. 어느쪽이든 flush 트리거.
+      // filename이 없거나 jsonl 외 파일 변경이면 skip (subdir 등).
+      if (filename && !filename.endsWith(".jsonl")) return;
+      scheduleFlush();
     });
-    console.error(`📝 [JSONL] live watcher armed`);
+    console.error(`📝 [JSONL] dir watcher armed`);
   } catch (err) {
-    console.error("⚠️ [JSONL] fs.watch failed (shutdown-only flush 폴백):", err);
+    console.error("⚠️ [JSONL] fs.watch dir failed (shutdown-only flush 폴백):", err);
   }
 }
 
-function disarmWatcher(): void {
+function disarmDirWatcher(): void {
   if (_flushDebounceTimer) {
     clearTimeout(_flushDebounceTimer);
     _flushDebounceTimer = null;
@@ -291,11 +330,10 @@ function disarmWatcher(): void {
 }
 
 /**
- * server shutdown 시 호출. watcher 닫고 final flush.
- * 실패는 best-effort (shutdown 막지 않음).
+ * server shutdown 시 호출. watcher 닫고 final flushAll. 실패는 best-effort.
  */
 export async function captureSessionEnd(): Promise<{ inserted: number; skipped: number; error?: string }> {
-  disarmWatcher();
+  disarmDirWatcher();
 
   // 진행 중 flush 마무리 대기 (최대 2s — shutdown 자체 timeout 안에서)
   const waitStart = Date.now();
@@ -303,20 +341,17 @@ export async function captureSessionEnd(): Promise<{ inserted: number; skipped: 
     await new Promise((r) => setTimeout(r, 50));
   }
 
-  if (!_state || !_state.jsonlPath) {
+  if (!_state || !_state.projectDir) {
     return { inserted: 0, skipped: 0, error: "session not armed" };
-  }
-  if (!fs.existsSync(_state.jsonlPath)) {
-    return { inserted: 0, skipped: 0, error: "jsonl missing" };
   }
 
   _flushInProgress = true;
   try {
-    const result = await flushDelta();
-    if (result.inserted > 0 || result.skipped > 0 || result.dedup > 0) {
-      console.error(`📝 [JSONL] final flush session=${_state.sessionId}: inserted=${result.inserted}, dedup=${result.dedup}, skipped=${result.skipped}`);
+    const r = await flushAllFiles();
+    if (r.inserted > 0 || r.skipped > 0 || r.dedup > 0) {
+      console.error(`📝 [JSONL] final flush: inserted=${r.inserted}, dedup=${r.dedup}, skipped=${r.skipped}`);
     }
-    return { inserted: result.inserted, skipped: result.skipped };
+    return { inserted: r.inserted, skipped: r.skipped };
   } finally {
     _flushInProgress = false;
   }
@@ -324,7 +359,7 @@ export async function captureSessionEnd(): Promise<{ inserted: number; skipped: 
 
 /** state reset (test용 / restart). */
 export function resetCaptureState(): void {
-  disarmWatcher();
+  disarmDirWatcher();
   _state = null;
   _flushInProgress = false;
   _flushPending = false;
