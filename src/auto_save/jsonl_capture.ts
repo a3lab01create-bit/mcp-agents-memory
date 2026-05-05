@@ -64,10 +64,64 @@ let _flushInProgress = false;
 let _flushPending = false;
 let _flushDebounceTimer: NodeJS.Timeout | null = null;
 
-/** project dir 이름 derivation: cwd → ~/.claude/projects/<slug> */
-function deriveProjectDir(cwd: string): string {
-  const slug = cwd.replace(/^\/+/, "").replace(/\//g, "-").replace(/^-+/, "-");
-  return path.join(PROJECTS_ROOT, `-${slug}`);
+/**
+ * ~/.claude/projects/ 하위 디렉토리를 스캔해서 cwd가 일치하는 실제 project dir 탐색.
+ * slug 알고리즘 역추측 없이 JSONL 엔트리의 cwd 필드로 직접 매칭.
+ */
+function findProjectDir(cwd: string): string | null {
+  let subdirs: fs.Dirent[];
+  try {
+    subdirs = fs.readdirSync(PROJECTS_ROOT, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  for (const subdir of subdirs) {
+    if (!subdir.isDirectory()) continue;
+    const dirPath = path.join(PROJECTS_ROOT, subdir.name);
+
+    let files: fs.Dirent[];
+    try {
+      files = fs.readdirSync(dirPath, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    const jsonlFile = files.find((f) => f.isFile() && f.name.endsWith(".jsonl"));
+    if (!jsonlFile) continue;
+
+    const foundCwd = readCwdFromJsonl(path.join(dirPath, jsonlFile.name));
+    if (foundCwd === cwd) return dirPath;
+  }
+
+  return null;
+}
+
+/** JSONL 파일 첫 2KB에서 cwd 필드를 읽어 반환. 없으면 null. */
+function readCwdFromJsonl(jsonlPath: string): string | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(jsonlPath, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const buf = Buffer.alloc(2048);
+    const bytesRead = fs.readSync(fd, buf, 0, 2048, 0);
+    const raw = buf.slice(0, bytesRead).toString("utf-8");
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (typeof entry.cwd === "string") return entry.cwd;
+      } catch {
+        // partial line — skip
+      }
+    }
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /**
@@ -75,11 +129,11 @@ function deriveProjectDir(cwd: string): string {
  * 옛 entries backfill 안 함 (cursor = 시작 시점 size).
  */
 export function captureSessionStart(cwd: string): void {
-  const projectDir = deriveProjectDir(cwd);
   _state = { cwd, projectDir: null, files: new Map() };
 
-  if (!fs.existsSync(projectDir)) {
-    return; // 비-Claude Code (Gemini / Codex) 또는 첫 세션 — no-op
+  const projectDir = findProjectDir(cwd);
+  if (!projectDir) {
+    return; // 비-Claude Code (Gemini / Codex) 또는 디렉토리 아직 없음
   }
   _state.projectDir = projectDir;
 
