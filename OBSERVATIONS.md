@@ -77,6 +77,12 @@ ssh key path 설정해주면서 절대경로 로 지정해줘야한다는 코멘
 
 동일 에이전트 동일모델로 다양한 기기에서 접속할때  기기명도 가져와서 대화내역이 정확히 어떤 기기에서 이루어 졌는지도 넣어주면 더 좋을듯
 
+**구현 아이디어**
+- `os.hostname()`으로 MCP 서버 시작 시점에 기기명 캡처 (Node.js 기본 제공)
+- `memory` 테이블에 `device_name` 컬럼 추가 (migration) — row 단위로 기기 기록
+- briefing에서 `claude-code @ Mac-Studio`, `claude-code @ t460-server` 식으로 표시 가능
+- 별도 `devices` 테이블 정규화는 오버엔지니어링 — 컬럼 추가로 충분
+
 --------------
 
 ## §6. p_tag 미등록 문제 — tag_processed 구조의 부작용
