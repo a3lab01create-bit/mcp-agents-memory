@@ -1,7 +1,7 @@
 /**
  * Role-based Model Registry — RESPEC v1.
  *
- * Providers: openai + google only (RESPEC §결정 — gemini + gpt만 유지).
+ * Providers: openai + xai + google (xai default — grok 사용).
  * Roles:
  *   - tagger    (Cold Path: predefined p_tag + dynamic d_tag 추출)
  *   - librarian (memory → user.core/sub_profile promote)
@@ -67,8 +67,8 @@ export function inferProvider(modelName: string): Provider | null {
 // ─────────────────────────────────────────────────────────────
 
 const DEFAULTS: Record<Role, ModelSpec> = {
-  tagger:    { provider: 'google', model_name: 'gemini-2.5-flash' },
-  librarian: { provider: 'google', model_name: 'gemini-2.5-flash' },
+  tagger:    { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' },
+  librarian: { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' },
 };
 
 function envEnvelope(role: Role): ModelSpec {

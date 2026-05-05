@@ -1,7 +1,7 @@
 /**
  * Cold Path Tagger — predefined p_tag + dynamic d_tag 추출.
  *
- * Model: gemini-2.5-flash (RESPEC §결정 5)
+ * Model: grok-4-1-fast-non-reasoning (default; env TAGGER_MODEL/TAGGER_PROVIDER으로 오버라이드 가능)
  * Prompt 핵심:
  *   - 기존 project_tags 후보 보고 매칭 우선 (§(1-A) explosion 방어)
  *   - role='assistant'면 "user 사실로 단정 X" 명시 (§(1-A) hallucination 방어)

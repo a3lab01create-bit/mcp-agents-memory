@@ -199,7 +199,7 @@ Configuration is loaded from (first hit wins):
 Required settings:
   DATABASE_URL=postgres://user:pass@host:5432/db?sslmode=require   (or DB_HOST + DB_USER + DB_PASS + DB_NAME)
   OPENAI_API_KEY=sk-...                                            (embedding text-embedding-3-large)
-  GEMINI_API_KEY=...                                               (Cold Path tagger gemini-2.5-flash)`);
+  XAI_API_KEY=...                                                  (Cold Path tagger/librarian — grok-4-1-fast-non-reasoning default)`);
 }
 
 async function runMcpServer() {
