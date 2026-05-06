@@ -20,8 +20,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export function configSearchPaths(): string[] {
   const paths: string[] = [];
   if (process.env.MEMORY_CONFIG_PATH) paths.push(process.env.MEMORY_CONFIG_PATH);
-  paths.push(path.resolve(process.cwd(), '.env'));
   paths.push(path.join(os.homedir(), '.config', 'mcp-agents-memory', '.env'));
+  paths.push(path.resolve(process.cwd(), '.env'));
   paths.push(path.resolve(__dirname, '..', '.env'));
   return paths;
 }
