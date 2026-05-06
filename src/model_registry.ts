@@ -18,7 +18,7 @@ import OpenAI from "openai";
 // ─────────────────────────────────────────────────────────────
 
 export type Provider = 'openai' | 'google' | 'xai';
-export type Role = 'tagger' | 'librarian';
+export type Role = 'tagger' | 'librarian' | 'clusterer';
 
 export interface ModelSpec {
   provider: Provider;
@@ -69,6 +69,7 @@ export function inferProvider(modelName: string): Provider | null {
 const DEFAULTS: Record<Role, ModelSpec> = {
   tagger:    { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' },
   librarian: { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' },
+  clusterer: { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' },
 };
 
 function envEnvelope(role: Role): ModelSpec {
@@ -99,6 +100,7 @@ function envEnvelope(role: Role): ModelSpec {
 export const ROLE_REGISTRY: Record<Role, ModelSpec> = {
   tagger:    envEnvelope('tagger'),
   librarian: envEnvelope('librarian'),
+  clusterer: envEnvelope('clusterer'),
 };
 
 // Validate at module load — surfaces provider/model mismatch immediately.

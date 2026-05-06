@@ -79,15 +79,15 @@ ssh key path 설정해주면서 절대경로 로 지정해줘야한다는 코멘
 
 --------------
 
-## §5. 접속기기
+## §5. 접속기기 ✅ SHIPPED (v0.9.3)
 
 동일 에이전트 동일모델로 다양한 기기에서 접속할때  기기명도 가져와서 대화내역이 정확히 어떤 기기에서 이루어 졌는지도 넣어주면 더 좋을듯
 
-**구현 아이디어**
-- `os.hostname()`으로 MCP 서버 시작 시점에 기기명 캡처 (Node.js 기본 제공)
-- `memory` 테이블에 `device_name` 컬럼 추가 (migration) — row 단위로 기기 기록
-- briefing에서 `claude-code @ Mac-Studio`, `claude-code @ t460-server` 식으로 표시 가능
-- 별도 `devices` 테이블 정규화는 오버엔지니어링 — 컬럼 추가로 충분
+**구현 완료**
+- `os.hostname()`으로 모듈 로드 시점에 기기명 캡처 (모든 캡처 모듈 공통)
+- migration 022: `memory` 테이블에 `device_name TEXT` 컬럼 추가
+- jsonl_capture / codex_capture / gemini_capture / save_message / manage_knowledge — 모두 `device_name` 주입
+- briefing: `claude-code @ Mac-Studio` 형식으로 platform 헤더 + 개별 메시지 라인에 표시
 
 --------------
 
@@ -112,11 +112,58 @@ ssh key path 설정해주면서 절대경로 로 지정해줘야한다는 코멘
 - AI 없이 순수 통계: 동일 d_tag가 N회 이상 반복 → `project_tags` 자동 INSERT → 미태깅 row 소급 업데이트
 - 과금 없음, 오판 없음. 단점: 첫 등장 때는 무조건 늦음
 
-**권장 방향 — A + B 조합**
+**권장 방향 — A + C 조합 ✅ SHIPPED (v0.9.3)**
 - AI(Grok)는 지금처럼 보수적 유지 (explosion 방어)
-- d_tag 빈도 기반 승급 레이어를 별도로 추가
-- 첫 등장은 느리지만 안전, 반복되면 자동으로 p_tag 생성
-- N 임계값, 기간 윈도우, 소급 업데이트 범위 등은 추가 설계 필요
+- `src/cold_path/dtag_promoter.ts` 신설 — LLM 클러스터링 기반 승급
+  - `clusterer` role 추가 (model_registry) — grok-4-1-fast-non-reasoning, ~100 토큰/회
+  - 빈도 집계 후 LLM이 의미 유사 d_tag를 클러스터로 묶어 합산 (`yt-viral-signal` + `yt-signal-finder` → 합산)
+  - `DTAG_PROMOTE_MIN_COUNT` (default **10**) — 클러스터 합산 기준이라 exact보다 높게 설정
+  - `DTAG_PROMOTE_WINDOW_DAYS` (default 30)
+  - `DTAG_PROMOTE_ENABLED=false` 로 disable
+  - LLM 실패 시 단독 클러스터 fallback (non-blocking)
+- worker.ts: 매 10 tick마다 promoter 실행
+- 소급 업데이트: 클러스터 멤버 d_tag 보유 + `p_tag_id IS NULL` 인 row 전부 fill
+- tagger candidate cache 즉시 무효화 → 다음 turn부터 새 tag가 candidate list에
+
+--------------
+
+## §8. agent 능동적 자원 활용 부재
+
+**현상**
+- 메모리/웹/문서 등 자원이 연결돼 있어도 agent가 스스로 찾아보지 않음
+- 업무 참고자료를 줘도 확인 안 하고 진행, memory 연결돼있어도 mid-session search 안 함
+- Copilot처럼 웹페이지 연결돼있어도 페이지 내용을 안 보는 경우
+
+**본질**
+- LLM은 기본적으로 reactive(반응형) — "지금 이걸 봐야겠다"는 능동 판단 없음
+- memory_startup 자동 주입처럼 강제로 넣어주지 않으면 있는 자원도 안 씀
+- mcp-agents-memory만의 문제가 아닌 agent 설계 전반의 구조적 한계
+
+**방향**
+- [ ] mid-session에서 agent가 스스로 search_memory 호출하는 트리거 설계
+- [ ] CLAUDE.md 또는 system prompt 레벨에서 "X 전에 반드시 Y 확인" 규칙 주입
+- [ ] §7 역할별 mcp 아이디어와 연결 — 역할마다 "봐야 할 자원" 명시화
+
+--------------
+
+## §9. memory_startup brief 품질 문제
+
+**현상**
+- 새 세션에서 agent가 핵심 맥락(예: Claude 별명 "쿠름")을 모르는 경우 발생
+- brief가 중간에 잘림: `N… [truncated]`
+- 기기마다 기억이 다름 (t460 vs Mac Studio)
+
+**원인 분석**
+
+1. **brief 잘림**: `memory_startup`이 생성하는 brief가 MCP server instructions 허용 길이를 초과 → Claude Code가 truncate
+2. **기기간 불일치**: 핵심 정보(별명, 선호 등)가 mcp-agents-memory DB에는 있어도 startup brief에 우선순위로 포함 안 될 수 있음. Claude Code auto-memory(MEMORY.md)는 로컬 파일이라 기기마다 다름
+3. **요약 품질**: brief가 최근 프로젝트 상태 위주로 구성되어 "항상 알아야 할 것"이 밀려남
+
+**방향 아이디어**
+- [ ] brief 생성 시 "핵심 프로필 항목"을 최상단 고정 (잘려도 살아남게)
+- [ ] brief 총 길이 상한 명시적 제어 (truncate 방지)
+- [ ] Claude Code auto-memory(MEMORY.md)와 DB 기억 간 sync 전략 검토
+- [ ] "항상 알아야 할 것" (is_pinned) 항목은 brief에서 절대 생략 안 하는 규칙
 
 --------------
 

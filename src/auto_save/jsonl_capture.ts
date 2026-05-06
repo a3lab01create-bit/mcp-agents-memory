@@ -39,6 +39,7 @@ import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
 
 const CLIENT_PLATFORM = "claude-code"; // 본 모듈은 Claude Code 전용
+const DEVICE_NAME = os.hostname();
 const PROJECTS_ROOT = path.join(os.homedir(), ".claude", "projects");
 const FLUSH_DEBOUNCE_MS = 200; // fs.watch 다중 fire coalescing
 
@@ -275,6 +276,7 @@ async function flushDeltaForFile(
         role: parsed.role,
         message: parsed.message,
         external_uuid: externalUuid,
+        device_name: DEVICE_NAME,
       });
       if (result.inserted) inserted++;
       else dedup++;

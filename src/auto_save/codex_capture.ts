@@ -19,40 +19,63 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { spawnSync } from "node:child_process";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
 
-const CLIENT_PLATFORM = "codex-mcp-client";
+const DEVICE_NAME = os.hostname();
 const SESSIONS_ROOT = path.join(os.homedir(), ".codex", "sessions");
+const STATE_DB = path.join(os.homedir(), ".codex", "state_5.sqlite");
 const FLUSH_DEBOUNCE_MS = 200;
+const POLL_INTERVAL_MS = 3000; // OS 버퍼링 우회 — fs.watch 미발화 보완
+
+/** state_5.sqlite threads.source → agent_platform 매핑 */
+function sourceToPlatform(source: string): string {
+  switch (source) {
+    case "cli":    return "codex-cli";
+    case "vscode": return "codex-desktop";
+    case "mcp":    return "codex-mcp";
+    case "exec":   return "codex-exec";
+    default:       return "codex-mcp-client";
+  }
+}
+
+/** sessionId로 state_5.sqlite 조회 → platform string. 실패 시 default. */
+function lookupPlatform(sessionId: string): string {
+  try {
+    const res = spawnSync(
+      "sqlite3",
+      [STATE_DB, `SELECT source FROM threads WHERE id='${sessionId}' LIMIT 1;`],
+      { encoding: "utf-8", timeout: 500 },
+    );
+    const source = (res.stdout ?? "").trim();
+    if (source) return sourceToPlatform(source);
+  } catch {}
+  return "codex-mcp-client";
+}
 
 interface FileState {
   /** 다음 read 시작 byte. arm 시점 size 또는 신규 발견 파일이면 0. */
   cursorBytes: number;
   /** rollout 파일명에서 추출한 session UUID. */
   sessionId: string;
-  /**
-   * cwd 매칭 결과:
-   *   - null: 아직 session_meta line 못 봄 (probe 실패 또는 미존재)
-   *   - true: session_meta cwd가 server cwd와 일치 → INSERT 대상
-   *   - false: 불일치 → cursor만 진전, INSERT skip
-   */
-  cwdMatched: boolean | null;
+  /** state_5.sqlite source → platform (cli→codex-cli, vscode→codex-desktop …). */
+  agentPlatform: string;
   /** 마지막으로 본 turn_context.payload.model (없으면 null → 'unknown'). */
   currentModel: string | null;
 }
 
 interface DirState {
-  cwd: string;
-  /** 정규화된 server cwd (path.resolve 결과). cwd 비교용. */
-  cwdNormalized: string;
   rootExists: boolean;
   files: Map<string, FileState>;
 }
 
 let _state: DirState | null = null;
+/** 서버 시작 시각 (ms). 이보다 이전에 생성된 파일의 기존 내용은 skip. */
+const SERVER_START_MS = Date.now();
 
 let _watcher: fs.FSWatcher | null = null;
+let _pollTimer: NodeJS.Timeout | null = null;
 let _flushInProgress = false;
 let _flushPending = false;
 let _flushDebounceTimer: NodeJS.Timeout | null = null;
@@ -63,32 +86,6 @@ function extractSessionId(filename: string): string | null {
   return m ? m[1] : null;
 }
 
-/**
- * file 첫 줄 (session_meta) 한 번 읽어 cwd / sessionId 추출.
- * 실패 시 null (file이 너무 작거나 첫 줄이 session_meta 아님).
- */
-function probeSessionMeta(filePath: string): { sessionId: string; cwd: string } | null {
-  let fd: number;
-  try { fd = fs.openSync(filePath, "r"); } catch { return null; }
-  try {
-    const buf = Buffer.alloc(8192);
-    const n = fs.readSync(fd, buf, 0, 8192, 0);
-    if (n === 0) return null;
-    const slice = buf.slice(0, n).toString("utf-8");
-    const nl = slice.indexOf("\n");
-    if (nl === -1) return null;
-    const entry = JSON.parse(slice.slice(0, nl));
-    if (entry.type !== "session_meta") return null;
-    const sid = entry.payload?.id;
-    const cwd = entry.payload?.cwd;
-    if (typeof sid !== "string" || typeof cwd !== "string") return null;
-    return { sessionId: sid, cwd };
-  } catch {
-    return null;
-  } finally {
-    try { fs.closeSync(fd); } catch {}
-  }
-}
 
 /**
  * sessions root 아래 모든 rollout-*.jsonl 경로 yield (재귀 walk).
@@ -119,12 +116,9 @@ function* walkRollouts(root: string): Generator<string> {
   }
 }
 
-export function captureSessionStart(cwd: string): void {
-  const cwdNormalized = path.resolve(cwd);
+export function captureSessionStart(_cwd: string): void {
   const rootExists = fs.existsSync(SESSIONS_ROOT);
   _state = {
-    cwd,
-    cwdNormalized,
     rootExists,
     files: new Map(),
   };
@@ -133,31 +127,24 @@ export function captureSessionStart(cwd: string): void {
     return;
   }
 
-  // 기존 rollout snapshot — cursor = 현재 size, cwd 매칭은 probe로 결정
-  let count = 0, matched = 0;
+  // 기존 rollout snapshot — cursor = 현재 size (pre-existing 내용 bulk dump 방지)
+  let count = 0;
   for (const filePath of walkRollouts(SESSIONS_ROOT)) {
     let stat: fs.Stats;
     try { stat = fs.statSync(filePath); } catch { continue; }
     const sessionId = extractSessionId(path.basename(filePath));
     if (!sessionId) continue;
 
-    const meta = probeSessionMeta(filePath);
-    let cwdMatched: boolean | null = null;
-    if (meta) {
-      cwdMatched = path.resolve(meta.cwd) === cwdNormalized;
-    }
-
     _state.files.set(filePath, {
       cursorBytes: stat.size,
       sessionId,
-      cwdMatched,
+      agentPlatform: lookupPlatform(sessionId),
       currentModel: null,
     });
     count++;
-    if (cwdMatched) matched++;
   }
 
-  console.error(`📝 [Codex] capture armed: ${count} rollout(s), ${matched} cwd-matched`);
+  console.error(`📝 [Codex] capture armed: ${count} rollout(s)`);
   armDirWatcher();
 }
 
@@ -198,6 +185,12 @@ export function parseEntry(line: string, byteOffset: number): ParsedEntry | null
   const message = typeof payload.message === "string" ? payload.message.trim() : "";
   if (!message) return null;
 
+  // Codex agent_message에는 tool call 로그가 섞임 — 메모리 노이즈 제거
+  if (message.startsWith("[external_agent_tool_call:") ||
+      message.startsWith("[external_agent_tool_call_response:")) {
+    return null;
+  }
+
   return { byteOffset, role, message };
 }
 
@@ -215,25 +208,9 @@ function extractModelFromTurnContext(line: string): string | null {
   }
 }
 
-/**
- * session_meta line이 이전에 probe 실패했을 때, delta read 중 발견되면 cwd 판정.
- * (file이 처음 생긴 직후 watcher가 fire하면 probe보다 line 통과가 먼저일 수 있음)
- */
-function applySessionMetaIfPresent(line: string, fileState: FileState, cwdNormalized: string): void {
-  if (fileState.cwdMatched !== null) return;
-  try {
-    const entry = JSON.parse(line);
-    if (entry.type !== "session_meta") return;
-    const cwd = entry.payload?.cwd;
-    if (typeof cwd !== "string") return;
-    fileState.cwdMatched = path.resolve(cwd) === cwdNormalized;
-  } catch {}
-}
-
 async function flushDeltaForFile(
   filePath: string,
   fileState: FileState,
-  cwdNormalized: string
 ): Promise<{ inserted: number; skipped: number; dedup: number }> {
   if (!fs.existsSync(filePath)) return { inserted: 0, skipped: 0, dedup: 0 };
 
@@ -273,19 +250,10 @@ async function flushDeltaForFile(
       continue;
     }
 
-    // session_meta가 늦게 흘러들어왔으면 cwd 판정 update
-    applySessionMetaIfPresent(trimmed, fileState, cwdNormalized);
-
     // turn_context면 model 갱신만 하고 다음
     const m = extractModelFromTurnContext(trimmed);
     if (m !== null) {
       fileState.currentModel = m;
-      lineStartInRaw += Buffer.byteLength(line, "utf-8") + 1;
-      continue;
-    }
-
-    // cwd 불일치 file이면 INSERT skip (cursor만 진전)
-    if (fileState.cwdMatched === false) {
       lineStartInRaw += Buffer.byteLength(line, "utf-8") + 1;
       continue;
     }
@@ -298,14 +266,6 @@ async function flushDeltaForFile(
       continue;
     }
 
-    // cwd 미정 (cwdMatched===null)이면 안전상 보류 — 다음 flush에 재시도 안 함.
-    // session_meta 한 번도 못 본 jsonl은 의심스러우니 INSERT skip.
-    if (fileState.cwdMatched !== true) {
-      skipped++;
-      lineStartInRaw += Buffer.byteLength(line, "utf-8") + 1;
-      continue;
-    }
-
     const externalUuid = `codex:${fileState.sessionId}:${parsed.byteOffset}`;
     const agentModel =
       parsed.role === "user" ? null : (fileState.currentModel ?? "unknown");
@@ -313,11 +273,12 @@ async function flushDeltaForFile(
     try {
       const result = await insertRawMemory({
         user_id: userId,
-        agent_platform: CLIENT_PLATFORM,
+        agent_platform: fileState.agentPlatform,
         agent_model: agentModel,
         role: parsed.role,
         message: parsed.message,
         external_uuid: externalUuid,
+        device_name: DEVICE_NAME,
       });
       if (result.inserted) inserted++;
       else dedup++;
@@ -335,27 +296,39 @@ async function flushDeltaForFile(
 
 async function flushAllFiles(): Promise<{ inserted: number; skipped: number; dedup: number }> {
   if (!_state || !_state.rootExists) return { inserted: 0, skipped: 0, dedup: 0 };
-  const cwdNormalized = _state.cwdNormalized;
 
   let totalI = 0, totalS = 0, totalD = 0;
 
   for (const filePath of walkRollouts(SESSIONS_ROOT)) {
     let fileState = _state.files.get(filePath);
     if (!fileState) {
-      // 신규 파일 — cursor 0, 곧이어 session_meta delta-read로 cwd 판정
       const sessionId = extractSessionId(path.basename(filePath));
       if (!sessionId) continue;
+
+      // 서버 시작 이전에 이미 존재하던 파일 → 기존 내용 skip (cursor = 현재 size).
+      // Codex Desktop이 과거 세션을 bulk dump할 때 오래된 내용이 대량 삽입되는 것 방지.
+      let stat: fs.Stats | null = null;
+      try { stat = fs.statSync(filePath); } catch {}
+      const fileBirthMs = stat ? stat.birthtimeMs || stat.ctimeMs : SERVER_START_MS;
+      const isPreExisting = fileBirthMs < SERVER_START_MS - 5000; // 5s 여유
+      const initialCursor = isPreExisting ? (stat?.size ?? 0) : 0;
+
+      if (isPreExisting) {
+        console.error(`📝 [Codex] pre-existing rollout skipped (cursor=${initialCursor}): ${path.basename(filePath)}`);
+      } else {
+        console.error(`📝 [Codex] new rollout detected: ${path.basename(filePath)}`);
+      }
+
       fileState = {
-        cursorBytes: 0,
+        cursorBytes: initialCursor,
         sessionId,
-        cwdMatched: null,
+        agentPlatform: lookupPlatform(sessionId),
         currentModel: null,
       };
       _state.files.set(filePath, fileState);
-      console.error(`📝 [Codex] new rollout detected: ${path.basename(filePath)}`);
     }
 
-    const r = await flushDeltaForFile(filePath, fileState, cwdNormalized);
+    const r = await flushDeltaForFile(filePath, fileState);
     totalI += r.inserted;
     totalS += r.skipped;
     totalD += r.dedup;
@@ -406,14 +379,20 @@ function armDirWatcher(): void {
     });
     console.error(`📝 [Codex] dir watcher armed (recursive)`);
   } catch (err) {
-    console.error("⚠️ [Codex] fs.watch failed (shutdown-only flush 폴백):", err);
+    console.error("⚠️ [Codex] fs.watch failed — polling only:", err);
   }
+  // OS 버퍼링으로 fs.watch 이벤트 누락될 수 있음 → 폴링으로 보완
+  _pollTimer = setInterval(() => { void flushWithMutex(); }, POLL_INTERVAL_MS);
 }
 
 function disarmDirWatcher(): void {
   if (_flushDebounceTimer) {
     clearTimeout(_flushDebounceTimer);
     _flushDebounceTimer = null;
+  }
+  if (_pollTimer) {
+    clearInterval(_pollTimer);
+    _pollTimer = null;
   }
   if (_watcher) {
     try { _watcher.close(); } catch {}

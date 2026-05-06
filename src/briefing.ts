@@ -17,6 +17,7 @@
  *     (없으면 8건 cross-platform)
  */
 
+import * as os from "node:os";
 import { db } from "./db.js";
 import { getDefaultUserId } from "./users.js";
 
@@ -28,6 +29,7 @@ const ACTIVE_PTAG_LIMIT = 5;            // 활성 프로젝트 태그 top N
 export interface BriefMessage {
   role: string;
   agent_platform: string;
+  device_name: string | null;
   preview: string;
   created_at: Date;
 }
@@ -89,7 +91,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
   if (currentPlatform) {
     // current platform 메시지 우선
     const currentMsgs = await db.query(
-      `SELECT role, agent_platform, message, created_at
+      `SELECT role, agent_platform, device_name, message, created_at
          FROM memory
         WHERE user_id = $1
           AND is_active = TRUE
@@ -103,7 +105,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
 
     // other platforms 메시지 (preview)
     const othersMsgs = await db.query(
-      `SELECT role, agent_platform, message, created_at
+      `SELECT role, agent_platform, device_name, message, created_at
          FROM memory
         WHERE user_id = $1
           AND is_active = TRUE
@@ -117,7 +119,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
   } else {
     // cross-platform 통합 brief (legacy 동작)
     const msgs = await db.query(
-      `SELECT role, agent_platform, message, created_at
+      `SELECT role, agent_platform, device_name, message, created_at
          FROM memory
         WHERE user_id = $1
           AND is_active = TRUE
@@ -149,6 +151,7 @@ function rowToMsg(r: any): BriefMessage {
   return {
     role: r.role,
     agent_platform: r.agent_platform,
+    device_name: r.device_name ?? null,
     preview: String(r.message ?? '').slice(0, RECENT_MESSAGE_PREVIEW),
     created_at: r.created_at,
   };
@@ -159,7 +162,7 @@ export function formatBriefMarkdown(brief: BriefData): string {
   const lines: string[] = [];
   lines.push(`# Memory Briefing (user: ${brief.user_name})`);
   if (brief.current_platform) {
-    lines.push(`Current platform: \`${brief.current_platform}\``);
+    lines.push(`Current platform: \`${brief.current_platform} @ ${os.hostname()}\``);
   }
   lines.push("");
 
@@ -215,7 +218,8 @@ export function formatBriefMarkdown(brief: BriefData): string {
 
 function formatMsgLine(m: BriefMessage, showPlatform: boolean): string {
   const dt = m.created_at?.toISOString?.().slice(11, 16) ?? '';
-  const platformTag = showPlatform ? `${m.agent_platform} ` : '';
+  const device = m.device_name ? `@${m.device_name} ` : '';
+  const platformTag = showPlatform ? `${m.agent_platform} ${device}` : device;
   const truncated = m.preview.length >= RECENT_MESSAGE_PREVIEW ? '…' : '';
   return `- [${dt} ${platformTag}${m.role}] ${m.preview}${truncated}`;
 }

@@ -14,8 +14,11 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import * as os from "node:os";
 import { db } from "../db.js";
 import { insertRawMemory } from "../hot_path.js";
+
+const DEVICE_NAME = os.hostname();
 import { getDefaultUserId, updateUserProfile, getUserProfile } from "../users.js";
 import { generateEmbedding } from "../embeddings.js";
 import { tagMessage } from "../cold_path/tagger.js";
@@ -212,6 +215,7 @@ target='sub_profile' 사용 시:
         p_tag_id,
         d_tag,
         embedding,
+        device_name: DEVICE_NAME,
       });
 
       return ok({

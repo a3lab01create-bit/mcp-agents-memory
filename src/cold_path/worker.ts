@@ -19,10 +19,12 @@
 import { db } from "../db.js";
 import { tagMessage } from "./tagger.js";
 import { embedMessage, vectorToHalfvecSql } from "./embedder.js";
+import { runDtagPromotion } from "./dtag_promoter.js";
 
 let intervalTimer: NodeJS.Timeout | null = null;
 let warmupTimer: NodeJS.Timeout | null = null;
 let running = false;
+let tickCount = 0;
 
 const DEFAULT_INTERVAL_SEC = 60;
 const DEFAULT_BATCH = 5;
@@ -234,6 +236,22 @@ async function tick(): Promise<number> {
   }
 }
 
+const DTAG_PROMOTE_EVERY_N_TICKS = 10;
+
+async function maybeRunPromotion(): Promise<void> {
+  if (process.env.DTAG_PROMOTE_ENABLED === 'false') return;
+  tickCount++;
+  if (tickCount % DTAG_PROMOTE_EVERY_N_TICKS !== 0) return;
+  try {
+    const result = await runDtagPromotion();
+    if (result.promoted.length > 0 || result.retrotagged > 0) {
+      console.error(`🏷️ [DTagPromoter] promoted=${result.promoted.length} tags, retrotagged=${result.retrotagged} rows`);
+    }
+  } catch (err) {
+    console.error("⚠️ [DTagPromoter] promotion error (non-blocking):", err);
+  }
+}
+
 export function startColdPathWorker(): void {
   if (process.env.COLD_PATH_ENABLED === 'false') {
     console.error("🔵 [ColdPath] disabled (COLD_PATH_ENABLED=false)");
@@ -248,9 +266,11 @@ export function startColdPathWorker(): void {
   warmupTimer = setTimeout(() => {
     intervalTimer = setInterval(() => {
       tick().catch((err) => console.error("❌ [ColdPath] unhandled tick error:", err));
+      maybeRunPromotion().catch((err) => console.error("❌ [DTagPromoter] unhandled error:", err));
     }, intervalSec * 1000);
     // 첫 tick 즉시 한번 실행
     tick().catch((err) => console.error("❌ [ColdPath] unhandled first tick:", err));
+    maybeRunPromotion().catch((err) => console.error("❌ [DTagPromoter] unhandled error:", err));
   }, warmupSec * 1000);
 }
 

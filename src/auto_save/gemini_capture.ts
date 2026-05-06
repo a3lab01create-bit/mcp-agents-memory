@@ -25,6 +25,7 @@ import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
 
 const CLIENT_PLATFORM = "gemini-cli-mcp-client";
+const DEVICE_NAME = os.hostname();
 const GEMINI_TMP_ROOT = path.join(os.homedir(), ".gemini", "tmp");
 const FLUSH_DEBOUNCE_MS = 200;
 const PARSE_RETRY_MS = 80; // mid-write JSON 깨질 때 잠깐 backoff
@@ -175,6 +176,7 @@ async function flushDeltaForFile(
         role: parsed.role,
         message: parsed.message,
         external_uuid: externalUuid,
+        device_name: DEVICE_NAME,
       });
       if (result.inserted) inserted++;
       else dedup++;

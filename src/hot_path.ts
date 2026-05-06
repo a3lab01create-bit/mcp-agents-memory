@@ -46,6 +46,8 @@ export interface HotPathInsertParams {
    * save_message tool / manage_knowledge는 NULL 사용 (자동 생성 not needed).
    */
   external_uuid?: string | null;
+  /** MCP 서버 시작 시 os.hostname()으로 캡처한 기기명. null이면 unknown. */
+  device_name?: string | null;
 }
 
 export interface HotPathInsertResult {
@@ -76,6 +78,7 @@ export async function insertRawMemory(
     d_tag = [],
     embedding = null,
     external_uuid = null,
+    device_name = null,
   } = params;
 
   const embeddingSql = embedding && embedding.length > 0
@@ -91,13 +94,15 @@ export async function insertRawMemory(
        subagent, subagent_model, subagent_role,
        role, message,
        p_tag_id, d_tag, embedding,
-       is_pinned, tag_processed, external_uuid
+       is_pinned, tag_processed, external_uuid,
+       device_name
      ) VALUES (
        $1, $2, $3,
        $4, $5, $6,
        $7, $8,
        $9, $10::text[], $11::halfvec,
-       $12, $13, $14
+       $12, $13, $14,
+       $15
      )
      ON CONFLICT (external_uuid) WHERE external_uuid IS NOT NULL
        DO NOTHING
@@ -108,6 +113,7 @@ export async function insertRawMemory(
       role, message,
       p_tag_id, d_tag, embeddingSql,
       is_pinned, tagProcessed, external_uuid,
+      device_name,
     ]
   );
 

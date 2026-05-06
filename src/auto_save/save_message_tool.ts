@@ -18,9 +18,12 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import * as os from "node:os";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
 import { resolveAgentIdentity } from "../agent_identity.js";
+
+const DEVICE_NAME = os.hostname();
 
 export function registerSaveMessage(server: McpServer): void {
   server.registerTool(
@@ -67,6 +70,7 @@ subagent 컨텍스트라면 subagent=true + subagent_model + subagent_role 함�
         subagent_role: id.subagent_role,
         role: args.role,
         message: args.message,
+        device_name: DEVICE_NAME,
         // tag/embed NULL — Cold Path가 background 처리 (Hot Path latency 보장)
       });
 

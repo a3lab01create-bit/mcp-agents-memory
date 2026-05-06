@@ -215,3 +215,43 @@ AGENT_KEY=...                      # 옵션, multi-persona 구분용
 ---
 
 *Status: fresh implementation 준비 단계. 실제 구현은 form 결정 후 진행.*
+
+
+
+gemini cli trust setting 방법
+
+~/.gemini/settings.json
+
+```json
+"mcpServers": {
+    "mcp-agents-memory": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "/Users/hoon/Documents/Playgrounds/mcp-agents-memory/build/index.js"
+      ],
+      "env": {},
+      "trust": true 
+    }
+  }
+```
+
+codex 
+
+~/.codex/config.toml
+
+```toml
+[mcp_servers.mcp-agents-memory]
+command = "mcp-agents-memory"
+args = []
+
+[mcp_servers.mcp-agents-memory.tools.memory_startup]
+approval_mode = "approve"
+
+[mcp_servers.mcp-agents-memory.tools.save_message]
+approval_mode = "approve"
+
+[mcp_servers.mcp-agents-memory.tools.search_memory]
+approval_mode = "approve"
+```
+

@@ -62,7 +62,7 @@ async function listProjectTagCandidates(limit = 20): Promise<Array<{ id: number;
 }
 
 /** Cache invalidate — 새 p_tag 생성 시 호출해서 즉시 후보 list 갱신. */
-function invalidateCandidateCache(): void {
+export function invalidateCandidateCache(): void {
   _candidateCache = null;
 }
 
