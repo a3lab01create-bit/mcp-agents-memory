@@ -188,6 +188,32 @@ ssh key path 설정해주면서 절대경로 로 지정해줘야한다는 코멘
 
 --------------
 
+## §11. HTTP 서버 모드 — 웹 LLM / Desktop 앱 연결 (장기 로드맵)
+
+**동기**
+- ChatGPT Desktop, Claude Desktop 등 stdio MCP를 제대로 지원 안 하는 앱 대응
+- 웹 기반 LLM (OpenAI, Gemini Web 등) 연결 가능성
+- SSH 터널 제거 → Mac Pro 서버에서 DB 직접 접속
+
+**로컬 HTTP 옵션 (코드 수정 최소)**
+- `npx mcp-agents-memory http --port 3000` 로 로컬 HTTP 서버 모드 추가
+- 클라이언트는 `url: "http://localhost:3000"` 으로 연결
+- passive transcript capture는 로컬이라 cwd 그대로 사용 가능
+- 현재 코드 구조 거의 그대로 유지
+
+**원격 서버 옵션 (Mac Pro 배포)**
+- Mac Pro에 설치 → nginx + 도메인 연결
+- 장점: SSH 터널 불필요, 프로세스 1개, 어디서든 연결
+- 단점: passive capture 재설계 필요 (서버가 원격 → transcript 파일 못 읽음)
+  → `save_message` fallback 전용으로 운영하거나, session init 시 cwd 전달 방식 도입 필요
+
+**우선순위**
+- Desktop 앱 메모리 연결은 급하지 않음
+- npm 패키지 안정화 후 검토
+- 로컬 HTTP 옵션이 코드 변경 최소로 가장 현실적인 첫 단계
+
+--------------
+
 ## §7. mcp-agents-memory 를 역할별로 다양하게 마드는게 가능할까? 
 
 예를 들면 지금 처럼 일반 작업용 멀티에이전트 메모리
