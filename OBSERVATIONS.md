@@ -127,6 +127,33 @@ ssh key path 설정해주면서 절대경로 로 지정해줘야한다는 코멘
 
 --------------
 
+## §10. 멀티 프로세스 중복 저장 ✅ FIXED (v0.9.4, 2026-05-07)
+
+**현상**
+- Gemini CLI + Claude Code 동시 사용 시 Gemini 메시지 2배 저장
+- Claude Code에서 user 메시지만 2배 저장 (assistant는 1개)
+
+**원인 1 — Gemini: sessionId 불일치로 ON CONFLICT 우회**
+- Gemini MCP 프로세스 시작 시 chats 디렉토리에 이미 세션 파일 존재 → `captureSessionStart`에서 cursor=파일크기 설정
+- `extractShortId` regex (`\.json$`)가 `.jsonl` 확장자에 미매칭 → sessionId에 파일명 전체(`"session-...-d5286079.jsonl"`) 저장
+- 반면 Claude Code MCP 프로세스는 해당 파일을 "신규"로 감지 → cursor=0 → 헤더 라인 읽음 → 정확한 sessionId(`"d5286079-78d1-4512..."`) 사용
+- 두 프로세스가 서로 다른 `external_uuid` 생성 → DB `ON CONFLICT` 우회 → 2개 INSERT
+
+**원인 2 — Claude Code: 동일 user 메시지 다른 UUID로 재기록**
+- Claude Code가 tool 호출 컨텍스트 재구성 시 동일 내용의 user 메시지를 다른 UUID로 재기록
+- UUID 기반 `external_uuid`만으로는 dedup 불가
+
+**픽스 (commit 792c4e0)**
+1. `gemini_capture.ts` — `captureSessionStart`에서 `.jsonl` 기존 파일의 첫 512바이트 읽어 `sessionId` 직접 추출
+2. `jsonl_capture.ts` — `FileState`에 `contentSeen: Set<string>` 추가, `role::message` 키로 content 기반 dedup
+
+**진단 포인트**
+- `search_memory` 결과에서 두 row의 `created_at`가 동일 millisecond → 동시 INSERT 증거
+- assistant 메시지는 1개 (sessionId가 동일한 경우 ON CONFLICT 정상 작동)
+- Gemini 닫으면 1개 프로세스 → 1x 저장 확인 → 멀티 프로세스 원인 확정
+
+--------------
+
 ## §8. agent 능동적 자원 활용 부재
 
 **현상**
