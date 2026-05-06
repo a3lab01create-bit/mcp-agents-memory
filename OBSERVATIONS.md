@@ -65,11 +65,17 @@
 
 -----------
 
-## §4. ssh 키 문제 
+## §4. ssh 키 / config 경로 문제
 
 새로운 컴퓨터에서 설치시 ssh key 가 없으면 서버랑 연결을 못함 
 일반사용자들이 사용 가능하게끔 setup 에서 같이 처리해 줘야할 듯
 ssh key path 설정해주면서 절대경로 로 지정해줘야한다는 코멘트도 넣어줘야 할 듯
+
+**2026-05-06 fix (v0.9.3)**
+- `process.cwd()/.env`가 `~/.config/mcp-agents-memory/.env`보다 우선 탐색되어
+  CLI 환경(T460 등)에서 claude 실행 디렉토리에 따라 SSH_ENABLED가 무시되는 문제 발견
+- `configSearchPaths()` 순서를 XDG 경로 우선으로 변경 (commit f661b87)
+- Mac Studio(dev 환경)는 `~/.config/mcp-agents-memory/.env` 없으면 `process.cwd()/.env`로 fallback → 기존 동작 유지
 
 --------------
 
@@ -112,7 +118,11 @@ ssh key path 설정해주면서 절대경로 로 지정해줘야한다는 코멘
 - 첫 등장은 느리지만 안전, 반복되면 자동으로 p_tag 생성
 - N 임계값, 기간 윈도우, 소급 업데이트 범위 등은 추가 설계 필요
 
+--------------
 
+## §7. mcp-agents-memory 를 역할별로 다양하게 마드는게 가능할까? 
 
-
+예를 들면 지금 처럼 일반 작업용 멀티에이전트 메모리
+브랜드 마케팅 쇼핑몰용 하네스 멀티에이전트 에서 사용할 ai 오피스용 메모리
+https://github.com/outworked/outworked --> 이런식으로 멀티에이전트로 작업을 할때 같은 모델을 여러게 쓸수도 있으니 모델의 별명? 도 지어줄 수 있음 좋을듯..(진짜 tiny office 처럼..ㅋㅋ;;)
 
