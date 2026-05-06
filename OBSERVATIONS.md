@@ -7,21 +7,15 @@
 
 ---
 
-## §1. Codex Desktop 앱 — 1턴 지연 저장
+## §1. Codex Desktop 앱 — 1턴 지연 저장 ✅ FIXED (v0.9.4, 2026-05-07)
 
 **증상**
 - Codex Desktop 앱에서 대화하면 메모리 저장이 1턴씩 늦게 들어감
 - Codex CLI에서는 즉시 저장됨 (정상)
 
-**추정 원인 (조사 필요)**
-- Desktop 앱과 CLI의 transcript 파일 flush 시점 차이?
-- Desktop 앱은 turn 종료 시점에 디스크 write가 지연될 가능성
-- passive read 루프의 polling 타이밍과 어긋남?
-
-**해결 방향**
-- [ ] Desktop 앱의 transcript 파일 위치 + flush 동작 확인
-- [ ] CLI vs Desktop transcript 포맷/타이밍 diff
-- [ ] 1턴 지연이 file write 지연인지, 우리 read 루프 지연인지 분리
+**해결**
+- §10 멀티 프로세스 중복 저장 픽스(v0.9.4)와 함께 해소됨
+- Mac Studio에서 Codex Desktop 재테스트 → 지연 없음 확인 (2026-05-07)
 
 ---
 
