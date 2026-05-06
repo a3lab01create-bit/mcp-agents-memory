@@ -29,10 +29,12 @@ const DEVICE_NAME = os.hostname();
 const GEMINI_TMP_ROOT = path.join(os.homedir(), ".gemini", "tmp");
 const FLUSH_DEBOUNCE_MS = 200;
 const PARSE_RETRY_MS = 80; // mid-write JSON 깨질 때 잠깐 backoff
+const POLL_INTERVAL_MS = 3000; // OS 버퍼링 우회
 
 interface FileState {
-  /** 다음 read 시작 array index. arm 시점 messages.length 또는 신규 파일이면 0. */
-  cursorIndex: number;
+  /** json: messages array index / jsonl: byte offset */
+  cursor: number;
+  format: "json" | "jsonl";
   /** 파일에서 추출한 sessionId (top-level field). 없으면 file basename에서 추출. */
   sessionId: string;
 }
@@ -47,6 +49,7 @@ interface DirState {
 let _state: DirState | null = null;
 
 const _watchers: fs.FSWatcher[] = [];
+let _pollTimer: NodeJS.Timeout | null = null;
 let _flushInProgress = false;
 let _flushPending = false;
 let _flushDebounceTimer: NodeJS.Timeout | null = null;
@@ -112,7 +115,7 @@ export function parseMessage(msg: GeminiMessage, fallbackId: string): ParsedEntr
   let role: "user" | "assistant";
   if (msg.type === "user") role = "user";
   else if (msg.type === "gemini") role = "assistant";
-  else return null;
+  else return null; // info / $set / 기타 타입 skip
 
   let text = "";
   const c = msg.content;
@@ -128,6 +131,9 @@ export function parseMessage(msg: GeminiMessage, fallbackId: string): ParsedEntr
   text = text.trim();
   if (!text) return null;
 
+  // Gemini CLI 시스템 주입 메시지 필터 (사용자 실발화 아님)
+  if (text.startsWith("System:") || text === "Please continue.") return null;
+
   const msgId = typeof msg.id === "string" && msg.id ? msg.id : fallbackId;
   const agent_model = role === "assistant" && typeof msg.model === "string" ? msg.model : null;
 
@@ -136,7 +142,19 @@ export function parseMessage(msg: GeminiMessage, fallbackId: string): ParsedEntr
 
 async function flushDeltaForFile(
   filePath: string,
-  fileState: FileState
+  fileState: FileState,
+  contentSeen: Set<string>,
+): Promise<{ inserted: number; skipped: number; dedup: number }> {
+  return fileState.format === "jsonl"
+    ? flushJsonlFile(filePath, fileState, contentSeen)
+    : flushJsonFile(filePath, fileState, contentSeen);
+}
+
+/** 구버전 .json (배열 전체 atomic replace) 처리 */
+async function flushJsonFile(
+  filePath: string,
+  fileState: FileState,
+  contentSeen: Set<string>,
 ): Promise<{ inserted: number; skipped: number; dedup: number }> {
   const session = await readSessionFile(filePath);
   if (!session || !Array.isArray(session.messages)) {
@@ -144,11 +162,10 @@ async function flushDeltaForFile(
   }
 
   const messages = session.messages;
-  if (messages.length <= fileState.cursorIndex) {
+  if (messages.length <= fileState.cursor) {
     return { inserted: 0, skipped: 0, dedup: 0 };
   }
 
-  // sessionId가 top-level에 있으면 그걸로 갱신 (probe 시 fallback이었을 수 있음)
   if (typeof session.sessionId === "string" && session.sessionId) {
     fileState.sessionId = session.sessionId;
   }
@@ -156,44 +173,119 @@ async function flushDeltaForFile(
   const userId = await getDefaultUserId();
   let inserted = 0, skipped = 0, dedup = 0;
 
-  for (let i = fileState.cursorIndex; i < messages.length; i++) {
+  for (let i = fileState.cursor; i < messages.length; i++) {
     const msg = messages[i];
     const fallbackId = `${fileState.sessionId}-${i}`;
     const parsed = parseMessage(msg, fallbackId);
-    if (!parsed) {
-      skipped++;
-      continue;
-    }
+    if (!parsed) { skipped++; continue; }
+    const ck = `${parsed.role}::${parsed.message}`;
+    if (contentSeen.has(ck)) { dedup++; continue; }
+    contentSeen.add(ck);
     const externalUuid = `gemini:${fileState.sessionId}:${parsed.msgId}`;
-    const agentModel =
-      parsed.role === "user" ? null : (parsed.agent_model ?? "unknown");
-
+    const agentModel = parsed.role === "user" ? null : (parsed.agent_model ?? "unknown");
     try {
       const result = await insertRawMemory({
-        user_id: userId,
-        agent_platform: CLIENT_PLATFORM,
-        agent_model: agentModel,
-        role: parsed.role,
-        message: parsed.message,
-        external_uuid: externalUuid,
-        device_name: DEVICE_NAME,
+        user_id: userId, agent_platform: CLIENT_PLATFORM, agent_model: agentModel,
+        role: parsed.role, message: parsed.message,
+        external_uuid: externalUuid, device_name: DEVICE_NAME,
       });
-      if (result.inserted) inserted++;
-      else dedup++;
+      if (result.inserted) inserted++; else dedup++;
     } catch (err) {
       console.error(`⚠️ [Gemini] insert failed at index ${i}:`, err);
       skipped++;
     }
   }
 
-  fileState.cursorIndex = messages.length;
+  fileState.cursor = messages.length;
   return { inserted, skipped, dedup };
+}
+
+/** 신버전 .jsonl (라인별 append) 처리 */
+async function flushJsonlFile(
+  filePath: string,
+  fileState: FileState,
+  contentSeen: Set<string>,
+): Promise<{ inserted: number; skipped: number; dedup: number }> {
+  if (!fs.existsSync(filePath)) return { inserted: 0, skipped: 0, dedup: 0 };
+  let stat: fs.Stats;
+  try { stat = fs.statSync(filePath); } catch { return { inserted: 0, skipped: 0, dedup: 0 }; }
+  if (stat.size <= fileState.cursor) return { inserted: 0, skipped: 0, dedup: 0 };
+
+  const length = stat.size - fileState.cursor;
+  const fd = fs.openSync(filePath, "r");
+  let raw: string;
+  try {
+    const buf = Buffer.alloc(length);
+    fs.readSync(fd, buf, 0, length, fileState.cursor);
+    raw = buf.toString("utf-8");
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  const lastNl = raw.lastIndexOf("\n");
+  if (lastNl === -1) return { inserted: 0, skipped: 0, dedup: 0 };
+
+  const parsable = raw.slice(0, lastNl);
+  const advanceBy = Buffer.byteLength(parsable, "utf-8") + 1;
+  const newCursor = fileState.cursor + advanceBy;
+
+  const userId = await getDefaultUserId();
+  let inserted = 0, skipped = 0, dedup = 0;
+  let lineIdx = fileState.cursor === 0 ? 0 : -1; // 0이면 첫 줄(세션 메타) 포함
+
+  for (const line of parsable.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) { lineIdx++; continue; }
+    let obj: any;
+    try { obj = JSON.parse(trimmed); } catch { lineIdx++; continue; }
+
+    // 첫 줄 — 세션 메타에서 sessionId 추출
+    if (lineIdx === 0 && typeof obj.sessionId === "string" && obj.sessionId) {
+      fileState.sessionId = obj.sessionId;
+      lineIdx++;
+      continue;
+    }
+    lineIdx++;
+
+    // $set — 메타 업데이트, skip
+    if (obj.$set !== undefined) continue;
+
+    const parsed = parseMessage(obj, `${fileState.sessionId}-${lineIdx}`);
+    if (!parsed) { skipped++; continue; }
+
+    const ck = `${parsed.role}::${parsed.message}`;
+    if (contentSeen.has(ck)) { dedup++; continue; }
+    contentSeen.add(ck);
+
+    const externalUuid = `gemini:${fileState.sessionId}:${parsed.msgId}`;
+    const agentModel = parsed.role === "user" ? null : (parsed.agent_model ?? "unknown");
+    try {
+      const result = await insertRawMemory({
+        user_id: userId, agent_platform: CLIENT_PLATFORM, agent_model: agentModel,
+        role: parsed.role, message: parsed.message,
+        external_uuid: externalUuid, device_name: DEVICE_NAME,
+      });
+      if (result.inserted) inserted++; else dedup++;
+    } catch (err) {
+      console.error(`⚠️ [Gemini] jsonl insert failed:`, err);
+      skipped++;
+    }
+  }
+
+  fileState.cursor = newCursor;
+  return { inserted, skipped, dedup };
+}
+
+export function isCaptureArmed(): boolean {
+  return _state !== null && _state.chatsDirs.length > 0;
 }
 
 async function flushAllFiles(): Promise<{ inserted: number; skipped: number; dedup: number }> {
   if (!_state) return { inserted: 0, skipped: 0, dedup: 0 };
 
   let totalI = 0, totalS = 0, totalD = 0;
+  // 동일 flush pass 내 content 기반 dedup (같은 메시지가 .json + .jsonl에 동시 존재할 때 방지)
+  const contentSeen = new Set<string>();
 
   for (const dir of _state.chatsDirs) {
     if (!fs.existsSync(dir)) continue;
@@ -204,20 +296,22 @@ async function flushAllFiles(): Promise<{ inserted: number; skipped: number; ded
       continue;
     }
     for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      if (!entry.isFile()) continue;
       if (!entry.name.startsWith("session-")) continue;
+      if (!entry.name.endsWith(".json") && !entry.name.endsWith(".jsonl")) continue;
       const filePath = path.join(dir, entry.name);
 
       let fileState = _state.files.get(filePath);
       if (!fileState) {
         // 신규 — cursor 0부터 전체 캡처
         const sessionId = extractShortId(entry.name);
-        fileState = { cursorIndex: 0, sessionId };
+        const format: "json" | "jsonl" = entry.name.endsWith(".jsonl") ? "jsonl" : "json";
+        fileState = { cursor: 0, format, sessionId };
         _state.files.set(filePath, fileState);
-        console.error(`📝 [Gemini] new session detected: ${entry.name}`);
+        console.error(`📝 [Gemini] new session detected: ${entry.name} (${format})`);
       }
 
-      const r = await flushDeltaForFile(filePath, fileState);
+      const r = await flushDeltaForFile(filePath, fileState, contentSeen);
       totalI += r.inserted;
       totalS += r.skipped;
       totalD += r.dedup;
@@ -275,24 +369,25 @@ export function captureSessionStart(cwd: string): void {
       continue;
     }
     for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      if (!entry.isFile()) continue;
       if (!entry.name.startsWith("session-")) continue;
+      if (!entry.name.endsWith(".json") && !entry.name.endsWith(".jsonl")) continue;
       const filePath = path.join(dir, entry.name);
 
-      let session: GeminiSessionFile | null = null;
-      try {
-        const raw = fs.readFileSync(filePath, "utf-8");
-        session = JSON.parse(raw);
-      } catch {
-        // 깨졌거나 mid-write — cursor 0으로 두고 다음 flush에서 재시도
-        session = null;
+      const format: "json" | "jsonl" = entry.name.endsWith(".jsonl") ? "jsonl" : "json";
+      const sessionId = extractShortId(entry.name);
+      let cursor = 0;
+
+      if (format === "json") {
+        let session: GeminiSessionFile | null = null;
+        try { session = JSON.parse(fs.readFileSync(filePath, "utf-8")); } catch {}
+        cursor = session && Array.isArray(session.messages) ? session.messages.length : 0;
+      } else {
+        // jsonl: cursor = 현재 파일 크기 (기존 내용 skip)
+        try { cursor = fs.statSync(filePath).size; } catch {}
       }
-      const sessionId =
-        (session && typeof session.sessionId === "string" && session.sessionId) ||
-        extractShortId(entry.name);
-      const cursorIndex =
-        session && Array.isArray(session.messages) ? session.messages.length : 0;
-      _state.files.set(filePath, { cursorIndex, sessionId });
+
+      _state.files.set(filePath, { cursor, format, sessionId });
       count++;
     }
   }
@@ -309,7 +404,7 @@ function armDirWatchers(): void {
   for (const dir of _state.chatsDirs) {
     try {
       const w = fs.watch(dir, (_evt, filename) => {
-        if (filename && !filename.endsWith(".json")) return;
+        if (filename && !filename.endsWith(".json") && !filename.endsWith(".jsonl")) return;
         scheduleFlush();
       });
       _watchers.push(w);
@@ -320,12 +415,17 @@ function armDirWatchers(): void {
   if (_watchers.length > 0) {
     console.error(`📝 [Gemini] dir watcher(s) armed: ${_watchers.length}`);
   }
+  _pollTimer = setInterval(() => { void flushWithMutex(); }, POLL_INTERVAL_MS);
 }
 
 function disarmDirWatchers(): void {
   if (_flushDebounceTimer) {
     clearTimeout(_flushDebounceTimer);
     _flushDebounceTimer = null;
+  }
+  if (_pollTimer) {
+    clearInterval(_pollTimer);
+    _pollTimer = null;
   }
   for (const w of _watchers) {
     try { w.close(); } catch {}

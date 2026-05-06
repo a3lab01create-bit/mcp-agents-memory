@@ -22,6 +22,7 @@ import * as os from "node:os";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
 import { resolveAgentIdentity } from "../agent_identity.js";
+import { isCaptureArmed as isGeminiArmed } from "./gemini_capture.js";
 
 const DEVICE_NAME = os.hostname();
 
@@ -57,6 +58,16 @@ subagent 컨텍스트라면 subagent=true + subagent_model + subagent_role 함�
     async (args) => {
       const userId = await getDefaultUserId();
       const id = resolveAgentIdentity(server, args);
+
+      // passive capture가 활성화된 platform은 save_message 수동 호출 불필요 — 중복 방지
+      if (id.agent_platform === "gemini-cli-mcp-client" && isGeminiArmed()) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({ stored: false, skipped: "passive capture active" }, null, 2),
+          }],
+        };
+      }
 
       // user role: 사람이 친 거니 model N/A → null. assistant: id.agent_model.
       const agentModel = args.role === 'user' ? null : id.agent_model;
