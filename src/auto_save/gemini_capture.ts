@@ -378,16 +378,31 @@ export function captureSessionStart(cwd: string): void {
       const sessionId = extractShortId(entry.name);
       let cursor = 0;
 
+      let realSessionId = sessionId;
       if (format === "json") {
         let session: GeminiSessionFile | null = null;
         try { session = JSON.parse(fs.readFileSync(filePath, "utf-8")); } catch {}
         cursor = session && Array.isArray(session.messages) ? session.messages.length : 0;
+        if (session?.sessionId) realSessionId = session.sessionId;
       } else {
-        // jsonl: cursor = 현재 파일 크기 (기존 내용 skip)
+        // jsonl: cursor = 현재 파일 크기 (기존 내용 skip).
+        // 헤더 라인에서 정확한 sessionId 추출 — extractShortId regex는 .jsonl 불일치로
+        // 잘못된 sessionId를 반환, 다른 프로세스와 external_uuid가 달라져 ON CONFLICT 우회됨.
         try { cursor = fs.statSync(filePath).size; } catch {}
+        try {
+          const fd = fs.openSync(filePath, "r");
+          const buf = Buffer.alloc(512);
+          const n = fs.readSync(fd, buf, 0, 512, 0);
+          fs.closeSync(fd);
+          const firstLine = buf.slice(0, n).toString("utf-8").split("\n")[0].trim();
+          const header = JSON.parse(firstLine);
+          if (typeof header.sessionId === "string" && header.sessionId) {
+            realSessionId = header.sessionId;
+          }
+        } catch {}
       }
 
-      _state.files.set(filePath, { cursor, format, sessionId });
+      _state.files.set(filePath, { cursor, format, sessionId: realSessionId });
       count++;
     }
   }

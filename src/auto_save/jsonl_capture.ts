@@ -48,6 +48,9 @@ interface FileState {
    *  flushDeltaForFile 성공 후 마지막 \n 위치까지 전진. */
   cursorBytes: number;
   sessionId: string;
+  /** Claude Code가 tool 컨텍스트 재구성 시 같은 user 메시지를 다른 uuid로 재기록.
+   *  uuid 기반 external_uuid만으론 dedup 불가 → content 기반 dedup (role::text). */
+  contentSeen: Set<string>;
 }
 
 interface DirState {
@@ -152,7 +155,7 @@ export function captureSessionStart(cwd: string): void {
     let stat: fs.Stats;
     try { stat = fs.statSync(jsonlPath); } catch { continue; }
     const sessionId = entry.name.replace(/\.jsonl$/, "");
-    _state.files.set(jsonlPath, { cursorBytes: stat.size, sessionId });
+    _state.files.set(jsonlPath, { cursorBytes: stat.size, sessionId, contentSeen: new Set() });
   }
 
   console.error(`📝 [JSONL] capture armed: ${_state.files.size} jsonl(s) in ${path.basename(projectDir)}/`);
@@ -265,6 +268,11 @@ async function flushDeltaForFile(
       skipped++;
       continue;
     }
+    // Claude Code가 tool 컨텍스트 재구성 시 user 메시지를 같은 내용 다른 uuid로 재기록 → dedup
+    const ck = `${parsed.role}::${parsed.message}`;
+    if (fileState.contentSeen.has(ck)) { dedup++; continue; }
+    fileState.contentSeen.add(ck);
+
     const externalUuid = `claude-code:${fileState.sessionId}:${parsed.uuid}`;
     // user role: agent_model = null (사람이 친 거, N/A). assistant: 모델 명 (없으면 'unknown').
     const agentModel = parsed.role === 'user' ? null : (parsed.agent_model ?? 'unknown');
@@ -314,7 +322,7 @@ async function flushAllFiles(): Promise<{ inserted: number; skipped: number; ded
     if (!fileState) {
       // arm 이후 신규 jsonl — cursor 0부터 전체 캡처
       const sessionId = entry.name.replace(/\.jsonl$/, "");
-      fileState = { cursorBytes: 0, sessionId };
+      fileState = { cursorBytes: 0, sessionId, contentSeen: new Set() };
       _state.files.set(jsonlPath, fileState);
       console.error(`📝 [JSONL] new session detected: ${entry.name}`);
     }
