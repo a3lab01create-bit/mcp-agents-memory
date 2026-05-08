@@ -75,9 +75,14 @@ let _flushDebounceTimer: NodeJS.Timeout | null = null;
  *    타이밍 문제(MCP가 JSONL 생성 전에 시작) 완전 해소.
  * 2차: fallback — JSONL cwd 필드 스캔 (레거시 slug 변환이 다른 경우 대비).
  */
+/** Claude Code slug 알고리즘: 영숫자 제외 모든 문자 → '-' (슬래시, 언더스코어 등 포함). */
+function cwdToSlug(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9]/g, "-");
+}
+
 function findProjectDir(cwd: string): string | null {
-  // 1차: slug 직접 계산
-  const slug = cwd.replace(/\//g, "-");
+  // 1차: slug 직접 계산 (Claude Code와 동일 알고리즘 — 영숫자 외 전부 '-')
+  const slug = cwdToSlug(cwd);
   const slugPath = path.join(PROJECTS_ROOT, slug);
   try {
     if (fs.statSync(slugPath).isDirectory()) return slugPath;
@@ -143,14 +148,40 @@ function readCwdFromJsonl(jsonlPath: string): string | null {
 /**
  * server 시작 시 호출. projectDir 안 모든 jsonl size 스냅샷 + dir watcher arm.
  * 옛 entries backfill 안 함 (cursor = 시작 시점 size).
+ *
+ * 타이밍 안전: Claude Code가 MCP 시작 후 project dir / JSONL을 조금 뒤에 생성하는
+ * 경우 대비 → 500ms 간격으로 최대 20회(10초) retry.
  */
 export function captureSessionStart(cwd: string): void {
   _state = { cwd, projectDir: null, files: new Map() };
+  _tryArm(cwd, 0);
+}
 
+const _MAX_ARM_RETRIES = 20; // 20 × 500ms = 10s
+
+function _tryArm(cwd: string, attempt: number): void {
   const projectDir = findProjectDir(cwd);
+
   if (!projectDir) {
-    return; // 비-Claude Code (Gemini / Codex) 또는 디렉토리 아직 없음
+    if (attempt < _MAX_ARM_RETRIES) {
+      setTimeout(() => {
+        // 세션이 끊기거나 리셋됐으면 조용히 중단
+        if (!_state || _state.cwd !== cwd) return;
+        _tryArm(cwd, attempt + 1);
+      }, 500);
+    } else {
+      // 10초 후에도 못 찾으면 진단 로그 남기고 포기
+      console.error(
+        `⚠️ [JSONL] project dir not found after ${_MAX_ARM_RETRIES} retries — capture 건너뜀.\n` +
+        `   cwd="${cwd}"\n` +
+        `   PROJECTS_ROOT="${PROJECTS_ROOT}"\n` +
+        `   expected slug="${cwdToSlug(cwd)}"`
+      );
+    }
+    return;
   }
+
+  if (!_state || _state.cwd !== cwd) return; // race: session ended
   _state.projectDir = projectDir;
 
   // 기존 jsonl 모두 snapshot
@@ -170,6 +201,9 @@ export function captureSessionStart(cwd: string): void {
     _state.files.set(jsonlPath, { cursorBytes: stat.size, sessionId, contentSeen: new Set() });
   }
 
+  if (attempt > 0) {
+    console.error(`📝 [JSONL] project dir found on retry #${attempt}: ${path.basename(projectDir)}/`);
+  }
   console.error(`📝 [JSONL] capture armed: ${_state.files.size} jsonl(s) in ${path.basename(projectDir)}/`);
 
   armDirWatcher();
