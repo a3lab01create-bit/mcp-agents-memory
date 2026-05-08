@@ -69,10 +69,21 @@ let _flushPending = false;
 let _flushDebounceTimer: NodeJS.Timeout | null = null;
 
 /**
- * ~/.claude/projects/ 하위 디렉토리를 스캔해서 cwd가 일치하는 실제 project dir 탐색.
- * slug 알고리즘 역추측 없이 JSONL 엔트리의 cwd 필드로 직접 매칭.
+ * cwd → Claude Code project dir 탐색.
+ *
+ * 1차: slug 직접 계산 (cwd의 '/' → '-'). JSONL 없어도 즉시 확정.
+ *    타이밍 문제(MCP가 JSONL 생성 전에 시작) 완전 해소.
+ * 2차: fallback — JSONL cwd 필드 스캔 (레거시 slug 변환이 다른 경우 대비).
  */
 function findProjectDir(cwd: string): string | null {
+  // 1차: slug 직접 계산
+  const slug = cwd.replace(/\//g, "-");
+  const slugPath = path.join(PROJECTS_ROOT, slug);
+  try {
+    if (fs.statSync(slugPath).isDirectory()) return slugPath;
+  } catch { /* not found — fallback */ }
+
+  // 2차: JSONL cwd 필드 스캔 (fallback)
   let subdirs: fs.Dirent[];
   try {
     subdirs = fs.readdirSync(PROJECTS_ROOT, { withFileTypes: true });
@@ -91,11 +102,12 @@ function findProjectDir(cwd: string): string | null {
       continue;
     }
 
-    const jsonlFile = files.find((f) => f.isFile() && f.name.endsWith(".jsonl"));
-    if (!jsonlFile) continue;
-
-    const foundCwd = readCwdFromJsonl(path.join(dirPath, jsonlFile.name));
-    if (foundCwd === cwd) return dirPath;
+    // 모든 JSONL 체크 (find → some으로 변경해 첫 파일만 보는 버그 수정)
+    for (const f of files) {
+      if (!f.isFile() || !f.name.endsWith(".jsonl")) continue;
+      const foundCwd = readCwdFromJsonl(path.join(dirPath, f.name));
+      if (foundCwd === cwd) return dirPath;
+    }
   }
 
   return null;
