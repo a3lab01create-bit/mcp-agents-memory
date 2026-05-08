@@ -51,10 +51,46 @@
 
 ----
 
-## §3. Librarian 새로 만들기
+## §3. Librarian v2 설계 (2026-05-07 논의, 구현 보류 중)
 
+**배경**
+- RESPEC v1 이후 `librarian.ts`는 dead code — worker에 연결 안 됨
+- `users.core_profile` / `sub_profile` 최초 생성 후 자동 업데이트 경로 없음
+- 기존 Librarian은 API 비용 폭발로 제거됨 → 새 설계 필요
 
+**핵심 방향 (2026-05-07 확정)**
 
+> Librarian의 역할 = "현재 상태 요약" ❌ → "이 사람이 AI와 일하는 방식의 행동 지문(behavioral fingerprint)" ✅
+
+뽑아야 할 신호:
+- 소통 방식 — 호칭(쿠름), 언어, 톤
+- 협업 패턴 — 에이전트를 어떻게 쓰는지
+- 강한 원칙 — 비용 민감, root-cause 지향, 설계 철학
+- 정체성 — 역할, 전문성 수준
+- 습관 — 반복되는 행동 패턴
+
+뽑으면 안 되는 것 (프로젝트 상태 → p_tag/메모리로 충분):
+- "현재 mcp-agents-memory 작업 중"
+- "Mac Pro DB 서버 사용"
+- 일시적 도구/환경 상태
+
+**비용 게이트 (AND 조건)**
+- 시간 게이트: 마지막 실행 후 최소 24h 경과
+- 메시지 게이트: 새 user 메시지 N개 이상 (실측 후 확정 — 현재 후보 25개)
+- watermark: `users` 테이블에 `librarian_run_at TIMESTAMPTZ` 컬럼 추가
+
+**모델**: grok-4-1-fast-non-reasoning (추가 key 불필요, 프롬프트 설계로 품질 보완)
+**비용**: 하루 1회 × ~$0.002 — 사실상 무시 가능
+
+**Codex/Gemini 토의 결과 요약**
+- 게이트: Codex는 AND 선호, Gemini는 OR + 최소 쿨다운 6h 제안 → 실측 후 결정
+- incremental vs full-window: Codex는 incremental(새 메시지만), Gemini는 full-window 권장 → 미결
+- 공통 리스크: race condition(per-user lock 필요), length creep(출력 max 제한), 가정/농담의 사실화 방지
+
+**다음 단계**
+- [ ] 하루이틀 tagger 비용 관찰 후 user 메시지 일평균 실측
+- [ ] 게이트 숫자(N) + incremental/full-window 방향 확정
+- [ ] `librarian_v2.ts` 신규 작성 + worker 연결
 
 
 -----------
@@ -82,6 +118,24 @@ ssh key path 설정해주면서 절대경로 로 지정해줘야한다는 코멘
 - migration 022: `memory` 테이블에 `device_name TEXT` 컬럼 추가
 - jsonl_capture / codex_capture / gemini_capture / save_message / manage_knowledge — 모두 `device_name` 주입
 - briefing: `claude-code @ Mac-Studio` 형식으로 platform 헤더 + 개별 메시지 라인에 표시
+
+--------------
+
+## §12. tagger 비용 점프 관찰 중 (2026-05-07~)
+
+**현상**
+- d_tag only 시절: $0.01~0.03/일
+- v0.9.3 이후 (p_tag + 크로스플랫폼 캡처): $0.4~0.5/일
+
+**진단 (잠정)**
+- p_tag candidates list 추가는 call당 ~1.4배 토큰 증가 → 15~30배 점프 설명 불가
+- 추정 원인: v0.9.0 크로스플랫폼 캡처(Codex+Gemini) 이후 메시지 볼륨이 3~5배 증가
+- 1,000~1,500 msg/day → $0.15~0.23, 3,000~4,000 msg/day → $0.4~0.5 (계산 일치)
+
+**관찰 계획**
+- [ ] 하루이틀 추가 관찰
+- [ ] DB에서 일별 메시지 수 실측: `SELECT DATE(created_at), COUNT(*) FROM memory GROUP BY 1 ORDER BY 1`
+- [ ] 원인 확정 후 tagger 최적화 또는 볼륨 수용 결정
 
 --------------
 

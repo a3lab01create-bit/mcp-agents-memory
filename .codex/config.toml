@@ -1,0 +1,13 @@
+[mcp_servers.codex-mcp]
+args = [
+    "-y",
+    "codex-mcp-server",
+]
+command = "npx"
+
+[mcp_servers.gemini-mcp]
+args = [
+    "-y",
+    "@tuannvm/gemini-mcp-server",
+]
+command = "npx"
