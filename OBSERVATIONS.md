@@ -214,9 +214,19 @@ ssh key path 설정해주면서 절대경로 로 지정해줘야한다는 코멘
 - memory_startup 자동 주입처럼 강제로 넣어주지 않으면 있는 자원도 안 씀
 - mcp-agents-memory만의 문제가 아닌 agent 설계 전반의 구조적 한계
 
+**해결 옵션 비교 (2026-05-08)**
+
+| 옵션 | 방법 | 적용 범위 | 비고 |
+|------|------|-----------|------|
+| A | **MCP server instructions 강화** | 이 MCP에 연결된 모든 플랫폼 (Claude Code, Codex, Gemini 등) | 가장 넓은 범위. "global skill"과 같은 효과 |
+| B | **memory_startup brief 개선** | 모든 플랫폼 (startup 시점) | session 시작 때 힌트 주입. 중간 검색 트리거는 별도 필요 |
+| C | **CLAUDE.md (global)** | Claude Code 전용 | 플랫폼 한정, 다른 CLI에는 안 적용됨 |
+
+**핵심 인사이트**: "global skill처럼" 모든 플랫폼에 적용하려면 → Option A (MCP server instructions). CLAUDE.md는 Claude Code만, MCP instructions는 이 MCP를 붙인 모든 곳에.
+
 **방향**
-- [ ] mid-session에서 agent가 스스로 search_memory 호출하는 트리거 설계
-- [ ] CLAUDE.md 또는 system prompt 레벨에서 "X 전에 반드시 Y 확인" 규칙 주입
+- [ ] Option A 우선 검토 — server instructions에 "이런 상황에서 search_memory 호출" 트리거 규칙 추가
+- [ ] mid-session 트리거 조건 설계 (예: 사람 이름, 프로젝트명, "예전에" 등 키워드 패턴)
 - [ ] §7 역할별 mcp 아이디어와 연결 — 역할마다 "봐야 할 자원" 명시화
 
 --------------

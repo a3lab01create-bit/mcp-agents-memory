@@ -1,22 +1,23 @@
 /**
- * Librarian — memory → user 테이블 promote.
+ * Librarian v2 — periodic user profile promotion.
  *
- * RESPEC §시퀀스 #3 / §(1-A).3 hallucination 방어.
+ * Gate: LIBRARIAN_ENABLED=true + 30 새 메시지 + 24h 쿨다운.
+ * Model: local/qwen3.6:35b-a3b (thinking 허용, maxTokens=8192).
  *
- * 역할: 최근 form 발화를 검토 → 핵심 사용자 정체성 정보를 user 테이블의
- * core_profile / sub_profile로 promote 또는 갱신.
- *
- * 핵심 nuance:
- *   - role='user' 발화만 source로 사용 (assistant 발화는 hallucination 위험)
- *   - opt-in (LIBRARIAN_PROMOTE_ENABLED=true 일 때만 자동 시작)
- *   - 새 promote는 LLM (callRole 'librarian') 판단으로 기존 profile에 통합
- *
- * 본 모듈은 Phase E v1: 기본 promote 구조 + 수동 호출 진입점. 자동 cadence
- * 백그라운드 worker는 차후 (Phase G 또는 별도) 활성화.
+ * responseFormat 생략 — qwen3.x + response_format:json_object → content 빈 버그.
+ * callSpec 'local' case가 ```json fence를 이미 strip하므로 JSON.parse 가능.
  */
 
 import { db } from "./db.js";
 import { callRole } from "./model_registry.js";
+import { getDefaultUserId } from "./users.js";
+
+const LIBRARIAN_MSG_THRESHOLD = 30;
+const LIBRARIAN_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+const LIBRARIAN_RECENT_LIMIT = 50;
+// qwen3.6:35b-a3b: 50-msg 프롬프트에서 reasoning이 8k token을 소진하는 케이스 확인.
+// 32k로 올려 reasoning + 실제 JSON 응답 모두 수용.
+const LIBRARIAN_MAX_TOKENS = 32768;
 
 const SYSTEM_PROMPT = `You are the Librarian for one user's personal memory system.
 
@@ -44,105 +45,178 @@ RULES
 - If recent messages don't add anything new and existing profile is fine,
   output the existing profile unchanged.
 
+FORMAT RULES FOR THE VALUES:
+- Both fields must be PLAIN PROSE TEXT — no nested JSON, no {}, [], key-value blobs.
+  Write in sentences or short bullet lines, not serialized objects.
+- If you're tempted to write {"key": "value"} inside the string, write prose instead.
+
 OUTPUT JSON STRICTLY:
 {
-  "core_profile": "<concise high-signal text or null>",
-  "sub_profile":  "<longer secondary text or null>"
+  "core_profile": "<concise high-signal prose or null>",
+  "sub_profile":  "<longer secondary prose or null>"
 }`;
 
-interface PromoteParams {
+let librarianRunning = false;
+
+interface GateState {
   userId: number;
-  /** 살펴볼 user 발화 row 수 (default 30, 가장 최근 N건). */
-  recentLimit?: number;
+  shouldRun: boolean;
+  currentMsgCount: number;
+  lastRunAt: Date | null;
 }
 
-interface PromoteResult {
-  before: { core_profile: string | null; sub_profile: string | null };
-  after:  { core_profile: string | null; sub_profile: string | null };
-  source_message_count: number;
-  changed: boolean;
+async function checkGate(): Promise<GateState> {
+  const userId = await getDefaultUserId();
+
+  const r = await db.query(
+    `SELECT
+       u.librarian_last_run_at,
+       u.librarian_msg_count_at_run,
+       (SELECT COUNT(*)::bigint
+          FROM memory
+         WHERE user_id = u.user_id
+           AND role = 'user'
+           AND is_active = TRUE) AS current_msg_count
+     FROM users u
+     WHERE u.user_id = $1`,
+    [userId]
+  );
+
+  const row = r.rows[0];
+  const lastRunAt: Date | null = row?.librarian_last_run_at ?? null;
+  const msgCountAtRun = Number(row?.librarian_msg_count_at_run ?? 0);
+  const currentMsgCount = Number(row?.current_msg_count ?? 0);
+
+  const neverRan = lastRunAt === null;
+  const cooldownPassed =
+    lastRunAt !== null &&
+    Date.now() - new Date(lastRunAt).getTime() >= LIBRARIAN_COOLDOWN_MS;
+  const enoughNewMessages = currentMsgCount - msgCountAtRun >= LIBRARIAN_MSG_THRESHOLD;
+
+  const shouldRun = enoughNewMessages && (neverRan || cooldownPassed);
+
+  return { userId, shouldRun, currentMsgCount, lastRunAt };
 }
 
-export async function promoteUserProfile(params: PromoteParams): Promise<PromoteResult> {
-  const limit = params.recentLimit ?? 30;
+export async function runLibrarian(): Promise<void> {
+  if (librarianRunning) return;
 
-  const before = await db.query(
-    `SELECT core_profile, sub_profile FROM users WHERE user_id = $1`,
-    [params.userId]
-  );
-  const beforeProfile = before.rows[0] ?? { core_profile: null, sub_profile: null };
+  const gate = await checkGate();
+  if (!gate.shouldRun) return;
 
-  const recent = await db.query(
-    `SELECT message, agent_platform, agent_model, created_at
-       FROM memory
-      WHERE user_id = $1
-        AND role = 'user'
-        AND is_active = TRUE
-      ORDER BY created_at DESC
-      LIMIT $2`,
-    [params.userId, limit]
+  librarianRunning = true;
+
+  // 시도 시 즉시 last_run_at 업데이트 — 실패해도 24h 쿨다운으로 hammer 방지.
+  // msg_count_at_run은 성공 시에만 업데이트 (다음 24h 후 재시도 시 delta 재계산).
+  await db.query(
+    `UPDATE users SET librarian_last_run_at = NOW() WHERE user_id = $1`,
+    [gate.userId]
   );
 
-  if (recent.rows.length === 0) {
-    return {
-      before: beforeProfile,
-      after: beforeProfile,
-      source_message_count: 0,
-      changed: false,
-    };
-  }
+  try {
+    const beforeR = await db.query(
+      `SELECT core_profile, sub_profile FROM users WHERE user_id = $1`,
+      [gate.userId]
+    );
+    const before = beforeR.rows[0] ?? { core_profile: null, sub_profile: null };
 
-  const messagesText = recent.rows
-    .reverse() // 시간순 (오래된 → 최근)
-    .map((r: any, i: number) => `[#${i + 1} @ ${r.created_at?.toISOString().slice(0, 19) ?? ''}] ${r.message}`)
-    .join("\n\n");
+    const recentR = await db.query(
+      `SELECT message, created_at
+         FROM memory
+        WHERE user_id = $1
+          AND role = 'user'
+          AND is_active = TRUE
+        ORDER BY created_at DESC
+        LIMIT $2`,
+      [gate.userId, LIBRARIAN_RECENT_LIMIT]
+    );
 
-  const userPrompt = `EXISTING PROFILE (subject to update):
+    if (recentR.rows.length === 0) return;
+
+    const messagesText = recentR.rows
+      .reverse()
+      .map(
+        (r: any, i: number) =>
+          `[#${i + 1} @ ${r.created_at?.toISOString().slice(0, 19) ?? ''}] ${r.message}`
+      )
+      .join("\n\n");
+
+    const userPrompt = `EXISTING PROFILE (subject to update):
 core_profile:
-${beforeProfile.core_profile ?? '(empty)'}
+${before.core_profile ?? '(empty)'}
 
 sub_profile:
-${beforeProfile.sub_profile ?? '(empty)'}
+${before.sub_profile ?? '(empty)'}
 
-RECENT USER MESSAGES (most recent ${recent.rows.length}, role='user'):
+RECENT USER MESSAGES (most recent ${recentR.rows.length}, role='user'):
 ${messagesText}
 
 Task: produce updated core_profile and sub_profile JSON per the system prompt.`;
 
-  const raw = await callRole('librarian', {
-    system: SYSTEM_PROMPT,
-    user: userPrompt,
-    responseFormat: 'json',
-  });
+    // responseFormat 생략 — qwen3.x + json_object → content 빈 버그.
+    // callSpec local case가 <think>...</think> + ```json fence 모두 strip.
+    // max_tokens=32768: 50-msg 프롬프트에서 reasoning이 8k token 소진 사례 확인.
+    const raw = await callRole('librarian', {
+      system: SYSTEM_PROMPT,
+      user: userPrompt,
+      maxTokens: LIBRARIAN_MAX_TOKENS,
+    });
 
-  let parsed: { core_profile: string | null; sub_profile: string | null };
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error(`Librarian returned invalid JSON: ${raw.slice(0, 200)}`);
-  }
+    if (!raw) {
+      throw new Error('Librarian returned empty content (reasoning token budget exceeded?)');
+    }
 
-  const newCore = parsed.core_profile ?? null;
-  const newSub = parsed.sub_profile ?? null;
-  const changed =
-    (newCore ?? '') !== (beforeProfile.core_profile ?? '') ||
-    (newSub ?? '') !== (beforeProfile.sub_profile ?? '');
+    let parsed: { core_profile: string | null; sub_profile: string | null };
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`Librarian returned unparseable content: ${raw.slice(0, 300)}`);
+    }
 
-  if (changed) {
+    // JSON-in-string guard: 모델이 prose 대신 serialized JSON을 반환하면 reject.
+    // prompt fix만으론 불충분 — qwen3.x가 가끔 {"key":"val"} blob을 field value로 씀.
+    for (const [field, val] of [['core_profile', parsed.core_profile], ['sub_profile', parsed.sub_profile]] as const) {
+      if (typeof val === 'string') {
+        const t = val.trim();
+        if (t.startsWith('{') || t.startsWith('[')) {
+          throw new Error(`Librarian returned JSON-stuffed ${field} (prose required): ${t.slice(0, 120)}`);
+        }
+      }
+    }
+
+    // null 보호: 모델이 null 반환 시 기존 값 보존.
+    // "null = 삭제" 아닌 "null = 변경 없음" 으로 해석 — 실수 덮어쓰기 방지.
+    const newCore = parsed.core_profile ?? before.core_profile;
+    const newSub = parsed.sub_profile ?? before.sub_profile;
+    const changed =
+      (newCore ?? '') !== (before.core_profile ?? '') ||
+      (newSub ?? '') !== (before.sub_profile ?? '');
+
+    if (changed) {
+      await db.query(
+        `UPDATE users
+            SET core_profile = $1,
+                sub_profile  = $2,
+                updated_at   = NOW()
+          WHERE user_id = $3`,
+        [newCore, newSub, gate.userId]
+      );
+    }
+
+    // 성공 시 msg_count_at_run 업데이트 (last_run_at은 시도 시 이미 업데이트됨)
     await db.query(
-      `UPDATE users
-          SET core_profile = $1,
-              sub_profile  = $2,
-              updated_at   = NOW()
-        WHERE user_id = $3`,
-      [newCore, newSub, params.userId]
+      `UPDATE users SET librarian_msg_count_at_run = $1 WHERE user_id = $2`,
+      [gate.currentMsgCount, gate.userId]
     );
-  }
 
-  return {
-    before: beforeProfile,
-    after: { core_profile: newCore, sub_profile: newSub },
-    source_message_count: recent.rows.length,
-    changed,
-  };
+    console.error(
+      `📚 [Librarian] done — ${recentR.rows.length} msgs, profile ${changed ? 'updated' : 'unchanged'}`
+    );
+  } catch (err) {
+    // last_run_at는 이미 업데이트됨 → 24h 쿨다운 후 재시도.
+    // msg_count_at_run은 업데이트 안 됨 → 24h 후 delta 충분하면 다시 실행.
+    console.error("⚠️ [Librarian] run failed (retries in 24h):", err);
+  } finally {
+    librarianRunning = false;
+  }
 }

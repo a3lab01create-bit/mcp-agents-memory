@@ -11,7 +11,11 @@
  */
 
 import { db } from "../db.js";
-import { callRole } from "../model_registry.js";
+import { callRole, callSpec, ROLE_REGISTRY, type ModelSpec } from "../model_registry.js";
+
+// local 프로바이더 사용 시 실패하면 grok으로 fallback (LOCAL_GROK_FALLBACK=false 로 끄기 가능)
+const GROK_FALLBACK_SPEC: ModelSpec = { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' };
+const localFallbackEnabled = process.env.LOCAL_GROK_FALLBACK !== 'false';
 
 export interface TagInput {
   message: string;
@@ -135,11 +139,34 @@ export async function tagMessage(input: TagInput): Promise<TagResult> {
   const candidates = await listProjectTagCandidates();
   const userPrompt = buildUserPrompt(input, candidates);
 
-  const raw = await callRole('tagger', {
-    system: SYSTEM_PROMPT,
-    user: userPrompt,
-    responseFormat: 'json',
-  });
+  const isLocal = ROLE_REGISTRY.tagger.provider === 'local';
+  let raw: string;
+
+  if (isLocal) {
+    try {
+      raw = await callRole('tagger', {
+        system: SYSTEM_PROMPT,
+        user: userPrompt,
+        responseFormat: 'json',
+        // thinking: false — 태거는 단순 매핑 작업. thinking 켜면 reasoning이 모든 토큰 소비해 content 비어버림.
+        // Librarian 등 복잡한 분석 역할에서만 thinking: true 사용.
+      });
+    } catch (err) {
+      if (!localFallbackEnabled) throw err;
+      console.warn(`⚠️ [Tagger] Local model 실패, grok fallback: ${(err as Error).message?.slice(0, 80)}`);
+      raw = await callSpec(GROK_FALLBACK_SPEC, {
+        system: SYSTEM_PROMPT,
+        user: userPrompt,
+        responseFormat: 'json',
+      });
+    }
+  } else {
+    raw = await callRole('tagger', {
+      system: SYSTEM_PROMPT,
+      user: userPrompt,
+      responseFormat: 'json',
+    });
+  }
 
   let parsed: { p_tag: string | null; d_tag: string[] };
   try {

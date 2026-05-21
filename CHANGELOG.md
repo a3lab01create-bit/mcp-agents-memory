@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.9.7 — 2026-05-22
+
+### Librarian v2 — daily user profile promotion
+
+Background job that reads 50 recent `role='user'` messages once per day and promotes stable identity/preference facts to `users.core_profile` / `users.sub_profile` via qwen3.6:35b-a3b (local, Q4_K_M).
+
+Gate logic: `LIBRARIAN_ENABLED=true` + 30 new messages since last run + 24h cooldown. Attempt timestamp written immediately on every call (hammer prevention); `msg_count_at_run` updated on success only so gate re-opens after failed run.
+
+Hardened against two known qwen3.x failure modes: (1) `response_format: json_object` → empty content bug — omitted entirely, relying on callSpec local-case fence stripping; (2) reasoning token exhaustion at 8k — bumped to `max_tokens=32768`. Added JSON-in-string guard (rejects `sub_profile` that starts with `{` or `[`) and null protection (`parsed.field ?? existing` so model returning null preserves existing data).
+
+### Added
+- `src/librarian.ts` — full rebuild (v1 → v2): gate check, per-attempt `last_run_at` update, 32k token budget, null guard, JSON-in-string guard, prose-only system prompt rule
+- `src/migrations/023_librarian_gate.ts` — adds `librarian_last_run_at TIMESTAMPTZ` and `librarian_msg_count_at_run BIGINT` to `users` table
+- `src/cold_path/worker.ts` — wires `maybeRunLibrarian()` into cold path tick (gated by `LIBRARIAN_ENABLED`)
+- `src/model_registry.ts` — `librarian` role in ROLE_REGISTRY; local provider singleton client; `callSpec` exported as public API; qwen3 thinking flag support
+- `src/cold_path/tagger.ts` — grok fallback for local tagger failures (`LOCAL_GROK_FALLBACK=true`)
+- `.env.example` — `LIBRARIAN_PROVIDER`, `LIBRARIAN_MODEL`, `LIBRARIAN_ENABLED` added
+
+### Configuration
+- Ollama tuning applied on 몰타르 서버: `FLASH_ATTENTION=1`, `KV_CACHE_TYPE=q8_0`, `TIMEOUT=900`, `KEEP_ALIVE=60m` via systemd drop-in; Modelfile `num_ctx 16384` (down from 131072 — VRAM 97% constraint), `temperature 0.65`, `repeat_penalty 1.1`
+
 ## 0.8.1 — 2026-04-28
 
 ### Skill injection eval harness (dev tool)
