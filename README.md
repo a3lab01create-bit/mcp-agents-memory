@@ -139,7 +139,7 @@ manage_knowledge({
 | **Tagger (Cold Path)** | Google `gemini-2.5-flash` (predefined + dynamic) |
 | **검색 fallback** | PostgreSQL `ILIKE` (cosine 임계값 미만 시) |
 | **DB** | PostgreSQL + pgvector |
-| **Librarian (memory → user)** | TBD (form vision 결정 후) |
+| **Librarian (memory → user)** | local `qwen3.6:35b-a3b` (Q4_K_M, ollama) — 30 메시지 + 24h 게이트 |
 | **Skill 시스템** | TBD (다음 라운드) |
 
 ---
@@ -192,7 +192,7 @@ AGENT_KEY=...                      # 옵션, multi-persona 구분용
 | Librarian 구현 (memory → user.core/sub_profile promote) | ✅ Done |
 | MCP Tools (`search_memory` + `manage_knowledge`) | ✅ Done |
 | Migration (legacy ~3582 row → archive 보존 + 재임베딩) | ✅ Done |
-| 핵심 정체성 promote (user.core_profile / sub_profile) | ✅ Done — Librarian draft + form review |
+| 핵심 정체성 promote (user.core_profile / sub_profile) | ✅ Done — Librarian v2 (gate + null guard + JSON-in-string guard, qwen3.6:35b-a3b) |
 | Skill 트랙 정리 | ⏳ form 결정 보류, 차후 |
 
 ---

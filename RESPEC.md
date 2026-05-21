@@ -128,9 +128,13 @@ Tokens $0.50/ 1M tokens
 
 
 
-**Librarian**
+**Librarian** ✅ v2 완성 (2026-05-22)
 
 - memory table 에서 필요한 user 테이블용 정보를 선별해서 user 테이블에 저장
+- 모델: `qwen3.6:35b-a3b` (local/ollama, Q4_K_M) — thinking 허용, max_tokens=32768
+- 게이트: `LIBRARIAN_ENABLED=true` + 30 새 메시지 + 24h 쿨다운
+- 실패 방어: attempt 시 `last_run_at` 즉시 기록 (hammer 방지), null guard, JSON-in-string guard
+- Cold Path worker tick마다 `maybeRunLibrarian()` 호출 (migration 023)
 
 
 
