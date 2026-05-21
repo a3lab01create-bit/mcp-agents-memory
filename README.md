@@ -201,7 +201,7 @@ AGENT_KEY=...                      # 옵션, multi-persona 구분용
 
 - [`RESPEC.md`](./RESPEC.md) — 현재 vision + 회의 결정사항 + 구현 detail (단일 진실 원천)
 - [`SPEC.md`](./SPEC.md) — 구 SPEC (v0.x 역사 보존, 일부 §3.4 Memory Tier가 본 vision의 원형)
-- [`PROBLEMS.md`](./PROBLEMS.md) — 현재 진행 중 cleanup 단계 / 진단 결과
+- [`DEVLOG.md`](./DEVLOG.md) — 운영 이슈, 관찰 로그, 아이디어 적립
 
 ---
 
