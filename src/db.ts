@@ -10,18 +10,22 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─────────────────────────────────────────────────────────────
 // Config (.env) loading
-// Search order — first hit wins:
+// Search order — first valid hit wins (file must exist AND contain DB creds):
 //   1. MEMORY_CONFIG_PATH (explicit override)
 //   2. process.cwd()/.env  (project-local — preserves dev workflow)
 //   3. ~/.config/mcp-agents-memory/.env  (XDG, where the wizard writes)
 //   4. __dirname/../.env  (legacy fallback inside the package)
+//
+// "Valid" = parsed file contains DATABASE_URL or DB_HOST.
+// This prevents stray home-dir .env files (e.g. one containing only SUDO_PASSWORD)
+// from silently shadowing the real config.
 // ─────────────────────────────────────────────────────────────
 
 export function configSearchPaths(): string[] {
   const paths: string[] = [];
   if (process.env.MEMORY_CONFIG_PATH) paths.push(process.env.MEMORY_CONFIG_PATH);
-  paths.push(path.join(os.homedir(), '.config', 'mcp-agents-memory', '.env'));
   paths.push(path.resolve(process.cwd(), '.env'));
+  paths.push(path.join(os.homedir(), '.config', 'mcp-agents-memory', '.env'));
   paths.push(path.resolve(__dirname, '..', '.env'));
   return paths;
 }
@@ -31,11 +35,12 @@ let envLoadedFrom: string | null = null;
 export function loadEnv(): string | null {
   if (envLoadedFrom) return envLoadedFrom;
   for (const candidate of configSearchPaths()) {
-    if (fs.existsSync(candidate)) {
-      dotenv.config({ path: candidate });
-      envLoadedFrom = candidate;
-      return candidate;
-    }
+    if (!fs.existsSync(candidate)) continue;
+    const parsed = dotenv.parse(fs.readFileSync(candidate, 'utf-8'));
+    if (!parsed.DATABASE_URL && !parsed.DB_HOST) continue; // skip non-DB .env files
+    dotenv.config({ path: candidate });
+    envLoadedFrom = candidate;
+    return candidate;
   }
   return null;
 }
