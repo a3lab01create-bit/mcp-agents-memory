@@ -143,7 +143,21 @@ Pinned/Recent 도달 못 함).
 + `INSTRUCTIONS_MAX_CHARS`(기본 1900)에서 brief 예산 역산. 조립 실측 1,827자.
 ✅ fresh 재시작 테스트 PASS (2026-05-22): 새 세션 instructions에 Core → Pinned(4개) → Active가
 `[truncated]` 없이 주입됨, Sub Profile·Recent는 의도된 drop 확인 (inject vs full 대조로 검증).
-클라이언트 실주입 end-to-end 확정. Phase 2(brief CLI + SessionStart 훅)는 별도.
+클라이언트 실주입 end-to-end 확정.
+
+**Phase 2 (2026-05-22) — 연속성 채널 분리, 표준 경로로 확정**: Phase 1은 instructions(캡)에서
+Recent를 드롭했으므로 "직전 대화 연속성"은 아직 자동 주입 안 됨. 첫 시도는 Claude Code `SessionStart`
+훅(+ `session-brief` CLI)으로 캡을 우회하는 것 — 구현·검증까지 했으나 **폐기**: 훅은 (a) Claude Code 전용
+(b) 클라 settings.json 수동 등록 필요 = "표준 MCP 환경 zero-config" 원칙 위반(cf. 핀 메모리 id 60006,
+`feedback_no_settings_json_writes`).
+→ **확정 해결(표준·전 플랫폼·zero-config)**: 연속성을 캡 없는 **`memory_startup` 툴 응답**에 싣는다.
+  - `recent_messages_current`를 **현재 기기(`device_name = os.hostname()`)로 스코프** — "이 기기에서 뭐 하다 끊겼나".
+  - 미리보기를 캡과 **디커플** — `rowToMsg`는 `MAX_PREVIEW_STORE`(500)까지 저장, full-mode Recent만
+    `PREVIEW_RECENT`(300), pinned·whispers·**inject는 `PREVIEW_COMPACT`(100) 유지**(inject 캡 불변).
+  - full brief 캡 `BRIEF_MAX_CHARS` 3000→8000 (두꺼운 Recent가 optional-fill에서 드롭되지 않게).
+  instructions의 pointer("세션 시작 시 memory_startup 호출")가 전 플랫폼(Claude/Codex/Gemini)에서
+  이 풍부한 연속성을 끌어옴 — 클라 설정 0. 로컬 덤프 검증: Recent device=현재기기 단일·미리보기 두꺼움·pinned 100자 유지.
+⏳ 남은 것: `search_memory` device 스코프(local/global) — 별도 (Phase 2b).
 
 ---
 

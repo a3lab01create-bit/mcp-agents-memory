@@ -21,15 +21,22 @@ import * as os from "node:os";
 import { db } from "./db.js";
 import { getDefaultUserId } from "./users.js";
 
-const RECENT_CURRENT_LIMIT = 8;        // 현 platform 최근 N건 (또는 cross-platform 8건)
+const RECENT_CURRENT_LIMIT = 8;        // 현 platform+기기 최근 N건. ⚠️ N × PREVIEW_RECENT(300) ≈ 2.4KB —
+                                       //   memory_startup은 캡 없는 툴 응답이라 OK. 단 mid-session 반복 호출 시 매번 재주입됨.
 const RECENT_OTHERS_LIMIT = 4;          // 타 platform 최근 N건 (currentPlatform 있을 때만)
-const RECENT_MESSAGE_PREVIEW = 100;     // 각 메시지 첫 N자만
+// 미리보기 길이 — 캡과 디커플. rowToMsg는 MAX_PREVIEW_STORE까지 저장하고,
+// formatMsgLine이 context별 maxPreview로 슬라이스한다.
+// invariant: MAX_PREVIEW_STORE > 모든 maxPreview 값 (안 그러면 '…' 잘림 표시가 깨짐).
+const MAX_PREVIEW_STORE = 500;          // rowToMsg 저장 상한
+const PREVIEW_COMPACT = 100;            // pinned·whispers·inject (캡 민감 → 짧게)
+const PREVIEW_RECENT = 300;             // full-mode 현재기기 Recent (캡 없는 툴 응답 → 두껍게)
 const ACTIVE_PTAG_LIMIT = 5;            // 활성 프로젝트 태그 top N
 const PINNED_LIMIT = 10;                // 고정 메모리 top N (full brief)
 const INJECT_PINNED_LIMIT = 5;          // inject 모드 인라인 고정 메모리 최신 N개
-// full brief(memory_startup tool) 최대 길이. inject 모드는 이 값 대신
-// index.ts가 INSTRUCTIONS_MAX_CHARS에서 역산한 예산(maxChars)을 넘겨받아 쓴다.
-const BRIEF_MAX_CHARS = Number(process.env.BRIEF_MAX_CHARS ?? 3000);
+// full brief(memory_startup tool) 최대 길이. 클라가 안 자르는 툴 응답이므로 넉넉히 —
+// 두꺼운 Recent(현재기기 8건×300자)가 optional-fill에서 통째 드롭되지 않도록 충분해야 한다.
+// inject 모드는 이 값 대신 index.ts가 INSTRUCTIONS_MAX_CHARS에서 역산한 예산(maxChars)을 받아 쓴다.
+const BRIEF_MAX_CHARS = Number(process.env.BRIEF_MAX_CHARS ?? 8000);
 
 export interface BriefMessage {
   role: string;
@@ -60,6 +67,8 @@ export interface CollectBriefOpts {
   shortTermDays?: number;
   /** "claude-code" / "gemini-cli-mcp-client" 등. null/undefined면 cross-platform brief. */
   currentPlatform?: string | null;
+  /** 현재 기기명 (default os.hostname()). currentPlatform 분기의 recent를 이 기기로 스코프. */
+  deviceName?: string;
 }
 
 /** brief 데이터 수집. Hot Path INSERT가 빈번할 때도 빠르게 (~50ms) 동작 목표. */
@@ -67,6 +76,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
   const userId = opts.userId ?? (await getDefaultUserId());
   const shortTermDays = opts.shortTermDays ?? Number(process.env.SHORT_TERM_DAYS ?? 3);
   const currentPlatform = opts.currentPlatform ?? null;
+  const deviceName = opts.deviceName ?? os.hostname();
 
   // user 정보
   const u = await db.query(
@@ -108,7 +118,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
   let recentOthers: BriefMessage[] = [];
 
   if (currentPlatform) {
-    // current platform 메시지 우선
+    // current platform + 현재 기기 메시지 우선 (연속성: "이 기기에서 뭐 하다 끊겼나")
     const currentMsgs = await db.query(
       `SELECT role, agent_platform, device_name, message, created_at
          FROM memory
@@ -116,10 +126,11 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
           AND is_active = TRUE
           AND created_at >= NOW() - ($2 || ' days')::INTERVAL
           AND agent_platform = $3
+          AND device_name = $4
           AND is_pinned = FALSE
         ORDER BY created_at DESC
-        LIMIT $4`,
-      [userId, String(shortTermDays), currentPlatform, RECENT_CURRENT_LIMIT]
+        LIMIT $5`,
+      [userId, String(shortTermDays), currentPlatform, deviceName, RECENT_CURRENT_LIMIT]
     );
     recentCurrent = currentMsgs.rows.reverse().map(rowToMsg);
 
@@ -175,7 +186,7 @@ function rowToMsg(r: any): BriefMessage {
     role: r.role,
     agent_platform: r.agent_platform,
     device_name: r.device_name ?? null,
-    preview: String(r.message ?? '').slice(0, RECENT_MESSAGE_PREVIEW),
+    preview: String(r.message ?? '').slice(0, MAX_PREVIEW_STORE),
     created_at: r.created_at,
   };
 }
@@ -263,7 +274,7 @@ function formatBriefFull(brief: BriefData): string {
       : `## Recent Memory (last ${brief.recent_messages_current.length}, oldest → newest)`;
     const lines: string[] = [heading];
     for (const m of brief.recent_messages_current) {
-      lines.push(formatMsgLine(m, brief.current_platform === null));
+      lines.push(formatMsgLine(m, brief.current_platform === null, PREVIEW_RECENT));
     }
     lines.push('');
     optionalSections.push(lines.join('\n'));
@@ -356,10 +367,13 @@ function fitSection(heading: string, lines: string[], budget: { remaining: numbe
   return out.join('\n');
 }
 
-function formatMsgLine(m: BriefMessage, showPlatform: boolean): string {
+function formatMsgLine(m: BriefMessage, showPlatform: boolean, maxPreview: number = PREVIEW_COMPACT): string {
   const dt = m.created_at?.toISOString?.().slice(11, 16) ?? '';
   const device = m.device_name ? `@${m.device_name} ` : '';
   const platformTag = showPlatform ? `${m.agent_platform} ${device}` : device;
-  const truncated = m.preview.length >= RECENT_MESSAGE_PREVIEW ? '…' : '';
-  return `- [${dt} ${platformTag}${m.role}] ${m.preview}${truncated}`;
+  // m.preview는 MAX_PREVIEW_STORE까지 저장돼 있음 → context별 maxPreview로 슬라이스.
+  // invariant(MAX_PREVIEW_STORE > maxPreview) 덕에 length > maxPreview면 '실제로 더 길다'가 보장됨.
+  const truncated = m.preview.length > maxPreview;
+  const text = truncated ? m.preview.slice(0, maxPreview) : m.preview;
+  return `- [${dt} ${platformTag}${m.role}] ${text}${truncated ? '…' : ''}`;
 }
