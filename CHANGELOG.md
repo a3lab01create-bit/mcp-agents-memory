@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.9.9 — 2026-05-23
+
+### `search_memory` device scoping — "search wide, resume narrow"
+
+New `device_scope: 'local' | 'global'` param (default `global`). `local` restricts results to the current device (`os.hostname()`), but pinned memories stay cross-device (`device_name = $N OR is_pinned = TRUE`) — mirroring the brief's device-scope + pinned-exempt precedent, since pinned facts are important regardless of context. Applied to both the vector/recency path and the ILIKE fallback.
+
+Two bugs surfaced during the brief-continuity verification are fixed:
+
+- `agent_platform: "*"` was a literal SQL match (`= '*'`) returning 0 rows, despite the startup brief documenting `"*"` as a cross-platform search. Now treated as no-filter.
+- `device_name` was absent from `search_memory` results (the brief renders `@hostname`, but search dropped it). Added to the result schema, all three SELECTs, and all three row mappers.
+
+Zero-config preserved: the server resolves the hostname; no per-client configuration.
+
+## 0.9.8 — 2026-05-22
+
+### Startup brief — budget cap + device-scoped continuity
+
+Two-channel brief assembly so the client-injected MCP `instructions` block survives the client's ~2KB truncation while `memory_startup` carries the rich context.
+
+- **Inject mode (Phase 1)**: `STATIC_INSTRUCTIONS` trimmed (1,436→565 chars); the auto-injected brief now guarantees header + Core Profile + pinned + active projects within `INSTRUCTIONS_MAX_CHARS` (default 1900) via budgeted line-fill, dropping Sub Profile / Recent in inject mode (they load lazily via `memory_startup`). Pinned hoisted above Sub Profile.
+- **`memory_startup` continuity (Phase 2)**: previous-conversation continuity rides the uncapped `memory_startup` tool response, not a Claude-Code-only `SessionStart` hook — that hook attempt was built then reverted for violating the zero-config standard-env principle. `recent_messages_current` scoped to the current device (`device_name = os.hostname()`); preview length decoupled from the inject cap (`MAX_PREVIEW_STORE` 500 / `PREVIEW_RECENT` 300 / `PREVIEW_COMPACT` 100); `BRIEF_MAX_CHARS` 3000→8000 so the thicker Recent is not dropped.
+- **Proactive resource use**: brief footer + STATIC instructions nudge agents to call `search_memory` on named-entity mentions and before assuming past preferences/decisions.
+
+The `instructions` pointer drives every platform (Claude / Codex / Gemini) to call `memory_startup`, so all clients get rich device-scoped continuity with zero client config.
+
 ## 0.9.7 — 2026-05-22
 
 ### Librarian v2 — daily user profile promotion

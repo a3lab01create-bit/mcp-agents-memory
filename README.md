@@ -109,7 +109,11 @@ search_memory({
   query?: string,        // 의미 검색 (vector + ILIKE fallback)
   p_tag?: string,        // 특정 프로젝트로 한정
   date_range?: string,   // 기간 한정 (예: "2026-04-29..", "last_week")
-  role?: 'user' | 'assistant',  // form 발화만 / assistant 발화만 (기본 둘 다)
+  role?: 'user' | 'assistant',  // user 발화만 / assistant 발화만 (기본 둘 다)
+  agent_platform?: string,      // 플랫폼 한정 (예: 'claude-code'). 생략 또는 '*' = 전 플랫폼
+  device_scope?: 'local' | 'global',  // 'global'(기본)=전 기기 / 'local'=현재 기기(pinned은 기기 무관)
+  limit?: number,        // 최대 결과 수 (기본 10, 최대 50)
+  include_archived?: boolean,   // archived 메모리 포함 (기본 false)
 })
 ```
 
