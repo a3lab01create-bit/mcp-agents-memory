@@ -17,6 +17,7 @@ import { z } from "zod";
 import { db } from "../db.js";
 import { getDefaultUserId } from "../users.js";
 import { embedMessage, vectorToHalfvecSql } from "../cold_path/embedder.js";
+import os from "node:os";
 
 const DEFAULT_LIMIT = 10;
 const DEFAULT_FALLBACK_THRESHOLD = 0.3;
@@ -76,6 +77,7 @@ interface SearchRow {
   message: string;
   agent_platform: string;
   agent_model: string;
+  device_name: string | null;
   p_tag_name: string | null;
   d_tag: string[];
   is_pinned: boolean;
@@ -105,7 +107,10 @@ date_range 인식 형식:
         date_range: z.string().optional().describe("기간 한정 (today / last_week / last_month / 7_days_ago / YYYY-MM-DD)"),
         role: z.enum(['user', 'assistant']).optional().describe("발화자 한정 (생략 시 둘 다)"),
         agent_platform: z.string().optional().describe(
-          "agent platform 한정 (예: 'claude-code', 'gemini-cli-mcp-client'). 생략 시 cross-platform."
+          "agent platform 한정 (예: 'claude-code', 'gemini-cli-mcp-client'). 생략 또는 '*' 이면 cross-platform(전 플랫폼)."
+        ),
+        device_scope: z.enum(['local', 'global']).optional().describe(
+          "기기 한정. 'global'(기본): 전 기기 검색(넓게). 'local': 현재 기기(hostname)로 한정(이어받기용, 좁게). zero-config — 서버가 hostname 자동 해석."
         ),
         limit: z.number().int().min(1).max(50).optional().describe(`최대 결과 수 (default ${DEFAULT_LIMIT})`),
         include_archived: z.boolean().optional().describe("archived 메모리도 포함 (default false)"),
@@ -136,6 +141,7 @@ date_range 인식 형식:
 
       const sinceDate = parseDateRange(args.date_range);
       const includeArchived = args.include_archived === true;
+      const localDevice = os.hostname();  // device_scope:'local' 시 현재 기기 식별 (briefing.ts와 동일)
 
       const filters: string[] = [`m.user_id = $1`];
       const params: any[] = [userId];
@@ -155,9 +161,17 @@ date_range 인식 형식:
         filters.push(`m.role = $${p++}`);
         params.push(args.role);
       }
-      if (args.agent_platform) {
+      if (args.agent_platform && args.agent_platform !== '*') {
         filters.push(`m.agent_platform = $${p++}`);
         params.push(args.agent_platform);
+      }
+      // device_scope: 'local' → 현재 기기로 한정 (zero-config: os.hostname()). 'global'(기본) → 전 기기.
+      // briefing.ts:130 패턴 미러: device-scope하되 **pinned는 기기 무관 노출**(강제기억은 맥락 불문 중요).
+      // briefing은 pinned를 별도 섹션으로 빼지만 search는 단일 리스트라 OR로 합친다.
+      // device_name NULL인 옛 행(migration 022 이전)은 local에서 제외 — 의도된 동작(NULL ≠ this device).
+      if (args.device_scope === 'local') {
+        filters.push(`(m.device_name = $${p++} OR m.is_pinned = TRUE)`);
+        params.push(localDevice);
       }
       const whereSql = filters.join(' AND ');
 
@@ -176,7 +190,7 @@ date_range 인식 형식:
           params.push(limit);
 
           const r = await db.query(
-            `SELECT m.id, m.role, m.message, m.agent_platform, m.agent_model,
+            `SELECT m.id, m.role, m.message, m.agent_platform, m.agent_model, m.device_name,
                     pt.name AS p_tag_name, m.d_tag, m.is_pinned, m.created_at,
                     1 - (m.embedding <=> $${vecParam}::halfvec) AS similarity
                FROM memory m
@@ -193,6 +207,7 @@ date_range 인식 형식:
             message: row.message,
             agent_platform: row.agent_platform,
             agent_model: row.agent_model,
+            device_name: row.device_name ?? null,
             p_tag_name: row.p_tag_name,
             d_tag: row.d_tag ?? [],
             is_pinned: row.is_pinned,
@@ -226,16 +241,20 @@ date_range 인식 형식:
             ilikeFilters.push(`m.role = $${q++}`);
             ilikeParams.push(args.role);
           }
-          if (args.agent_platform) {
+          if (args.agent_platform && args.agent_platform !== '*') {
             ilikeFilters.push(`m.agent_platform = $${q++}`);
             ilikeParams.push(args.agent_platform);
+          }
+          if (args.device_scope === 'local') {
+            ilikeFilters.push(`(m.device_name = $${q++} OR m.is_pinned = TRUE)`);
+            ilikeParams.push(localDevice);
           }
           ilikeFilters.push(`m.message ILIKE $${q++}`);
           ilikeParams.push(`%${args.query}%`);
           ilikeParams.push(limit);
 
           const r = await db.query(
-            `SELECT m.id, m.role, m.message, m.agent_platform, m.agent_model,
+            `SELECT m.id, m.role, m.message, m.agent_platform, m.agent_model, m.device_name,
                     pt.name AS p_tag_name, m.d_tag, m.is_pinned, m.created_at
                FROM memory m
                LEFT JOIN project_tags pt ON pt.id = m.p_tag_id
@@ -251,6 +270,7 @@ date_range 인식 형식:
               message: row.message,
               agent_platform: row.agent_platform,
               agent_model: row.agent_model,
+              device_name: row.device_name ?? null,
               p_tag_name: row.p_tag_name,
               d_tag: row.d_tag ?? [],
               is_pinned: row.is_pinned,
@@ -264,7 +284,7 @@ date_range 인식 형식:
         // ── query 없음: 시간순 최근 N건 ──
         params.push(limit);
         const r = await db.query(
-          `SELECT m.id, m.role, m.message, m.agent_platform, m.agent_model,
+          `SELECT m.id, m.role, m.message, m.agent_platform, m.agent_model, m.device_name,
                   pt.name AS p_tag_name, m.d_tag, m.is_pinned, m.created_at
              FROM memory m
              LEFT JOIN project_tags pt ON pt.id = m.p_tag_id
@@ -279,6 +299,7 @@ date_range 인식 형식:
           message: row.message,
           agent_platform: row.agent_platform,
           agent_model: row.agent_model,
+          device_name: row.device_name ?? null,
           p_tag_name: row.p_tag_name,
           d_tag: row.d_tag ?? [],
           is_pinned: row.is_pinned,

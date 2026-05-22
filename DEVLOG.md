@@ -157,7 +157,21 @@ Recent를 드롭했으므로 "직전 대화 연속성"은 아직 자동 주입 �
   - full brief 캡 `BRIEF_MAX_CHARS` 3000→8000 (두꺼운 Recent가 optional-fill에서 드롭되지 않게).
   instructions의 pointer("세션 시작 시 memory_startup 호출")가 전 플랫폼(Claude/Codex/Gemini)에서
   이 풍부한 연속성을 끌어옴 — 클라 설정 0. 로컬 덤프 검증: Recent device=현재기기 단일·미리보기 두꺼움·pinned 100자 유지.
-⏳ 남은 것: `search_memory` device 스코프(local/global) — 별도 (Phase 2b).
+**Phase 2b (2026-05-23) — `search_memory` device 스코프 + 부수 버그 2건**: "찾을 땐 넓게,
+이어받을 땐 좁게" 원칙을 검색 툴에도 적용. Phase 2 검증 중 발견한 버그 2건을 함께 픽스.
+- **device_scope 추가**: `device_scope: 'local'|'global'`(기본 `global`). `local`이면 현재 기기
+  (`os.hostname()`, briefing.ts:79 미러)로 `AND device_name = $N` 한정. main `filters`(vector·recency)
+  + `ilikeFilters`(fallback) 양쪽에 동일 적용. `device_name` NULL인 옛 행(migration 022 이전)은
+  local에서 제외 — 의도된 동작.
+- **버그 #1**: `agent_platform: "*"`가 리터럴 `= '*'` 매칭이라 0건 반환(brief가 "*"=cross-platform이라
+  안내하는데 실제론 안 먹힘). → `args.agent_platform !== '*'` 가드로 "*"=no-filter 처리.
+- **버그 #2**: search 결과에 `device_name` 미노출(brief는 `@hostname` 렌더하는데). → `SearchRow` +
+  3개 SELECT + 3개 mapper에 `device_name` 추가.
+- **zero-config 유지**: hostname을 서버가 해석(클라가 device id 안 넘김). `briefing.ts`는 안 건드림.
+✅ 임시 `dump-search` 하네스(fake-server stub으로 실제 핸들러 클로저 호출)로 검증·제거·재빌드:
+  `"*"` 0→count>0, 모든 결과에 device_name, **GLOBAL 4기기 vs LOCAL 1기기(현재) 배제 실증**
+  (DB 분포: Mac-Studio 3428·null 1424·MS-Mortar 641·Mac-Pro 597·t460 420·MacBook 46),
+  predicate proof `device_name='호스트' 641행 vs '없는기기' 0행`. tsc --noEmit clean.
 
 ---
 
