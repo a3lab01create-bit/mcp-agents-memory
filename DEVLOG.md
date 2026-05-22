@@ -107,7 +107,7 @@
 
 ---
 
-## §8. Agent 능동적 자원 활용 부재 ⏳ 보류
+## §8. Agent 능동적 자원 활용 부재 🔵 SHIPPED (v0.9.8)
 
 **현상**: 메모리/웹/문서 연결돼있어도 agent가 스스로 찾아보지 않음.
 
@@ -125,14 +125,25 @@
 
 ---
 
-## §9. memory_startup brief 품질 ⏳ 보류
+## §9. memory_startup brief 품질 🔵 SHIPPED (v0.9.8)
 
 **현상**: 핵심 맥락이 잘리거나 기기마다 달라짐. `N… [truncated]` 발생.
 
 **방향 아이디어**
-- [ ] 핵심 프로필 항목 최상단 고정 (잘려도 살아남게)
-- [ ] is_pinned 항목 절대 생략 안 하는 규칙
-- [ ] brief 총 길이 명시적 제어
+- [x] 핵심 프로필 항목 최상단 고정 (inject 모드: Core 보장 + Pinned를 Sub 앞으로 재정렬)
+- [x] is_pinned 항목 절대 생략 안 하는 규칙 (inject 예산 1순위 fill)
+- [x] brief 총 길이 명시적 제어 (`INSTRUCTIONS_MAX_CHARS`)
+
+**Follow-up (2026-05-22)**: 위 v0.9.8 SHIPPED는 **서버측 brief budget cap**만 다뤘음.
+실제 증상("이전 대화내역 startup 미주입")의 근인은 **클라이언트(Claude Code)가 MCP `instructions`
+블록을 ~2,054자에서 절삭**하는 것 — 별건. fresh 세션 실측으로 확정(Sub Profile 중간 `[truncated]`,
+Pinned/Recent 도달 못 함).
+→ 해결: STATIC_INSTRUCTIONS 다이어트(1,436→565자) + `formatBriefMarkdown` **inject 모드**
+(header+Core+Pinned+Active만 캡 안에 보장, Sub Profile·Recent는 `memory_startup` lazy load)
++ `INSTRUCTIONS_MAX_CHARS`(기본 1900)에서 brief 예산 역산. 조립 실측 1,827자.
+✅ fresh 재시작 테스트 PASS (2026-05-22): 새 세션 instructions에 Core → Pinned(4개) → Active가
+`[truncated]` 없이 주입됨, Sub Profile·Recent는 의도된 drop 확인 (inject vs full 대조로 검증).
+클라이언트 실주입 end-to-end 확정. Phase 2(brief CLI + SessionStart 훅)는 별도.
 
 ---
 

@@ -25,9 +25,10 @@ const RECENT_CURRENT_LIMIT = 8;        // 현 platform 최근 N건 (또는 cross
 const RECENT_OTHERS_LIMIT = 4;          // 타 platform 최근 N건 (currentPlatform 있을 때만)
 const RECENT_MESSAGE_PREVIEW = 100;     // 각 메시지 첫 N자만
 const ACTIVE_PTAG_LIMIT = 5;            // 활성 프로젝트 태그 top N
-const PINNED_LIMIT = 10;                // 고정 메모리 top N
-// MCP 클라이언트가 instructions 필드를 자르기 전 brief 최대 길이.
-// STATIC_INSTRUCTIONS (~900자)와 구분자를 제외한 brief 부분 기준.
+const PINNED_LIMIT = 10;                // 고정 메모리 top N (full brief)
+const INJECT_PINNED_LIMIT = 5;          // inject 모드 인라인 고정 메모리 최신 N개
+// full brief(memory_startup tool) 최대 길이. inject 모드는 이 값 대신
+// index.ts가 INSTRUCTIONS_MAX_CHARS에서 역산한 예산(maxChars)을 넘겨받아 쓴다.
 const BRIEF_MAX_CHARS = Number(process.env.BRIEF_MAX_CHARS ?? 3000);
 
 export interface BriefMessage {
@@ -187,7 +188,23 @@ function rowToMsg(r: any): BriefMessage {
  *   2. Optional sections (active projects + recent messages) — 남은 budget 내 섹션 단위로 채움.
  * 결과는 BRIEF_MAX_CHARS 이하. is_pinned 항목은 절대 잘리지 않음.
  */
-export function formatBriefMarkdown(brief: BriefData): string {
+export interface FormatBriefOpts {
+  /** 'inject' = 시작 instructions용 압축 brief (Sub Profile·Recent 드롭, 예산 내 Pinned+Active만).
+   *  'full' = memory_startup tool용 전체 brief. default 'full'. */
+  mode?: "inject" | "full";
+  /** inject 모드에서 brief가 차지할 수 있는 최대 char 수 (초과 줄은 graceful drop). */
+  maxChars?: number;
+}
+
+export function formatBriefMarkdown(brief: BriefData, opts: FormatBriefOpts = {}): string {
+  if ((opts.mode ?? "full") === "inject") {
+    return formatBriefInject(brief, opts.maxChars ?? BRIEF_MAX_CHARS);
+  }
+  return formatBriefFull(brief);
+}
+
+/** 전체 brief (memory_startup tool용). 기존 동작 유지. */
+function formatBriefFull(brief: BriefData): string {
   // --- 1. Guaranteed sections ---
   const gLines: string[] = [];
   gLines.push(`# Memory Briefing (user: ${brief.user_name})`);
@@ -268,6 +285,75 @@ export function formatBriefMarkdown(brief: BriefData): string {
   }
 
   return guaranteed + '\n' + optionalText + '\n' + footer;
+}
+
+/**
+ * inject 모드 — 시작 instructions 캡(클라이언트 ~2KB) 안에서 살아남는 압축 brief.
+ *
+ * 보장: header + Core Profile + pointer footer.
+ * 예산 내에서 Pinned → Active Projects 순으로 줄 단위 graceful fill.
+ * Sub Profile·Recent 메시지는 드롭 (memory_startup으로 lazy load).
+ * Pinned이 절삭 1순위 피해자였던 full 구조(Core→Sub→Pinned)를 뒤집어 Core 바로 뒤로 끌어올림.
+ */
+function formatBriefInject(brief: BriefData, maxChars: number): string {
+  // --- 보장 섹션: header + Core Profile ---
+  const headLines: string[] = [`# Memory Briefing (user: ${brief.user_name})`];
+  if (brief.current_platform) {
+    headLines.push(`Current platform: \`${brief.current_platform} @ ${os.hostname()}\``);
+  }
+  headLines.push('');
+  if (brief.core_profile) {
+    headLines.push('## Core Profile', brief.core_profile, '');
+  }
+  const header = headLines.join('\n');
+
+  // --- pointer footer: 나머지는 memory_startup으로 lazy load ---
+  const pointer = [
+    '---',
+    '⚡ 압축본입니다. **세션 시작 시 `memory_startup`을 한 번 호출**해 최근 대화·활성 프로젝트·상세 프로필을 이어받으세요.',
+    'Use `search_memory({ query, p_tag, date_range, role, agent_platform })` to retrieve more.',
+  ].join('\n');
+
+  // --- 남은 예산으로 Pinned → Active 순 줄 단위 fill ---
+  const budget = { remaining: Math.max(0, maxChars - header.length - pointer.length - 2) };
+
+  const pinnedLines = brief.pinned_memories
+    .slice(0, INJECT_PINNED_LIMIT)
+    .map((m) => formatMsgLine(m, true));
+  const pinnedSection = fitSection('## Pinned Memories (Important Facts)', pinnedLines, budget);
+
+  const activeLines = brief.active_p_tags.map((t) => {
+    const dt = t.last_used ? t.last_used.toISOString().slice(0, 10) : '?';
+    return `- **${t.name}** — ${t.count} memories (last: ${dt})`;
+  });
+  const activeSection = fitSection(
+    `## Active Projects (last ${brief.short_term_window_days} days)`,
+    activeLines,
+    budget
+  );
+
+  return [header.trimEnd(), pinnedSection, activeSection, pointer]
+    .filter((s) => s.length > 0)
+    .join('\n\n');
+}
+
+/**
+ * heading + budget 내에 들어가는 만큼의 줄을 채워 반환. 한 줄도 못 넣으면 '' (heading도 생략).
+ * 사용한 char 수만큼 budget.remaining 차감 (mutate).
+ */
+function fitSection(heading: string, lines: string[], budget: { remaining: number }): string {
+  if (lines.length === 0) return '';
+  const headingCost = heading.length + 1;       // heading + 후행 '\n'
+  if (budget.remaining < headingCost + lines[0].length + 1) return '';
+  const out: string[] = [heading];
+  let used = headingCost;
+  for (const ln of lines) {
+    if (used + ln.length + 1 > budget.remaining) break;
+    out.push(ln);
+    used += ln.length + 1;
+  }
+  budget.remaining -= used;
+  return out.join('\n');
 }
 
 function formatMsgLine(m: BriefMessage, showPlatform: boolean): string {

@@ -21,30 +21,22 @@ import { PACKAGE_VERSION } from "./version.js";
 import fs from "fs";
 
 const BRIEF_DB_TIMEOUT_MS = 5000;
+// 조립된 instructions(STATIC + brief) 최대 char. 클라이언트(Claude Code 등)가
+// instructions를 ~2KB(실측 ~2,054자)에서 절삭하므로, 그 안에 들어가도록 brief 예산을 역산한다.
+const INSTRUCTIONS_MAX_CHARS = Number(process.env.INSTRUCTIONS_MAX_CHARS ?? 1900);
+const INSTRUCTIONS_SEP = "\n\n---\n\n";
 
 const STATIC_INSTRUCTIONS = `Long-term memory MCP server (RESPEC v1).
 
-Tools:
-  - memory_startup    : 시작 brief (user profile + 최근 활성 프로젝트 + 최근 메모리). 세션 시작 시 첫 호출 권장.
-  - search_memory     : 과거 기억 조회/검색 통합 (의미 + 키워드 fallback)
-  - manage_knowledge  : 명시 저장/수정/삭제 통합 (강제 기억은 is_pinned, archive 면제)
-  - save_message      : transcript 캡처 미지원 platform 한정 fallback (Cursor 등). Hot Path 직접 INSERT.
+▶ 세션 시작 시 \`memory_startup\`을 한 번 호출해 최근 대화·활성 프로젝트·상세 프로필 맥락을 이어받으세요.
 
-Hot Path (자동 저장) 룰:
-  - **Claude Code / Codex CLI / Gemini CLI**: server가 transcript 파일을 passive read해서 자동 캡처.
-    별도 save_message 호출 X. 호출하면 동일 메시지 중복 row 발생.
-  - **그 외 platform** (Cursor, Antigravity 등 transcript 비공개): 매 turn save_message 호출 — fallback.
+Tools: memory_startup(시작 brief) · search_memory(과거 조회/검색) · manage_knowledge(저장/수정/삭제; 강제기억 is_pinned) · save_message(transcript 미지원 platform fallback).
 
-Proactive Memory Rules (mandatory — act without being asked):
-  - **Named entity**: User mentions a project, repo, brand, machine, or person? Call \`search_memory\` with that name before answering.
-  - **Uncertainty**: About to assume user preference, history, or prior decision? Call \`search_memory\` first.
-  - **Task start**: Beginning implementation, debugging, or design? Call \`search_memory\` once with project + task type.
-  - **Error recovery**: Error occurred? Search memory for similar past issues before guessing.
-  - **Anti-spam**: Max 1-2 proactive searches per user task. Search again only when topic shifts or a new entity appears.
+자동 저장: Claude Code / Codex CLI / Gemini CLI는 transcript 자동 캡처 — save_message 호출 금지(중복 row). 그 외 platform만 매 turn save_message.
 
-caller convention:
-  - manage_knowledge / save_message 호출 시 agent_model 명시 (생략 시 'unknown' 저장)
-  - subagent context면 subagent: true + subagent_model + subagent_role 함께`;
+능동 규칙(mandatory): named entity(프로젝트·repo·인물) 언급 시, 또는 과거 선호·결정을 가정하기 전 먼저 search_memory. 작업당 1-2회.
+
+호출 시 agent_model 명시 (subagent면 subagent:true + subagent_model/role 동봉).`;
 
 const STATIC_INSTRUCTIONS_BRIEF_UNAVAILABLE = `\n\n---\n\n⚠️ 시작 brief를 불러오지 못했습니다 (DB 연결 또는 쿼리 timeout). \`memory_startup\` tool을 명시 호출해 brief를 받으세요.`;
 
@@ -73,7 +65,14 @@ async function buildInstructions(): Promise<string> {
       await db.connect();
       const currentPlatform = detectBootPlatformFromEnv();
       const brief = await collectBrief({ currentPlatform });
-      return formatBriefMarkdown(brief);
+      // 클라이언트 캡 안에서 살아남도록 inject 모드 + 역산한 예산으로.
+      // brief 예산 = 전체 캡 − STATIC − 구분자. inject 모드가 이 예산 내에서
+      // header+Core(보장) 후 Pinned→Active를 줄 단위로 채운다 (Sub·Recent는 lazy).
+      const briefBudget = Math.max(
+        0,
+        INSTRUCTIONS_MAX_CHARS - STATIC_INSTRUCTIONS.length - INSTRUCTIONS_SEP.length
+      );
+      return formatBriefMarkdown(brief, { mode: "inject", maxChars: briefBudget });
     })();
 
     const briefMd = await Promise.race([
@@ -83,7 +82,14 @@ async function buildInstructions(): Promise<string> {
       ),
     ]);
 
-    return `${STATIC_INSTRUCTIONS}\n\n---\n\n${briefMd}`;
+    const assembled = `${STATIC_INSTRUCTIONS}${INSTRUCTIONS_SEP}${briefMd}`;
+    if (assembled.length > INSTRUCTIONS_MAX_CHARS) {
+      // 예산을 역산했으므로 정상 경로에선 도달 불가. Core Profile 비대 등 예외 시만.
+      console.error(
+        `⚠️ instructions ${assembled.length}자 > cap ${INSTRUCTIONS_MAX_CHARS} — Core Profile 길이 점검 필요`
+      );
+    }
+    return assembled;
   } catch (err) {
     console.error("⚠️ Brief 동적 주입 실패 (DB connect 또는 brief 쿼리 timeout):", err instanceof Error ? err.message : err);
     console.error("   static fallback + 'memory_startup 명시 호출 권장' 안내 포함.");
