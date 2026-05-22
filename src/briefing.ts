@@ -25,6 +25,10 @@ const RECENT_CURRENT_LIMIT = 8;        // 현 platform 최근 N건 (또는 cross
 const RECENT_OTHERS_LIMIT = 4;          // 타 platform 최근 N건 (currentPlatform 있을 때만)
 const RECENT_MESSAGE_PREVIEW = 100;     // 각 메시지 첫 N자만
 const ACTIVE_PTAG_LIMIT = 5;            // 활성 프로젝트 태그 top N
+const PINNED_LIMIT = 10;                // 고정 메모리 top N
+// MCP 클라이언트가 instructions 필드를 자르기 전 brief 최대 길이.
+// STATIC_INSTRUCTIONS (~900자)와 구분자를 제외한 brief 부분 기준.
+const BRIEF_MAX_CHARS = Number(process.env.BRIEF_MAX_CHARS ?? 3000);
 
 export interface BriefMessage {
   role: string;
@@ -39,6 +43,8 @@ export interface BriefData {
   core_profile: string | null;
   sub_profile: string | null;
   active_p_tags: Array<{ name: string; count: number; last_used: Date | null }>;
+  /** 중요 고정 메모리 (최신순) */
+  pinned_memories: BriefMessage[];
   /** currentPlatform 메시지 (또는 currentPlatform 없을 땐 cross-platform 통합). */
   recent_messages_current: BriefMessage[];
   /** 타 platform 메시지 (currentPlatform 있을 때만 채워짐, 없으면 빈 배열). */
@@ -67,6 +73,18 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
     [userId]
   );
   const user = u.rows[0] ?? { user_name: 'unknown', core_profile: null, sub_profile: null };
+
+  // 중요 고정 메모리 (Pinned)
+  const pinnedMsgs = await db.query(
+    `SELECT role, agent_platform, device_name, message, created_at
+       FROM memory
+      WHERE user_id = $1
+        AND is_active = TRUE
+        AND is_pinned = TRUE
+      ORDER BY created_at DESC
+      LIMIT $2`,
+    [userId, PINNED_LIMIT]
+  );
 
   // 최근 활성 p_tags top N
   const ptags = await db.query(
@@ -97,6 +115,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
           AND is_active = TRUE
           AND created_at >= NOW() - ($2 || ' days')::INTERVAL
           AND agent_platform = $3
+          AND is_pinned = FALSE
         ORDER BY created_at DESC
         LIMIT $4`,
       [userId, String(shortTermDays), currentPlatform, RECENT_CURRENT_LIMIT]
@@ -111,6 +130,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
           AND is_active = TRUE
           AND created_at >= NOW() - ($2 || ' days')::INTERVAL
           AND agent_platform != $3
+          AND is_pinned = FALSE
         ORDER BY created_at DESC
         LIMIT $4`,
       [userId, String(shortTermDays), currentPlatform, RECENT_OTHERS_LIMIT]
@@ -124,6 +144,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
         WHERE user_id = $1
           AND is_active = TRUE
           AND created_at >= NOW() - ($2 || ' days')::INTERVAL
+          AND is_pinned = FALSE
         ORDER BY created_at DESC
         LIMIT $3`,
       [userId, String(shortTermDays), RECENT_CURRENT_LIMIT]
@@ -135,6 +156,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
     user_name: user.user_name,
     core_profile: user.core_profile,
     sub_profile: user.sub_profile,
+    pinned_memories: pinnedMsgs.rows.map(rowToMsg),
     active_p_tags: ptags.rows.map((r: any) => ({
       name: r.name,
       count: r.cnt,
@@ -157,63 +179,95 @@ function rowToMsg(r: any): BriefMessage {
   };
 }
 
-/** brief 데이터 → markdown 문자열. instructions 필드 또는 tool 응답에 사용. */
+/**
+ * brief 데이터 → markdown 문자열. instructions 필드 또는 tool 응답에 사용.
+ *
+ * 2-pass budget model:
+ *   1. Guaranteed sections (header + profiles + pinned) — 항상 포함, budget 초과해도 유지.
+ *   2. Optional sections (active projects + recent messages) — 남은 budget 내 섹션 단위로 채움.
+ * 결과는 BRIEF_MAX_CHARS 이하. is_pinned 항목은 절대 잘리지 않음.
+ */
 export function formatBriefMarkdown(brief: BriefData): string {
-  const lines: string[] = [];
-  lines.push(`# Memory Briefing (user: ${brief.user_name})`);
+  // --- 1. Guaranteed sections ---
+  const gLines: string[] = [];
+  gLines.push(`# Memory Briefing (user: ${brief.user_name})`);
   if (brief.current_platform) {
-    lines.push(`Current platform: \`${brief.current_platform} @ ${os.hostname()}\``);
+    gLines.push(`Current platform: \`${brief.current_platform} @ ${os.hostname()}\``);
   }
-  lines.push("");
+  gLines.push('');
 
   if (brief.core_profile) {
-    lines.push(`## Core Profile`);
-    lines.push(brief.core_profile);
-    lines.push("");
+    gLines.push('## Core Profile');
+    gLines.push(brief.core_profile);
+    gLines.push('');
+  }
+  if (brief.sub_profile) {
+    gLines.push('## Sub Profile');
+    gLines.push(brief.sub_profile);
+    gLines.push('');
+  }
+  if (brief.pinned_memories.length > 0) {
+    gLines.push('## Pinned Memories (Important Facts)');
+    for (const m of brief.pinned_memories) {
+      gLines.push(formatMsgLine(m, true));
+    }
+    gLines.push('');
   }
 
-  if (brief.sub_profile) {
-    lines.push(`## Sub Profile`);
-    lines.push(brief.sub_profile);
-    lines.push("");
-  }
+  const guaranteed = gLines.join('\n');
+
+  // --- Footer (always included, counts toward budget) ---
+  const footerLines = [
+    '---',
+    `Use \`search_memory({ query, p_tag, date_range, role, agent_platform, include_archived })\` to retrieve more.`,
+    ...(brief.current_platform ? [`Cross-platform search: \`search_memory({ query, agent_platform: "*" })\`.`] : []),
+    `Use \`memory_startup\` tool for a refreshed brief mid-session.`,
+  ];
+  const footer = footerLines.join('\n');
+
+  // --- 2. Optional sections (fill remaining budget, whole sections only) ---
+  const remaining = Math.max(0, BRIEF_MAX_CHARS - guaranteed.length - footer.length - 2);
+
+  const optionalSections: string[] = [];
 
   if (brief.active_p_tags.length > 0) {
-    lines.push(`## Active Projects (last ${brief.short_term_window_days} days)`);
+    const lines: string[] = [`## Active Projects (last ${brief.short_term_window_days} days)`];
     for (const t of brief.active_p_tags) {
       const dt = t.last_used ? t.last_used.toISOString().slice(0, 10) : '?';
       lines.push(`- **${t.name}** — ${t.count} memories (last: ${dt})`);
     }
-    lines.push("");
+    lines.push('');
+    optionalSections.push(lines.join('\n'));
   }
 
   if (brief.recent_messages_current.length > 0) {
     const heading = brief.current_platform
       ? `## Recent on ${brief.current_platform} (last ${brief.recent_messages_current.length}, oldest → newest)`
       : `## Recent Memory (last ${brief.recent_messages_current.length}, oldest → newest)`;
-    lines.push(heading);
+    const lines: string[] = [heading];
     for (const m of brief.recent_messages_current) {
       lines.push(formatMsgLine(m, brief.current_platform === null));
     }
-    lines.push("");
+    lines.push('');
+    optionalSections.push(lines.join('\n'));
   }
 
   if (brief.recent_messages_others.length > 0) {
-    lines.push(`## Cross-platform Whispers (other agents, last ${brief.recent_messages_others.length})`);
+    const lines: string[] = [`## Cross-platform Whispers (other agents, last ${brief.recent_messages_others.length})`];
     for (const m of brief.recent_messages_others) {
-      lines.push(formatMsgLine(m, true)); // 항상 platform 표시
+      lines.push(formatMsgLine(m, true));
     }
-    lines.push("");
+    lines.push('');
+    optionalSections.push(lines.join('\n'));
   }
 
-  lines.push(`---`);
-  lines.push(`Use \`search_memory({ query, p_tag, date_range, role, agent_platform, include_archived })\` to retrieve more.`);
-  if (brief.current_platform) {
-    lines.push(`Cross-platform search: \`search_memory({ query, agent_platform: "*" })\`.`);
+  let optionalText = '';
+  for (const section of optionalSections) {
+    if (optionalText.length + section.length > remaining) break;
+    optionalText += section;
   }
-  lines.push(`Use \`memory_startup\` tool for a refreshed brief mid-session.`);
 
-  return lines.join("\n");
+  return guaranteed + '\n' + optionalText + '\n' + footer;
 }
 
 function formatMsgLine(m: BriefMessage, showPlatform: boolean): string {

@@ -35,6 +35,13 @@ Hot Path (자동 저장) 룰:
     별도 save_message 호출 X. 호출하면 동일 메시지 중복 row 발생.
   - **그 외 platform** (Cursor, Antigravity 등 transcript 비공개): 매 turn save_message 호출 — fallback.
 
+Proactive Memory Rules (mandatory — act without being asked):
+  - **Named entity**: User mentions a project, repo, brand, machine, or person? Call \`search_memory\` with that name before answering.
+  - **Uncertainty**: About to assume user preference, history, or prior decision? Call \`search_memory\` first.
+  - **Task start**: Beginning implementation, debugging, or design? Call \`search_memory\` once with project + task type.
+  - **Error recovery**: Error occurred? Search memory for similar past issues before guessing.
+  - **Anti-spam**: Max 1-2 proactive searches per user task. Search again only when topic shifts or a new entity appears.
+
 caller convention:
   - manage_knowledge / save_message 호출 시 agent_model 명시 (생략 시 'unknown' 저장)
   - subagent context면 subagent: true + subagent_model + subagent_role 함께`;
