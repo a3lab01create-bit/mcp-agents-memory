@@ -362,6 +362,36 @@ write-side cycle guard: project_tags CHECK(alias_of <> id) + confirm 트랜잭�
 
 ---
 
+## §21. Librarian 모델 선택 + recency-bias 취약점 📌 설계/실험 (구현 전, 2026-05-24)
+
+judge=gemma4 확정 후, Librarian용 모델을 광범위 비교(동일 처방: 강한 프롬프트 + ollama grammar schema `format={core_profile:string, sub_profile:string}`):
+
+| 모델 | 계열 | 속도 | 결과 |
+|---|---|---|---|
+| **qwen2.5:7b** | 비-thinking | 14s | ✅ valid JSON prose |
+| qwen2.5:14b | 비-thinking | 15s | ✅ valid JSON |
+| qwen3.5:9b | thinking | 65s | ❌ schema 하 빈 응답 (추론이 토큰 소진) |
+| gemma4:26b-a4b | reasoning | 91s | ❌ core 한국어 정확하나 sub 반복-degeneration |
+| qwen3.6:35b-a3b / qwen3.5:27b | thinking·>VRAM | >5분 | ❌ 타임아웃 (CPU/partial offload) |
+
+**format 결론(확정)**: **비-thinking(qwen2.5 계열) + ollama grammar schema = JSON 100% 안정.** thinking/reasoning 모델은 grammar schema 하에서 빈응답/붕괴(추론 토큰이 출력을 잠식). 큰 모델(27b/35b)은 16GB VRAM 초과 → CPU offload → 너무 느림(>5분).
+
+**content 결론(중요 — 모델 문제 아님)**: 입력 윈도우(최근 50 user msg)가 **당일 메타-대화(모델사냥/붙여넣은 추천표)로 오염**되면 7b·14b **둘 다** 사용자 정체성 대신 그 주제를 프로필함. = **Librarian의 recency-bias 취약점.** (깨끗한 윈도우에선 7b가 정체성 정확히 추출했었음.)
+
+**선택**: Librarian = **qwen2.5:7b + grammar schema + 강한 프롬프트** (비-thinking·이미 로드·VRAM 0). 14b 품질 우위는 **깨끗한 윈도우에서 재검증**(현재 오염 상태론 비교 무효).
+
+**구현 TODO (다음 세션)**:
+1. `LIBRARIAN_MODEL=qwen2.5:7b` (.env)
+2. `callSpec`/`callRole`에 **ollama grammar schema(`format`) 지원 추가** — 7b는 schema 없으면 마크다운이라 필수. (35b는 schema 없이도 JSON 따랐지만 7b는 schema 의존)
+3. system prompt 강화: **저장된 core_profile을 anchor로 최우선**, 최근 메시지는 보조, 일시적 주제(모델테스트/기술실험)를 정체성으로 오해 금지.
+4. (선택) recency-bias 완화: 최근50만이 아니라 넓은 샘플 / 메타·시스템성 메시지 de-weight.
+
+**주의(설계 정정)**: core_profile **영속화는 이미 존재**(users.core_profile + 프롬프트에 기존 프로필 전달). 새 persistence infra 불필요 — **anchor 가중치 강화(#3)가 핵심.**
+
+협업: 모델 추천 그록(외부 LLM), 실험·검증 Claude, 방향 결정 사용자. 그록 추천(작은 qwen)은 방향 맞았으나 VRAM 수치(70B "12-14GB")·qwen3.5:14b 존재 등 부정확 → 실측으로 교정.
+
+---
+
 ## 가격 참고 (2026-05 기준)
 
 | 모델 | Input | Output |
