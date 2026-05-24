@@ -22,6 +22,8 @@ import { embedMessage, vectorToHalfvecSql } from "./embedder.js";
 import { runDtagPromotion } from "./dtag_promoter.js";
 import { runLibrarian } from "../librarian.js";
 
+export { runProjectAliasPromoter, applyAliasSuggestion } from "./project_alias_promoter.js";
+
 let intervalTimer: NodeJS.Timeout | null = null;
 let warmupTimer: NodeJS.Timeout | null = null;
 let running = false;

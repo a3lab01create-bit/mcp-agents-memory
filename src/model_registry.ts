@@ -5,6 +5,7 @@
  * Roles:
  *   - tagger    (Cold Path: predefined p_tag + dynamic d_tag 추출)
  *   - librarian (memory → user.core/sub_profile promote)
+ *   - project_alias_judge (canonical project tag alias/same-project 판정)
  *
  * Embedding은 role 아니라 별도 모듈 (src/embeddings.ts)에서 OpenAI
  * embeddings API 직접 호출. 본 모듈의 EMBEDDING_MODEL 상수만 참조.
@@ -18,7 +19,7 @@ import OpenAI from "openai";
 // ─────────────────────────────────────────────────────────────
 
 export type Provider = 'openai' | 'google' | 'xai' | 'local';
-export type Role = 'tagger' | 'librarian' | 'clusterer';
+export type Role = 'tagger' | 'librarian' | 'clusterer' | 'project_alias_judge';
 
 export interface ModelSpec {
   provider: Provider;
@@ -74,6 +75,7 @@ const DEFAULTS: Record<Role, ModelSpec> = {
   tagger:    { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' },
   librarian: { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' },
   clusterer: { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' },
+  project_alias_judge: { provider: 'local', model_name: 'gemma4:26b-a4b-it-q4_K_M' },
 };
 
 // local provider가 env에 명시된 경우 inferProvider가 null 반환하므로
@@ -109,6 +111,7 @@ export const ROLE_REGISTRY: Record<Role, ModelSpec> = {
   tagger:    envEnvelope('tagger'),
   librarian: envEnvelope('librarian'),
   clusterer: envEnvelope('clusterer'),
+  project_alias_judge: envEnvelope('project_alias_judge'),
 };
 
 // Validate at module load — surfaces provider/model mismatch immediately.

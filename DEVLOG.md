@@ -342,6 +342,26 @@ write-side cycle guard: project_tags CHECK(alias_of <> id) + confirm 트랜잭�
 
 ---
 
+## §20. Stage 2 구현 + judge 모델 결정 + 35b num_gpu 인프라 수정 🔵 SHIPPED (2026-05-24)
+
+§19 설계를 구현. 구현 = Codex gpt-5.5 xhigh, 검증 = Claude.
+
+**구현물** (브랜치 `feat/project-alias-lifecycle`)
+- migration 025: `project_tag_alias_suggestions`(제안 큐, 21컬럼, open-pair 부분 유니크) + `project_tags` CHECK(alias_of<>id) write-side cycle guard.
+- `src/cold_path/project_alias_promoter.ts`: 후보생성(개명발언 ILIKE / 신규·저빈도 / 벡터근접(기존 임베딩) / d_tag Jaccard / 이름유사) → per-pair LLM judge(evidence-bound JSON) → pending upsert(ON CONFLICT) + `applyAliasSuggestion()`(트랜잭션·FOR UPDATE·canonical resolve·재귀 cycle guard·supersede·tagger cache invalidate). 자동적용 기본 OFF.
+- `src/model_registry.ts`: role `project_alias_judge` 추가.
+
+**검증**: apply 트랜잭션 결정론 테스트(alias set+status+supersede+되돌림) ✅ / 후보→judge→파싱 스모크 errors=0 ✅. (실데이터엔 실제 중복 프로젝트가 없어 insert는 결정론 테스트로 커버.)
+
+**judge 모델 결정 (7b→35b→gemma4 여정)**
+- 처음 35b(qwen3.6:35b-a3b) 선택 → CPU에서 **판정 1건 232초**(너무 느림).
+- 7b(qwen2.5) 검토 → 빠르나(1-2s) sloppy: `relation`에 enum 통째 덤프, rationale 중국어 혼입. "되긴 되나 거침."
+- **최종: `gemma4:26b-a4b-it-q4_K_M`(17GB MoE, 4B active)** — 판정 ~20-50s(부분 offload), 한/영 개명 정확, 깔끔 JSON. 단 **추론(reasoning) 모델** — content 외 `reasoning` 필드 별도, max_tokens 넉넉히 줘야(예산 짧으면 content 빈 채 length 종료). promoter 기본 8192라 OK. 약점: confidence 항상 1.0(과신) — 게이트가 explicit 발언+무충돌 요구해 상쇄.
+
+**⚠️ 인프라 수정 (repo 밖, 유실 주의)**: ollama `qwen3.6:35b-a3b` Modelfile에 `num_gpu 99`(전체 GPU 강제)가 박혀 있어 16GB VRAM에 **로드 자체가 불가**(promoter+Librarian 둘 다 영향). `FROM <model> + PARAMETER num_gpu 0`로 재생성해 CPU offload로 수정(권한상 blob-path FROM 불가 → 모델명 FROM 사용). 이후 35b는 CPU(느림)지만 로드는 됨. **Librarian이 이 모델 쓰면 느려짐 — 필요시 Librarian도 gemma4 검토.**
+
+---
+
 ## 가격 참고 (2026-05 기준)
 
 | 모델 | Input | Output |
