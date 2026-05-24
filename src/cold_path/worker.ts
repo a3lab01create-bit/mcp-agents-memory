@@ -21,8 +21,13 @@ import { tagMessage } from "./tagger.js";
 import { embedMessage, vectorToHalfvecSql } from "./embedder.js";
 import { runDtagPromotion } from "./dtag_promoter.js";
 import { runLibrarian } from "../librarian.js";
+import { maybeRunProjectAliasPromoter } from "./project_alias_promoter.js";
 
-export { runProjectAliasPromoter, applyAliasSuggestion } from "./project_alias_promoter.js";
+export {
+  runProjectAliasPromoter,
+  applyAliasSuggestion,
+  maybeRunProjectAliasPromoter,
+} from "./project_alias_promoter.js";
 
 let intervalTimer: NodeJS.Timeout | null = null;
 let warmupTimer: NodeJS.Timeout | null = null;
@@ -280,11 +285,13 @@ export function startColdPathWorker(): void {
       tick().catch((err) => console.error("❌ [ColdPath] unhandled tick error:", err));
       maybeRunPromotion().catch((err) => console.error("❌ [DTagPromoter] unhandled error:", err));
       maybeRunLibrarian().catch((err) => console.error("❌ [Librarian] unhandled error:", err));
+      maybeRunProjectAliasPromoter().catch((err) => console.error("❌ [ProjectAliasPromoter] unhandled error:", err));
     }, intervalSec * 1000);
     // 첫 tick 즉시 한번 실행
     tick().catch((err) => console.error("❌ [ColdPath] unhandled first tick:", err));
     maybeRunPromotion().catch((err) => console.error("❌ [DTagPromoter] unhandled error:", err));
     maybeRunLibrarian().catch((err) => console.error("❌ [Librarian] unhandled error:", err));
+    maybeRunProjectAliasPromoter().catch((err) => console.error("❌ [ProjectAliasPromoter] unhandled error:", err));
   }, warmupSec * 1000);
 }
 

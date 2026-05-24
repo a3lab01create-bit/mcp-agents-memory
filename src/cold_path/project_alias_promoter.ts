@@ -90,6 +90,8 @@ const QUALIFYING_RELATIONS = new Set<AliasRelation>([
   "same_project",
 ]);
 
+const PROJECT_ALIAS_PROMOTER_DEFAULT_INTERVAL_HOURS = 24;
+
 const ALL_RELATIONS = new Set<AliasRelation>([
   "rename",
   "alias",
@@ -117,6 +119,8 @@ const EXPLICIT_PATTERNS = [
   "%same as%",
   "%alias%",
 ];
+
+let projectAliasPromoterRunning = false;
 
 const SOURCE_WEIGHT: Record<CandidateSource, number> = {
   explicit_user_statement: 100,
@@ -1049,6 +1053,57 @@ export async function runProjectAliasPromoter(
   }
 
   return summary;
+}
+
+export async function maybeRunProjectAliasPromoter(): Promise<void> {
+  if (process.env.PROJECT_ALIAS_PROMOTER_ENABLED !== "true") return;
+  if (projectAliasPromoterRunning) return;
+
+  projectAliasPromoterRunning = true;
+  const intervalHours = envInt(
+    "PROJECT_ALIAS_PROMOTER_INTERVAL_HOURS",
+    PROJECT_ALIAS_PROMOTER_DEFAULT_INTERVAL_HOURS
+  );
+
+  try {
+    const userId = await getDefaultUserId();
+    const result = await db.query(
+      `SELECT project_alias_promoter_last_run_at
+         FROM users
+        WHERE user_id = $1`,
+      [userId]
+    );
+
+    const lastRunAt: Date | null =
+      result.rows[0]?.project_alias_promoter_last_run_at ?? null;
+    const cooldownMs = intervalHours * 60 * 60 * 1000;
+    const cooldownPassed =
+      lastRunAt === null ||
+      Date.now() - new Date(lastRunAt).getTime() >= cooldownMs;
+    if (!cooldownPassed) return;
+
+    // 시도 시 즉시 last_run_at 업데이트 — 실패해도 interval 쿨다운으로 hammer 방지.
+    await db.query(
+      `UPDATE users
+          SET project_alias_promoter_last_run_at = NOW()
+        WHERE user_id = $1`,
+      [userId]
+    );
+
+    const summary = await runProjectAliasPromoter({ userId });
+    if (summary.candidates > 0 || summary.inserted > 0 || summary.errors > 0) {
+      console.error(
+        `🔁 [ProjectAliasPromoter] done — candidates=${summary.candidates}, judged=${summary.judged}, inserted=${summary.inserted}, autoApplied=${summary.autoApplied}, skipped=${summary.skipped}, errors=${summary.errors}`
+      );
+    }
+  } catch (err) {
+    console.error(
+      `⚠️ [ProjectAliasPromoter] run failed (retries in ${intervalHours}h):`,
+      err
+    );
+  } finally {
+    projectAliasPromoterRunning = false;
+  }
 }
 
 async function markSuggestionTerminal(

@@ -31,6 +31,7 @@ const MAX_PREVIEW_STORE = 500;          // rowToMsg 저장 상한
 const PREVIEW_COMPACT = 100;            // pinned·whispers·inject (캡 민감 → 짧게)
 const PREVIEW_RECENT = 300;             // full-mode 현재기기 Recent (캡 없는 툴 응답 → 두껍게)
 const ACTIVE_PTAG_LIMIT = 5;            // 활성 프로젝트 태그 top N
+const PENDING_ALIAS_SUGGESTION_LIMIT = 2; // brief에 노출할 대기 별칭 제안 top N (Stage 2 confirm 게이트)
 const PINNED_LIMIT = 10;                // 고정 메모리 top N (full brief)
 const INJECT_PINNED_LIMIT = 5;          // inject 모드 인라인 고정 메모리 최신 N개
 // full brief(memory_startup tool) 최대 길이. 클라가 안 자르는 툴 응답이므로 넉넉히 —
@@ -53,6 +54,8 @@ export interface BriefData {
   active_p_tags: Array<{ name: string; count: number; last_used: Date | null }>;
   /** 중요 고정 메모리 (최신순) */
   pinned_memories: BriefMessage[];
+  /** 사용자 확인 대기 별칭 제안 (Stage 2 confirm 게이트, 최신 top N) */
+  pending_alias_suggestions: Array<{ id: number; source: string; target: string; relation: string; confidence: number }>;
   /** currentPlatform 메시지 (또는 currentPlatform 없을 땐 cross-platform 통합). */
   recent_messages_current: BriefMessage[];
   /** 타 platform 메시지 (currentPlatform 있을 때만 채워짐, 없으면 빈 배열). */
@@ -164,11 +167,30 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
     recentCurrent = msgs.rows.reverse().map(rowToMsg);
   }
 
+  // 사용자 확인 대기 별칭 제안 (Stage 2 confirm 게이트)
+  const aliasSugg = await db.query(
+    `SELECT s.id, src.name AS source, tgt.name AS target, s.relation, s.confidence
+       FROM project_tag_alias_suggestions s
+       JOIN project_tags src ON src.id = s.source_tag_id
+       JOIN project_tags tgt ON tgt.id = s.target_tag_id
+      WHERE s.user_id = $1 AND s.status = 'pending'
+      ORDER BY s.confidence DESC, s.created_at DESC
+      LIMIT $2`,
+    [userId, PENDING_ALIAS_SUGGESTION_LIMIT]
+  );
+
   return {
     user_name: user.user_name,
     core_profile: user.core_profile,
     sub_profile: user.sub_profile,
     pinned_memories: pinnedMsgs.rows.map(rowToMsg),
+    pending_alias_suggestions: aliasSugg.rows.map((r: any) => ({
+      id: Number(r.id),
+      source: String(r.source),
+      target: String(r.target),
+      relation: String(r.relation),
+      confidence: Number(r.confidence),
+    })),
     active_p_tags: ptags.rows.map((r: any) => ({
       name: r.name,
       count: r.cnt,
@@ -238,6 +260,13 @@ function formatBriefFull(brief: BriefData): string {
     gLines.push('## Pinned Memories (Important Facts)');
     for (const m of brief.pinned_memories) {
       gLines.push(formatMsgLine(m, true));
+    }
+    gLines.push('');
+  }
+  if (brief.pending_alias_suggestions.length > 0) {
+    gLines.push('## Project Tag Suggestions (사용자 확인 필요)');
+    for (const s of brief.pending_alias_suggestions) {
+      gLines.push(`- [${s.id}] \`${s.source}\` → \`${s.target}\` 같은 프로젝트로 보임 (${s.relation}, conf ${s.confidence}). 맞으면 \`manage_project_tags({action:"confirm_alias",suggestion_id:${s.id}})\`, 아니면 \`reject_alias\`.`);
     }
     gLines.push('');
   }
