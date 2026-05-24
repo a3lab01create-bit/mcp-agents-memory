@@ -392,6 +392,30 @@ judge=gemma4 확정 후, Librarian용 모델을 광범위 비교(동일 처방: 
 
 ---
 
+## §22. Cross-platform 캡처 확장 — Grok + Antigravity 🔵 SHIPPED (v0.9.10, 2026-05-25)
+
+codex/gemini에 이어 **Grok Build·Antigravity** passive capture 추가 → 자동캡처 5종 완성(claude-code / codex / gemini / grok / antigravity). 원칙은 §5와 동일 — 호스트 transcript를 passive read(설정 오염 0), `save_message`는 fallback.
+
+**Grok** (`src/auto_save/grok_capture.ts`): `~/.grok/sessions/<urlenc-cwd>/<sid>/chat_history.jsonl`.
+- 함정: `~/.grok/logs/unified.jsonl`은 앱 디버그 로그(미끼). 실제 transcript는 chat_history.jsonl.
+- 캡처: user=`<user_query>` 안쪽만(메타/synthetic skip), assistant=비어있지 않은 content(`model_id`=grok-build).
+- **버그→교훈**: grok이 세션 초기 system-reminder를 *in-place rewrite*해 뒤 줄들의 byte offset이 밀림(+837) → byte-offset cursor/uuid면 첫 메시지가 2번 INSERT됨. → **line-index cursor + `grok:<sid>:<lineIndex>` uuid + size-gate**로 전환(줄 순서 보존 → dedup 정확).
+
+**Antigravity** (`src/auto_save/antigravity_capture.ts`): 3변종(antigravity / antigravity-cli / antigravity-ide) 각 `~/.gemini/<variant>/brain/<sid>/.system_generated/logs/transcript_full.jsonl`. watch root 3개(없는 변종 no-op), 변종별 agent_platform.
+- 함정: `conversations/*.pb`는 **암호화**(엔트로피 8.0, gzip/zlib/zstd 아님). transcript_full.jsonl만 사용.
+- 캡처: `USER_INPUT`(`<USER_REQUEST>` 안쪽) + `PLANNER_RESPONSE`(content 있음). 그 외 type(CONVERSATION_HISTORY/tool 결과) skip.
+- **dedup 키 = `step_index`**(엔트리 내재 정수 → rewrite/byte-shift 무관, grok 버그 원천 회피).
+- 모델: per-entry 필드 없음 → user의 `<USER_SETTINGS_CHANGE>`("Model Selection … to X")에서 추출해 file-state(currentModel) 추적, 이후 assistant에 매핑(codex 방식). 없으면 unknown.
+
+**공통**:
+- 이중삽입 가드: passive 활성 platform은 `save_message`가 skip 반환(gemini=정확매칭, grok·antigravity=`startsWith` prefix — clientInfo 변형 대비). STATIC_INSTRUCTIONS 자동캡처 목록에 Grok·Antigravity 추가.
+- timestamp 안 넘김(DB `now()`). hot path 실시간 read라 정합.
+- 검증: parseEntry 실측 + 라이브 DB(중복 0, model 정상, NULL uuid 0 = 가드 작동).
+
+협업: recon·설계·검증·`grok_capture` 작성 = Claude. `antigravity_capture` = Grok이 가이드(구 `docs/_wip/antigravity_capture_guide.md`, 본 §22로 통합 후 삭제) 따라 구현, Claude가 체크포인트 검증·모델 fix·multi-root 확장·소방수. 배포 = v0.9.10 (`reference_npm_publish.md`: 2FA bypass 토큰 필요).
+
+---
+
 ## 가격 참고 (2026-05 기준)
 
 | 모델 | Input | Output |
