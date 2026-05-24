@@ -17,6 +17,10 @@ import {
   captureSessionStart as captureGeminiStart,
   captureSessionEnd as captureGeminiEnd,
 } from "./auto_save/gemini_capture.js";
+import {
+  captureSessionStart as captureGrokStart,
+  captureSessionEnd as captureGrokEnd,
+} from "./auto_save/grok_capture.js";
 import { PACKAGE_VERSION } from "./version.js";
 import fs from "fs";
 
@@ -32,7 +36,7 @@ const STATIC_INSTRUCTIONS = `Long-term memory MCP server (RESPEC v1).
 
 Tools: memory_startup(시작 brief) · search_memory(과거 조회/검색) · manage_knowledge(저장/수정/삭제; 강제기억 is_pinned) · save_message(transcript 미지원 platform fallback).
 
-자동 저장: Claude Code / Codex CLI / Gemini CLI는 transcript 자동 캡처 — save_message 호출 금지(중복 row). 그 외 platform만 매 turn save_message.
+자동 저장: Claude Code / Codex CLI / Gemini CLI / Grok Build는 transcript 자동 캡처 — save_message 호출 금지(중복 row). 그 외 platform만 매 turn save_message.
 
 능동 규칙(mandatory): named entity(프로젝트·repo·인물) 언급 시, 또는 과거 선호·결정을 가정하기 전 먼저 search_memory. 작업당 1-2회.
 
@@ -116,6 +120,7 @@ async function shutdown(reason: string): Promise<void> {
         captureSessionEnd(),
         captureCodexEnd(),
         captureGeminiEnd(),
+        captureGrokEnd(),
       ]),
       new Promise<void>((resolve) => setTimeout(resolve, 3000)),
     ]);
@@ -242,9 +247,11 @@ async function runMcpServer() {
   // - jsonl_capture: ~/.claude/projects/<slug>/*.jsonl
   // - codex_capture: ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl (recursive watch)
   // - gemini_capture: ~/.gemini/tmp/<projectKey>/chats/session-*.json
+  // - grok_capture: ~/.grok/sessions/<urlencoded-cwd>/<sid>/chat_history.jsonl (recursive watch)
   captureSessionStart(process.cwd());
   captureCodexStart(process.cwd());
   captureGeminiStart(process.cwd());
+  captureGrokStart(process.cwd());
 
   console.error("🚀 Starting Memory MCP Server...");
 
