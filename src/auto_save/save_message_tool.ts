@@ -24,6 +24,7 @@ import { getDefaultUserId } from "../users.js";
 import { resolveAgentIdentity } from "../agent_identity.js";
 import { isCaptureArmed as isGeminiArmed } from "./gemini_capture.js";
 import { isCaptureArmed as isGrokArmed } from "./grok_capture.js";
+import { isCaptureArmed as isAntigravityArmed } from "./antigravity_capture.js";
 
 const DEVICE_NAME = os.hostname();
 
@@ -71,6 +72,15 @@ subagent 컨텍스트라면 subagent=true + subagent_model + subagent_role 함�
       }
       // Grok: clientInfo.name이 'grok-shell-...' 등 변형이라 prefix로 매칭 (grok* = grok뿐)
       if (id.agent_platform?.startsWith("grok") && isGrokArmed()) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({ stored: false, skipped: "passive capture active" }, null, 2),
+          }],
+        };
+      }
+      // Antigravity CLI: 과거 DB platform이 antigravity-client / antigravity 일 수 있으므로 startsWith
+      if (id.agent_platform?.startsWith("antigravity") && isAntigravityArmed()) {
         return {
           content: [{
             type: 'text' as const,

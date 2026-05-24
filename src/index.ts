@@ -21,6 +21,10 @@ import {
   captureSessionStart as captureGrokStart,
   captureSessionEnd as captureGrokEnd,
 } from "./auto_save/grok_capture.js";
+import {
+  captureSessionStart as captureAntigravityStart,
+  captureSessionEnd as captureAntigravityEnd,
+} from "./auto_save/antigravity_capture.js";
 import { PACKAGE_VERSION } from "./version.js";
 import fs from "fs";
 
@@ -36,7 +40,7 @@ const STATIC_INSTRUCTIONS = `Long-term memory MCP server (RESPEC v1).
 
 Tools: memory_startup(시작 brief) · search_memory(과거 조회/검색) · manage_knowledge(저장/수정/삭제; 강제기억 is_pinned) · save_message(transcript 미지원 platform fallback).
 
-자동 저장: Claude Code / Codex CLI / Gemini CLI / Grok Build는 transcript 자동 캡처 — save_message 호출 금지(중복 row). 그 외 platform만 매 turn save_message.
+자동 저장: Claude Code / Codex CLI / Gemini CLI / Grok Build / Antigravity CLI는 transcript 자동 캡처 — save_message 호출 금지(중복 row). 그 외 platform만 매 turn save_message.
 
 능동 규칙(mandatory): named entity(프로젝트·repo·인물) 언급 시, 또는 과거 선호·결정을 가정하기 전 먼저 search_memory. 작업당 1-2회.
 
@@ -113,7 +117,7 @@ async function shutdown(reason: string): Promise<void> {
   stopParentWatchdog();
 
   // 1. Final JSONL flush — INSERT raw rows. fs.watch 살아있는 동안 대부분
-  //    이미 들어왔지만 마지막 1-2건 잡힘. 세 platform (Claude Code / Codex / Gemini) 병렬.
+  //    이미 들어왔지만 마지막 1-2건 잡힘. cross-platform (Claude Code / Codex / Gemini / Grok / Antigravity) 병렬.
   try {
     await Promise.race([
       Promise.allSettled([
@@ -121,6 +125,7 @@ async function shutdown(reason: string): Promise<void> {
         captureCodexEnd(),
         captureGeminiEnd(),
         captureGrokEnd(),
+        captureAntigravityEnd(),
       ]),
       new Promise<void>((resolve) => setTimeout(resolve, 3000)),
     ]);
@@ -243,15 +248,17 @@ async function runMcpServer() {
   installShutdownHandlers();
   startParentWatchdog();
 
-  // §4/§5 fix: 세 platform passive 캡처 arm. 각자 transcript 파일 dir 없으면 no-op.
+  // §4/§5 fix: cross-platform passive 캡처 arm. 각자 transcript 파일 dir 없으면 no-op.
   // - jsonl_capture: ~/.claude/projects/<slug>/*.jsonl
   // - codex_capture: ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl (recursive watch)
   // - gemini_capture: ~/.gemini/tmp/<projectKey>/chats/session-*.json
   // - grok_capture: ~/.grok/sessions/<urlencoded-cwd>/<sid>/chat_history.jsonl (recursive watch)
+  // - antigravity_capture: ~/.gemini/antigravity-cli/brain/<sid>/.system_generated/logs/transcript_full.jsonl
   captureSessionStart(process.cwd());
   captureCodexStart(process.cwd());
   captureGeminiStart(process.cwd());
   captureGrokStart(process.cwd());
+  captureAntigravityStart(process.cwd());
 
   console.error("🚀 Starting Memory MCP Server...");
 
