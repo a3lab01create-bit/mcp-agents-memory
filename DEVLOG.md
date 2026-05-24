@@ -259,6 +259,60 @@ Recent를 드롭했으므로 "직전 대화 연속성"은 아직 자동 주입 �
 
 ---
 
+## §18. 프로젝트 alias lifecycle — read-time canonical projection 🔵 SHIPPED (PoC, 2026-05-24)
+
+**증상**
+- `market_collectors` 프로젝트가 세션 brief "Active Projects"에 안 뜸. 사용자가 직접 언급하기 전까지 존재를 모름.
+- 관련 메모리가 p_tag별로 흩어짐: `mcp-agents-memory`(5), `advertising`(2), `null`(1) — **`market_collectors` p_tag 자체가 없음**.
+- 과거 `market_analysis` → `market_collectors` 개명(DB수집/분석 분리). 대화에선 "마케팅db"/"마케팅 분석" 구어체로도 부름.
+
+**원인** (3-way 설계회의: Codex gpt-5.5 xhigh + Gemini 3 + advisor)
+- `project_tags.alias_of` 컬럼은 있으나 **채우는 주체가 없음**.
+- 더 근본: brief `active_p_tags`가 `GROUP BY pt.name`(= `m.p_tag_id` 원본 태그)이라 alias 메모리가 canonical로 안 묶임. search는 입력 p_tag만 canonical resolve(저장측 누락).
+- 태거의 "explosion 방어"(기존 후보 강선호)가 오히려 오태깅 유발 — market_collectors 작업을 가까운 `mcp-agents-memory`로 흡수하거나 `null` 처리.
+
+**"alias"는 한 문제가 아니라 셋** (분해 — 메커니즘 다름)
+- **A. 개명(rename)**: market_analysis→market_collectors. → `alias_of` (증거 = user 발언/git 흔적)
+- **B. 구어체 동의어**: 마케팅db, 마케팅 분석. → p_tag 아님. 태거가 write 시점에 canonical 매핑할 문제
+- **C. 오태깅(misfiling)**: mcp-agents-memory/advertising/null로 잘못 들어감. → 본문 벡터로 재배치(alias_of로는 못 고침)
+
+**설계 합의** (셋 다 독립 수렴 = 높은 신뢰도)
+- 벡터(pgvector) = **후보 발굴(recall)만**, LLM = 엔티티 동일성 판단, `alias_of` = ground truth. **벡터 단독 병합 금지** (market_collectors↔market_analysis는 임베딩 가깝지만 의도적으로 다른 프로젝트 = false merge 위험; 반대로 마케팅db↔market_collectors는 언어 달라 false miss).
+- **read-time(query-time) canonical projection = soft aliasing**: 히스토리 재태깅 안 함. 병합 취소 = `alias_of` 링크만 끊기 → **가역적**. (write-time 해소였으면 되돌리기 = 히스토리 재태깅 = 고위험)
+- p_tag 병합 게이트 ≫ d_tag 게이트: 자동 = 명시적 user 개명/등가 발언 + LLM confidence ≥ 0.98 + 충돌 evidence 없음. 애매 = pending + 다음 brief에서 사용자 확인. 금지 = 벡터 유사도 단독.
+- 프로젝트 요약은 `users.sub_profile`과 분리(`project_summaries`), canonical 키, alias 합쳐지면 summary도 merge.
+
+**alias lifecycle 파이프라인** (레이어 — 의존순)
+1. Tagger: p_tag/d_tag 부여 + **기존 alias resolve만**(alias 생성 X)
+2. `project_alias_promoter`(dtag_promoter와 **별도**): 벡터 후보 → evidence-bound LLM(`same_project`/`rename`/`alias`/`different`/`confidence`/`evidence_row_ids`) → 고확신 자동 / 나머지 pending
+3. brief 확인 게이트: "X와 Y 같은 프로젝트?"
+4. 태거 완화: 억지 매칭↓ + new-project flag (오태깅 차단)
+5. Project Librarian(별도 레이어): canonical 기준 `project_summaries` 생성/갱신
+6. (고급) 요약본 임베딩 → promoter가 새 태그를 **요약본 벡터**와 비교(메모리 N개 대신 요약 1개 — Gemini 제안)
+
+**해결 — #1 keystone (PoC ✅ SHIPPED)**
+- migration `024_canonical_project_tag_projection`: `canonical_project_tag_id(BIGINT)` STABLE 함수 — `alias_of` 체인을 root까지 resolve(사이클 방어 path 배열), NULL→NULL, 미존재 id→입력값 반환.
+- `briefing.ts` active_p_tags: `JOIN project_tags cpt ON cpt.id = canonical_project_tag_id(m.p_tag_id)` + `GROUP BY cpt.name`.
+- `search_memory.ts`: p_tag 필터 `canonical_project_tag_id(m.p_tag_id) = $id` + vector/ILIKE/recency 3개 SELECT 모두 p_tag_name canonical projection.
+- 구현 = Codex gpt-5.5 xhigh, 검증 = Claude.
+
+**PoC 검증** (실데이터, 트랜잭션 ROLLBACK — 프로덕션 무손상)
+- 시나리오: `project-claude-code-v0.4`(252) → 임시 `alias_of` → `mcp-agents-memory`(3161)
+- brief 집계: NEW에서 v0.4 사라지고 `mcp-agents-memory`=3413 (= 3161+252) ✅
+- search 필터(canonical=target)에 source 메모리 포함(3413) ✅
+- 가역성: ROLLBACK으로 원복, DB 변경 0 ✅
+- 검증 스크립트: `scratch/poc_verify.ts` (gitignore, 로컬 전용)
+
+**남은 작업**: 파이프라인 2~6단계(promoter / 게이트 / 태거 완화 / Project Librarian / 요약 벡터 루프). 라이브 brief·search 반영 시 **MCP 서버 재시작** 필요(현재 실행 프로세스는 옛 코드).
+
+**조심할 패턴**
+- read 경로 추가/수정 시 `canonical_project_tag_id` 일관 적용 — 누락하면 그 경로만 alias 안 풀림.
+- 함수가 per-row 호출 → 대량 집계 시 STABLE 최적화에 의존. 성능 이슈 시 인덱싱/머티리얼라이즈 검토.
+- ⏳ backlog: search 결과 `p_tag_name`이 canonical로 표시되는 건 diff상 명백하나 런타임 row 미검증 — `poc_verify.ts`에 alias 후 한 줄 assert 추가 예정.
+- cross-ref: `feedback_fundamental_standard_solution.md`(근본·표준 해결), `feedback_root_cause_not_eyeball_fix.md`(narrow-first 반사 경계).
+
+---
+
 ## 가격 참고 (2026-05 기준)
 
 | 모델 | Input | Output |

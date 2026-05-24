@@ -150,7 +150,7 @@ date_range 인식 형식:
         filters.push(`m.is_active = TRUE`);
       }
       if (p_tag_id !== null) {
-        filters.push(`m.p_tag_id = $${p++}`);
+        filters.push(`canonical_project_tag_id(m.p_tag_id) = $${p++}`);
         params.push(p_tag_id);
       }
       if (sinceDate) {
@@ -194,7 +194,7 @@ date_range 인식 형식:
                     pt.name AS p_tag_name, m.d_tag, m.is_pinned, m.created_at,
                     1 - (m.embedding <=> $${vecParam}::halfvec) AS similarity
                FROM memory m
-               LEFT JOIN project_tags pt ON pt.id = m.p_tag_id
+               LEFT JOIN project_tags pt ON pt.id = canonical_project_tag_id(m.p_tag_id)
               WHERE ${whereSql}
                 AND m.embedding IS NOT NULL
               ORDER BY m.embedding <=> $${vecParam}::halfvec
@@ -230,7 +230,7 @@ date_range 인식 형식:
           const ilikeFilters: string[] = [`m.user_id = $1`];
           if (!includeArchived) ilikeFilters.push(`m.is_active = TRUE`);
           if (p_tag_id !== null) {
-            ilikeFilters.push(`m.p_tag_id = $${q++}`);
+            ilikeFilters.push(`canonical_project_tag_id(m.p_tag_id) = $${q++}`);
             ilikeParams.push(p_tag_id);
           }
           if (sinceDate) {
@@ -257,7 +257,7 @@ date_range 인식 형식:
             `SELECT m.id, m.role, m.message, m.agent_platform, m.agent_model, m.device_name,
                     pt.name AS p_tag_name, m.d_tag, m.is_pinned, m.created_at
                FROM memory m
-               LEFT JOIN project_tags pt ON pt.id = m.p_tag_id
+               LEFT JOIN project_tags pt ON pt.id = canonical_project_tag_id(m.p_tag_id)
               WHERE ${ilikeFilters.join(' AND ')}
               ORDER BY m.created_at DESC
               LIMIT $${q}`,
@@ -287,7 +287,7 @@ date_range 인식 형식:
           `SELECT m.id, m.role, m.message, m.agent_platform, m.agent_model, m.device_name,
                   pt.name AS p_tag_name, m.d_tag, m.is_pinned, m.created_at
              FROM memory m
-             LEFT JOIN project_tags pt ON pt.id = m.p_tag_id
+             LEFT JOIN project_tags pt ON pt.id = canonical_project_tag_id(m.p_tag_id)
             WHERE ${whereSql}
             ORDER BY m.created_at DESC
             LIMIT $${p}`,

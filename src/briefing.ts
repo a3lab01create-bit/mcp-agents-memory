@@ -99,15 +99,15 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
 
   // 최근 활성 p_tags top N
   const ptags = await db.query(
-    `SELECT pt.name,
+    `SELECT cpt.name,
             COUNT(*)::int AS cnt,
             MAX(m.created_at) AS last_used
        FROM memory m
-       JOIN project_tags pt ON pt.id = m.p_tag_id
+       JOIN project_tags cpt ON cpt.id = canonical_project_tag_id(m.p_tag_id)
       WHERE m.user_id = $1
         AND m.is_active = TRUE
         AND m.created_at >= NOW() - ($2 || ' days')::INTERVAL
-      GROUP BY pt.name
+      GROUP BY cpt.name
       ORDER BY MAX(m.created_at) DESC
       LIMIT $3`,
     [userId, String(shortTermDays), ACTIVE_PTAG_LIMIT]
