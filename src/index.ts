@@ -40,7 +40,7 @@ const STATIC_INSTRUCTIONS = `Long-term memory MCP server (RESPEC v1).
 
 Tools: memory_startup(시작 brief) · search_memory(과거 조회/검색) · manage_knowledge(저장/수정/삭제; 강제기억 is_pinned) · save_message(transcript 미지원 platform fallback).
 
-자동 저장: Claude Code / Codex CLI / Gemini CLI / Grok Build / Antigravity CLI는 transcript 자동 캡처 — save_message 호출 금지(중복 row). 그 외 platform만 매 turn save_message.
+자동 저장: Claude Code / Codex CLI / Gemini CLI / Grok Build / Antigravity는 transcript 자동 캡처 — save_message 호출 금지(중복 row). 그 외 platform만 매 turn save_message.
 
 능동 규칙(mandatory): named entity(프로젝트·repo·인물) 언급 시, 또는 과거 선호·결정을 가정하기 전 먼저 search_memory. 작업당 1-2회.
 

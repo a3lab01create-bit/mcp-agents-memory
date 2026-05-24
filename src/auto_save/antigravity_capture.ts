@@ -1,16 +1,18 @@
 /**
- * Antigravity CLI passive capture — RESPEC §5 cross-platform.
+ * Antigravity passive capture — RESPEC §5 cross-platform.
  *
  * Template: grok_capture.ts (line-cursor + size-gate + watcher + pre-existing skip).
- * Differences (exactly 2 as per recon):
- *   - Walk target: ~/.gemini/antigravity-cli/brain/<sid>/.system_generated/logs/transcript_full.jsonl
- *   - external_uuid key: step_index (from JSON entry) instead of lineIndex.
- *     → `antigravity:<sid>:<step_index>`
+ * Antigravity 고유:
+ *   - 3개 변종(antigravity / antigravity-cli / antigravity-ide)이 각각 brain/ 보유.
+ *     셋 다 동일 구조로 가정하고 watch root 3개를 잡는다. 없는 변종은 자동 no-op.
+ *     변종별로 agent_platform을 구분(antigravity / antigravity-cli / antigravity-ide).
+ *   - Walk target: ~/.gemini/<variant>/brain/<sid>/.system_generated/logs/transcript_full.jsonl
+ *   - external_uuid key: step_index (JSON entry) → `antigravity:<sid>:<step_index>`.
+ *     step_index가 안정적이라 byte-shift/rewrite에도 dedup 정확 (grok 교훈 회피).
+ *   - 모델: per-entry 필드 없음. USER_INPUT의 <USER_SETTINGS_CHANGE>에서 추출해
+ *     file-state(currentModel)에 추적, 이후 assistant 턴에 매핑 (codex_capture 방식).
  *
  * ⚠️ conversations/*.pb 는 암호화. 절대 건드리지 않음. transcript_full.jsonl만 사용.
- *
- * Checkpoint-driven. If stuck or quota low, stop at current CP.
- * Claude can resume from last verified checkpoint.
  */
 
 import * as fs from "node:fs";
@@ -20,29 +22,36 @@ import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
 
 const DEVICE_NAME = os.hostname();
-const SESSIONS_ROOT = path.join(os.homedir(), ".gemini", "antigravity-cli", "brain");
+const GEMINI_ROOT = path.join(os.homedir(), ".gemini");
 const CHAT_FILE = "transcript_full.jsonl";
-const AGENT_PLATFORM = "antigravity-cli";
 const FLUSH_DEBOUNCE_MS = 200;
 const POLL_INTERVAL_MS = 3000;
+
+/** antigravity 변종별 brain root + agent_platform 라벨. 없는 디렉토리는 자동 no-op. */
+const ROOTS: { dir: string; platform: string }[] = [
+  { dir: path.join(GEMINI_ROOT, "antigravity", "brain"),     platform: "antigravity" },
+  { dir: path.join(GEMINI_ROOT, "antigravity-cli", "brain"), platform: "antigravity-cli" },
+  { dir: path.join(GEMINI_ROOT, "antigravity-ide", "brain"), platform: "antigravity-ide" },
+];
 
 interface FileState {
   cursorLines: number;
   lastSize: number;
   sessionId: string; // the <sid> UUID under brain/
+  agentPlatform: string; // 어느 변종 root에서 왔는지
   /** USER_INPUT의 <USER_SETTINGS_CHANGE>에서 추적한 현재 모델. 없으면 null → 'unknown'. */
   currentModel: string | null;
 }
 
 interface DirState {
-  rootExists: boolean;
+  rootExists: boolean; // ROOTS 중 하나라도 존재
   files: Map<string, FileState>;
 }
 
 let _state: DirState | null = null;
 const SERVER_START_MS = Date.now();
 
-let _watcher: fs.FSWatcher | null = null;
+let _watchers: fs.FSWatcher[] = [];
 let _pollTimer: NodeJS.Timeout | null = null;
 let _flushInProgress = false;
 let _flushPending = false;
@@ -50,7 +59,7 @@ let _flushDebounceTimer: NodeJS.Timeout | null = null;
 
 /** brain/<sid>/.system_generated/logs/transcript_full.jsonl → sid */
 function extractSid(filePath: string): string {
-  // logs / .system_generated / <sid> / brain
+  // logs / .system_generated / <sid>
   return path.basename(path.dirname(path.dirname(path.dirname(filePath))));
 }
 
@@ -65,9 +74,7 @@ function countCompleteLines(filePath: string): number {
   }
 }
 
-/**
- * brain/ 아래 모든 transcript_full.jsonl 경로 yield (재귀).
- */
+/** 한 root 아래 모든 transcript_full.jsonl 경로 yield (재귀). */
 function* walkTranscripts(root: string): Generator<string> {
   if (!fs.existsSync(root)) return;
   const stack: string[] = [root];
@@ -90,8 +97,17 @@ function* walkTranscripts(root: string): Generator<string> {
   }
 }
 
+/** 모든 변종 root를 가로질러 {파일경로, platform} yield. */
+function* walkAllTranscripts(): Generator<{ filePath: string; platform: string }> {
+  for (const { dir, platform } of ROOTS) {
+    for (const filePath of walkTranscripts(dir)) {
+      yield { filePath, platform };
+    }
+  }
+}
+
 export function captureSessionStart(_cwd: string): void {
-  const rootExists = fs.existsSync(SESSIONS_ROOT);
+  const rootExists = ROOTS.some((r) => fs.existsSync(r.dir));
   _state = {
     rootExists,
     files: new Map(),
@@ -102,7 +118,7 @@ export function captureSessionStart(_cwd: string): void {
   }
 
   let count = 0;
-  for (const filePath of walkTranscripts(SESSIONS_ROOT)) {
+  for (const { filePath, platform } of walkAllTranscripts()) {
     let stat: fs.Stats;
     try { stat = fs.statSync(filePath); } catch { continue; }
 
@@ -110,12 +126,14 @@ export function captureSessionStart(_cwd: string): void {
       cursorLines: countCompleteLines(filePath),
       lastSize: stat.size,
       sessionId: extractSid(filePath),
+      agentPlatform: platform,
       currentModel: null,
     });
     count++;
   }
 
-  console.error(`📝 [Antigravity] capture armed: ${count} transcript(s)`);
+  const liveRoots = ROOTS.filter((r) => fs.existsSync(r.dir)).map((r) => r.platform);
+  console.error(`📝 [Antigravity] capture armed: ${count} transcript(s) across [${liveRoots.join(", ")}]`);
   armDirWatcher();
 }
 
@@ -222,7 +240,7 @@ async function flushDeltaForFile(
     try {
       const result = await insertRawMemory({
         user_id: userId,
-        agent_platform: AGENT_PLATFORM,
+        agent_platform: fileState.agentPlatform,
         agent_model: agentModel,
         role: parsed.role,
         message: parsed.message,
@@ -246,7 +264,7 @@ async function flushAllFiles(): Promise<{ inserted: number; skipped: number; ded
 
   let totalI = 0, totalS = 0, totalD = 0;
 
-  for (const filePath of walkTranscripts(SESSIONS_ROOT)) {
+  for (const { filePath, platform } of walkAllTranscripts()) {
     let fileState = _state.files.get(filePath);
     if (!fileState) {
       let stat: fs.Stats | null = null;
@@ -257,15 +275,16 @@ async function flushAllFiles(): Promise<{ inserted: number; skipped: number; ded
       const initialSize = isPreExisting ? (stat?.size ?? 0) : 0;
 
       if (isPreExisting) {
-        console.error(`📝 [Antigravity] pre-existing session skipped (lines=${initialCursor}): ${extractSid(filePath)}`);
+        console.error(`📝 [Antigravity] pre-existing session skipped (lines=${initialCursor}): ${platform}/${extractSid(filePath)}`);
       } else {
-        console.error(`📝 [Antigravity] new session detected: ${extractSid(filePath)}`);
+        console.error(`📝 [Antigravity] new session detected: ${platform}/${extractSid(filePath)}`);
       }
 
       fileState = {
         cursorLines: initialCursor,
         lastSize: initialSize,
         sessionId: extractSid(filePath),
+        agentPlatform: platform,
         currentModel: null,
       };
       _state.files.set(filePath, fileState);
@@ -312,17 +331,22 @@ function scheduleFlush(): void {
 
 function armDirWatcher(): void {
   if (!_state || !_state.rootExists) return;
-  if (_watcher) return;
-  try {
-    _watcher = fs.watch(SESSIONS_ROOT, { recursive: true }, (_evt, filename) => {
-      if (!filename) return;
-      if (path.basename(filename) !== CHAT_FILE) return;
-      scheduleFlush();
-    });
-    console.error(`📝 [Antigravity] dir watcher armed (recursive)`);
-  } catch (err) {
-    console.error("⚠️ [Antigravity] fs.watch failed — polling only:", err);
+  if (_watchers.length) return;
+  for (const { dir } of ROOTS) {
+    if (!fs.existsSync(dir)) continue;
+    try {
+      const w = fs.watch(dir, { recursive: true }, (_evt, filename) => {
+        if (!filename) return;
+        if (path.basename(filename) !== CHAT_FILE) return;
+        scheduleFlush();
+      });
+      _watchers.push(w);
+    } catch (err) {
+      console.error(`⚠️ [Antigravity] fs.watch failed for ${dir} — polling only:`, err);
+    }
   }
+  console.error(`📝 [Antigravity] dir watchers armed: ${_watchers.length} root(s)`);
+  // OS 버퍼링으로 fs.watch 이벤트 누락될 수 있음 → 폴링으로 보완
   _pollTimer = setInterval(() => { void flushWithMutex(); }, POLL_INTERVAL_MS);
 }
 
@@ -335,10 +359,10 @@ function disarmDirWatcher(): void {
     clearInterval(_pollTimer);
     _pollTimer = null;
   }
-  if (_watcher) {
-    try { _watcher.close(); } catch {}
-    _watcher = null;
+  for (const w of _watchers) {
+    try { w.close(); } catch {}
   }
+  _watchers = [];
 }
 
 export async function captureSessionEnd(): Promise<{ inserted: number; skipped: number; error?: string }> {
