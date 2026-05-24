@@ -313,6 +313,35 @@ Recent를 드롭했으므로 "직전 대화 연속성"은 아직 자동 주입 �
 
 ---
 
+## §19. project_alias_promoter (Stage 2) 설계 확정 📌 설계 (구현 전, 2026-05-24)
+
+3-way 회의(Codex gpt-5.5 xhigh + Gemini 3 council-high + Opus 종합). §18 keystone 위에 "누가/어떻게 `alias_of`를 채우나".
+
+**합의(셋 다 독립 수렴)**: 별도 테이블 / 벡터=recall만·LLM=엔티티 판단 / 로컬 qwen3.6:35b per-pair evidence-bound / 하이브리드 스케줄(이벤트+daily) / 제안 적극·auto-apply 보수 / dtag_promoter와 별도 worker(helper만 공유).
+
+**Opus 종합 판단 (갈린 지점)**
+- **저장**: 1테이블 `project_tag_alias_suggestions` + relation enum(`rename`/`alias`/`same_project`/`different`/`misfile_suspected`/`insufficient`) + open-pair 부분 유니크 인덱스(`WHERE status='pending'`, `LEAST/GREATEST`로 방향무관 dedupe + reject 후 재제안 허용) + `signals JSONB`. (Codex의 정규화 evidence 테이블은 v1 YAGNI — 후일.)
+- **확인 UX**: **새 MCP tool `manage_project_tags`**(`list_suggestions`/`confirm_alias`/`reject_alias`/`set_alias`/`unset_alias`). manage_knowledge 재사용은 도메인 불일치(메모리 CRUD vs 태그그래프 mutate, `memory_id=suggestion_id` 혼동)로 기각. 새 *서버* tool = 여전히 client zero-config(원칙 위배 아님).
+- **범위 교정(중요)**: 오태깅(C)은 alias 축이 아니라 **개별 메모리 retag** 축 — tag A→B alias하면 A의 *모든* 메모리가 끌려감. 따라서 **Stage 2 = 태그레벨 A(개명)+B(동의어)만.** C(개별 misfile retag)는 별도 backlog.
+- **벡터**: v1=대표 메모리 근접. 태그/요약 벡터 임베딩은 Stage 6(요약 벡터 루프)으로.
+
+**설계 요약**
+```
+project_alias_promoter.ts (별도 worker)
+├─ 후보생성: canonical root 태그만. 신호 우선순위 = user 개명발언(ILIKE) > 신규/저빈도 태그 > 벡터근접 메모리 > d_tag overlap > 이름유사. 벡터=지명만(판단 X).
+├─ LLM(qwen3.6:35b, 신규 role 'project_alias_judge'): per-pair → {relation, confidence, evidence_memory_ids, rationale}
+├─ 게이트: auto-apply(기본 OFF) = 명시적 user rename + relation∈{rename,alias,same_project} + conf≥0.98 + 충돌0 + 양쪽 canonical root + 최근 reject 아님 + ENABLE 플래그
+│           pending = conf 0.85~0.97 → brief 노출 → 사용자 confirm
+├─ 스케줄: rename 스캐너 ~10 cold-path tick + full pass daily/cooldown + 신규태그 "다음 run 우선" 플래그
+└─ 저장: project_tag_alias_suggestions(1테이블)
+write-side cycle guard: project_tags CHECK(alias_of <> id) + confirm 트랜잭션에서 multi-hop cycle check (§18 함수는 read 방어일 뿐)
+초기 배포: auto-apply OFF → pending 쌓고 수동 confirm 10~20건 관찰 후 ON
+```
+
+**남은 backlog**: C(개별 메모리 retag 기능), 그리고 lifecycle 4~6단계(태거 완화 / Project Librarian `project_summaries` / 요약 벡터 루프).
+
+---
+
 ## 가격 참고 (2026-05 기준)
 
 | 모델 | Input | Output |
