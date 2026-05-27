@@ -89,6 +89,32 @@
 
 ---
 
+## 멀티머신 — 서버 / 클라이언트 (콜드패스 처리)
+
+여러 기기가 **하나의 공유 DB**를 쓸 때, Cold Path(태깅·프로필·클러스터링·alias 판정)는 **한 머신에서만** 돌아야 한다 — 안 그러면 같은 row를 여러 기기가 중복 처리하고 클라우드 비용이 배가된다. 같은 패키지를 **config로 역할만** 가른다:
+
+| | 클라이언트 | 서버 (처리) |
+|---|---|---|
+| **DB** | 원격 DB 접속 (SSH 터널 등) | DB 호스트 / 직접 접속 |
+| **Cold Path** | `COLD_PATH_ENABLED=false` | 전용 데몬으로 상시 가동 |
+| **하는 일** | `search` / `manage_knowledge`만 | 태깅 · 프로필 · 클러스터링 · alias 판정 |
+| **설정 난이도** | `.env` 몇 줄 (순수 config) | config + 로컬 LLM 인프라 |
+
+- **클라이언트**: editor가 띄우는 MCP 서버가 그대로 단말. `.env`에 `COLD_PATH_ENABLED=false`만 추가하면 끝.
+- **서버**: Cold Path를 MCP(=editor) 수명과 분리해 **독립 데몬**으로 상시 가동 (editor를 안 켜도 처리됨):
+  ```bash
+  mcp-agents-memory coldpath    # MCP 서버 없이 Cold Path 워커만 도는 데몬 (systemd 권장)
+  ```
+  데몬은 PostgreSQL advisory lock으로 **싱글톤** 보장 — 인스턴스가 몇 개든 락을 잡은 1개만 처리한다(중복 방지·자동 failover).
+
+### Cold Path LLM 백엔드 (config로 교체)
+
+`LOCAL_LLM_BASE_URL`로 OpenAI-호환 엔드포인트를 가리키면 로컬/셀프호스트 추론을 쓴다 (llama.cpp, ollama 등). 미설정 시 클라우드(`grok-4-1`) 기본. `LOCAL_GROK_FALLBACK=true`면 로컬 실패 시 grok으로 폴백.
+
+> 예) AMD/NVIDIA GPU에 llama.cpp `llama-server`로 Qwen3-14B를 올리고 `LOCAL_LLM_BASE_URL=http://localhost:8080/v1` → 콜드패스 클라우드 비용 ≈ $0. (json_schema 문법 + thinking off로 valid JSON 보장)
+
+---
+
 ## 메모리 로드 룰
 
 - **단기 메모리**: 최근 2-3일 raw 그대로, 또는 8000 토큰(약 12000-16000자) 중 먼저 도달하는 것
@@ -140,10 +166,10 @@ manage_knowledge({
 | 역할 | 사용 기술 |
 |---|---|
 | **Embedding** | OpenAI `text-embedding-3-large` (3072 dim) |
-| **Tagger (Cold Path)** | Google `gemini-2.5-flash` (predefined + dynamic) |
+| **Cold Path LLM** (tagger / librarian / clusterer / project-alias judge) | 로컬 `Qwen3-14B` (llama.cpp, json_schema 문법 + thinking off → valid JSON 보장) **또는** 클라우드 `grok-4-1-fast-non-reasoning` — `LOCAL_LLM_BASE_URL`로 선택 |
 | **검색 fallback** | PostgreSQL `ILIKE` (cosine 임계값 미만 시) |
 | **DB** | PostgreSQL + pgvector |
-| **Librarian (memory → user)** | local `qwen3.6:35b-a3b` (Q4_K_M, ollama) — 30 메시지 + 24h 게이트 |
+| **Librarian (memory → user)** | 위 Cold Path 백엔드 공유 — recency-bias 저항 큐레이션(core 정체성 ↔ sub 작업 분리 + null-preserve), 게이트 env tunable |
 | **Skill 시스템** | TBD (다음 라운드) |
 
 ---
@@ -164,11 +190,22 @@ SSH_HOST=...
 
 # 모델
 EMBEDDING_MODEL=text-embedding-3-large
-TAGGER_MODEL=gemini-2.5-flash
-OPENAI_API_KEY=...
-GEMINI_API_KEY=...
+OPENAI_API_KEY=...                 # embedding (필수)
+XAI_API_KEY=...                    # grok-4-1 (Cold Path 기본 + 로컬 폴백)
+
+# Cold Path LLM 백엔드 — 로컬 추론 쓰려면 OpenAI-호환 엔드포인트 지정 (없으면 클라우드)
+LOCAL_LLM_BASE_URL=http://localhost:8080/v1   # llama.cpp / ollama 등
+LOCAL_GROK_FALLBACK=true           # 로컬 실패 시 grok 폴백
+TAGGER_PROVIDER=local              # local / xai
+TAGGER_MODEL=qwen3-14b
+LIBRARIAN_PROVIDER=local
+LIBRARIAN_MODEL=qwen3-14b
+LIBRARIAN_ENABLED=true
+LIBRARIAN_MSG_THRESHOLD=30         # 라이브러리언 게이트 (기본 보수적)
+LIBRARIAN_COOLDOWN_HOURS=24
 
 # Hot/Cold path 제어
+COLD_PATH_ENABLED=true             # false = 단말(Cold Path 안 돎). 멀티머신에선 처리 서버만 true
 COLD_PATH_INTERVAL_SEC=60          # 1분 단위 스케줄
 COLD_PATH_BATCH_SIZE=5             # 또는 5메시지 단위
 

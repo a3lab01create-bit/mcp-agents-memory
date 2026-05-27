@@ -33,6 +33,17 @@ export interface CallOptions {
   maxTokens?: number;
   /** local 프로바이더 전용: Qwen3 계열 /think 토글. 다른 프로바이더는 무시. */
   thinking?: boolean;
+  /**
+   * local 프로바이더 전용: json_schema 기반 grammar-constrained JSON 출력.
+   * 제공 시 response_format:json_object 대신 json_schema 모드로 전환.
+   * llama.cpp --jinja 플래그 필요.
+   */
+  jsonSchema?: Record<string, unknown>;
+  /**
+   * local 프로바이더 전용: llama.cpp thinking 토글 (chat_template_kwargs.enable_thinking).
+   * jsonSchema와 동시에 true이면 경고 후 false로 강제 (llama.cpp #20345).
+   */
+  enableThinking?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -224,19 +235,60 @@ export async function callSpec(spec: ModelSpec, opts: CallOptions): Promise<stri
     }
     case 'local': {
       const client = getLocalClient();
-      // qwen2.5 계열 (non-thinking) 권장. qwen3.x 사용 시 response_format:json_object가
-      // content를 비워버리는 버그 있어 production에서는 qwen2.5:7b 사용.
-      const res = await client.chat.completions.create({
+
+      // llama.cpp #20345: enableThinking=true + jsonSchema は grammar を無視してしまう。
+      // 両方セットされた場合は警告してthinkingをオフに強制する。
+      let effectiveThinking = opts.enableThinking;
+      if (opts.enableThinking === true && opts.jsonSchema) {
+        console.warn(
+          '[ModelRegistry] enableThinking + jsonSchema both set — forcing thinking OFF (llama.cpp #20345 silently bypasses grammar when thinking is on).'
+        );
+        effectiveThinking = false;
+      }
+
+      // response_format の優先順位:
+      //   1. opts.jsonSchema → json_schema (grammar-constrained, llama.cpp --jinja 必須)
+      //   2. useJson (responseFormat:'json') → json_object (旧来の互換パス)
+      //   3. 指定なし → フリーテキスト
+      const responseFormat: Record<string, unknown> | undefined = opts.jsonSchema
+        ? {
+            type: 'json_schema',
+            json_schema: {
+              name: 'librarian_profile',
+              strict: true,
+              schema: opts.jsonSchema,
+            },
+          }
+        : useJson
+          ? { type: 'json_object' as const }
+          : undefined;
+
+      // chat_template_kwargs はOpenAI SDK の型定義にない llama-server 拡張フィールド。
+      // llama.cpp が --jinja フラグ付きで起動された場合にのみ有効。
+      // 型安全のため params を一旦型付けしてから create() の引数でのみ Record でキャスト。
+      const params: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
         model: spec.model_name,
         messages: [
-          { role: "system", content: opts.system },
-          { role: "user", content: opts.user },
+          { role: 'system', content: opts.system },
+          { role: 'user', content: opts.user },
         ],
-        ...(useJson ? { response_format: { type: "json_object" as const } } : {}),
+        ...(responseFormat ? { response_format: responseFormat as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming['response_format'] } : {}),
         temperature: 0.1,
         max_tokens: maxTokens,
-      });
+      };
+
+      const res = await client.chat.completions.create(
+        // narrow cast: only this call site is widened to accommodate chat_template_kwargs
+        {
+          ...params,
+          ...(effectiveThinking !== undefined
+            ? { chat_template_kwargs: { enable_thinking: effectiveThinking } }
+            : {}),
+        } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming & Record<string, unknown>
+      );
+
       const raw = res.choices[0]?.message?.content || '';
+      // <think>...</think> strip は defense-in-depth — thinking OFF 時も無害。
       return raw.replace(/<think>[\s\S]*?<\/think>/g, '').replace(/```json|```/g, '').trim();
     }
   }

@@ -17,6 +17,7 @@
  */
 
 import { db } from "../db.js";
+import type { PoolClient } from "pg";
 import { tagMessage } from "./tagger.js";
 import { embedMessage, vectorToHalfvecSql } from "./embedder.js";
 import { runDtagPromotion } from "./dtag_promoter.js";
@@ -269,9 +270,56 @@ async function maybeRunLibrarian(): Promise<void> {
   }
 }
 
-export function startColdPathWorker(): void {
+// ── Cold-path singleton (Postgres advisory lock) ──
+// Only the process holding this session-level lock runs the cold-path. The lock
+// is held on a DEDICATED pooled client for the process lifetime (Codex caveat:
+// never wrap row processing in it). Guards against multiple MCP instances /
+// daemons double-processing the shared DB. On process death the connection
+// drops and Postgres auto-releases the lock, so another instance can take over.
+const COLDPATH_ADVISORY_LOCK_KEY = 4242000017; // arbitrary stable key for this app
+let lockClient: PoolClient | null = null;
+
+async function acquireColdPathLock(): Promise<boolean> {
+  if (lockClient) return true; // already held by this process
+  const client = await db.getClient();
+  try {
+    const res = await client.query('SELECT pg_try_advisory_lock($1) AS got', [COLDPATH_ADVISORY_LOCK_KEY]);
+    if (res.rows[0]?.got === true) {
+      lockClient = client; // HOLD — do not release; releasing/closing frees the lock
+      return true;
+    }
+    client.release();
+    return false;
+  } catch (err) {
+    try { client.release(); } catch {}
+    throw err;
+  }
+}
+
+async function releaseColdPathLock(): Promise<void> {
+  const c = lockClient;
+  if (!c) return;
+  lockClient = null;
+  try { await c.query('SELECT pg_advisory_unlock($1)', [COLDPATH_ADVISORY_LOCK_KEY]); } catch {}
+  try { c.release(); } catch {}
+}
+
+export async function startColdPathWorker(): Promise<void> {
   if (process.env.COLD_PATH_ENABLED === 'false') {
     console.error("🔵 [ColdPath] disabled (COLD_PATH_ENABLED=false)");
+    return;
+  }
+
+  // Singleton guard: only the lock-holder processes. Fail safe — no lock, no run.
+  let got = false;
+  try {
+    got = await acquireColdPathLock();
+  } catch (err) {
+    console.error("❌ [ColdPath] advisory lock acquire failed — not starting:", err);
+    return;
+  }
+  if (!got) {
+    console.error("🔒 [ColdPath] another instance holds the lock — this process will not process");
     return;
   }
 
@@ -300,6 +348,8 @@ export function stopColdPathWorker(): void {
   if (intervalTimer) clearInterval(intervalTimer);
   warmupTimer = null;
   intervalTimer = null;
+  // Best-effort lock release; connection drop on process exit also frees it.
+  void releaseColdPathLock();
   console.error("🔵 [ColdPath] stopped");
 }
 

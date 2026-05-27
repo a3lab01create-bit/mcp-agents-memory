@@ -72,6 +72,18 @@ export function invalidateCandidateCache(): void {
 
 // RESPEC §3 cost fix: slim 적용. 핵심 룰 (explosion / role-awareness)은 keep.
 // 토큰 ~3K → ~1.8K 목표.
+
+/** JSON Schema for tagger output — used with local llama.cpp to enforce grammar (no <think> bleed). */
+const TAGGER_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    p_tag: { type: ['string', 'null'] },
+    d_tag: { type: 'array', items: { type: 'string' }, maxItems: 5 },
+  },
+  required: ['p_tag', 'd_tag'],
+  additionalProperties: false,
+};
+
 const SYSTEM_PROMPT = `Tagger for one user's personal long-term memory across AI agents.
 
 OUTPUT (strict JSON):
@@ -148,8 +160,10 @@ export async function tagMessage(input: TagInput): Promise<TagResult> {
         system: SYSTEM_PROMPT,
         user: userPrompt,
         responseFormat: 'json',
-        // thinking: false — 태거는 단순 매핑 작업. thinking 켜면 reasoning이 모든 토큰 소비해 content 비어버림.
-        // Librarian 등 복잡한 분석 역할에서만 thinking: true 사용.
+        jsonSchema: TAGGER_SCHEMA,
+        enableThinking: false,
+        // thinking off — 태거는 단순 매핑 작업. thinking 켜면 reasoning이 모든 토큰 소비해 content 비어버림.
+        // jsonSchema → llama.cpp grammar로 <think> bleed 차단 (Qwen3 bug #20345).
       });
     } catch (err) {
       if (!localFallbackEnabled) throw err;

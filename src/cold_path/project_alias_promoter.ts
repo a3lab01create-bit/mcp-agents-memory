@@ -130,6 +130,25 @@ const SOURCE_WEIGHT: Record<CandidateSource, number> = {
   low_frequency_tag: 8,
 };
 
+/** JSON Schema for project_alias_judge output — used with local llama.cpp to enforce grammar (no <think> bleed).
+ *  Note: confidence has no minimum/maximum — llama.cpp grammar cannot enforce numeric ranges;
+ *  the parser clamps via clamp01() already.
+ */
+const JUDGE_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    relation: { type: 'string', enum: ['rename', 'alias', 'same_project', 'different', 'misfile_suspected', 'insufficient'] },
+    same_project: { type: 'boolean' },
+    source_should_alias_target: { type: 'boolean' },
+    confidence: { type: 'number' },
+    evidence_memory_ids: { type: 'array', items: { type: 'integer' } },
+    conflict_memory_ids: { type: 'array', items: { type: 'integer' } },
+    rationale: { type: 'string' },
+  },
+  required: ['relation', 'same_project', 'source_should_alias_target', 'confidence', 'evidence_memory_ids', 'conflict_memory_ids', 'rationale'],
+  additionalProperties: false,
+};
+
 const JUDGE_SYSTEM_PROMPT = `You are a project-tag alias judge for one user's personal memory system.
 
 Decide whether two CANONICAL project tags refer to the same project identity.
@@ -824,7 +843,9 @@ async function judgePair(
   const raw = await callSpec(spec, {
     system: JUDGE_SYSTEM_PROMPT,
     user: userPrompt,
-    ...(spec.provider === "local" ? {} : { responseFormat: "json" as const }),
+    ...(spec.provider === "local"
+      ? { jsonSchema: JUDGE_SCHEMA, enableThinking: false }
+      : { responseFormat: "json" as const }),
     maxTokens: envInt("PROJECT_ALIAS_JUDGE_MAX_TOKENS", 8192),
   });
   if (!raw) throw new Error("project_alias_judge returned empty content");

@@ -212,6 +212,7 @@ function printHelp() {
 
 Usage:
   mcp-agents-memory                 Run the MCP server (stdio).
+  mcp-agents-memory coldpath        Run ONLY the cold-path worker as a standalone always-on daemon (no MCP server). For the processing/GPU machine via systemd.
   mcp-agents-memory setup           Interactive setup — write config to ~/.config/mcp-agents-memory/.env and run migrations.
   mcp-agents-memory migrate         Apply any pending DB migrations against the configured database.
   mcp-agents-memory help            Show this message.
@@ -280,8 +281,38 @@ async function runMcpServer() {
     process.exit(1);
   }
 
-  startColdPathWorker();
+  void startColdPathWorker().catch((err) => console.error("❌ [ColdPath] start failed:", err));
   // Phase E will start Librarian (memory→user) worker here.
+}
+
+async function runColdPathDaemon() {
+  // Standalone cold-path daemon — runs ONLY the cold-path worker, no MCP server.
+  // Intended for an always-on systemd service on the processing/GPU machine, so
+  // the cold-path is decoupled from any editor/MCP lifecycle. The daemon IS the
+  // cold-path, so force it on regardless of COLD_PATH_ENABLED=false (which the
+  // MCP servers on this same box use to stay thin clients).
+  process.env.COLD_PATH_ENABLED = "true";
+
+  // systemd stop = SIGTERM → clean shutdown (drain + advisory-lock release + exit).
+  // No stdin handlers (daemon has no stdin pipe) and no parent watchdog (systemd supervises).
+  process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
+  process.on("SIGINT",  () => { void shutdown("SIGINT");  });
+  process.on("SIGHUP",  () => { void shutdown("SIGHUP");  });
+
+  // Connect DB up front so an unreachable DB / bad tunnel fails loudly → systemd retries.
+  try {
+    await db.connect();
+  } catch (err) {
+    console.error("❌ [ColdPathDaemon] DB connect failed — exiting (systemd will retry):", err);
+    process.exit(1);
+  }
+
+  console.error(`🧊 Cold-path daemon (v${PACKAGE_VERSION}) started — no MCP server`);
+  await startColdPathWorker();
+  // If the lock was acquired, the cold-path interval keeps the process alive.
+  // If another instance already holds the lock, this process has nothing to do
+  // and exits cleanly (exit 0 → systemd won't restart-loop). Normal single-daemon
+  // deployments always acquire the lock.
 }
 
 async function cli() {
@@ -289,6 +320,10 @@ async function cli() {
 
   if (!cmd || cmd === "serve") {
     return runMcpServer();
+  }
+
+  if (cmd === "coldpath") {
+    return runColdPathDaemon();
   }
 
   if (cmd === "help" || cmd === "--help" || cmd === "-h") {

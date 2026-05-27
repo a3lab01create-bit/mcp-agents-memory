@@ -426,6 +426,51 @@ codex/gemini에 이어 **Grok Build·Antigravity** passive capture 추가 → �
 
 ---
 
+## §23. 콜드패스 로컬 통합 — llama.cpp Qwen3-14B 단일 모델 🔵 구성 staged (2026-05-27)
+
+**배경**: §21에서 recency-bias는 "입력 문제(모델 무관)"로 진단됐으나, 실제 배포는 `LIBRARIAN_MODEL=qwen3.6:35b-a3b`(16GB 초과 → CPU offload/타임아웃 → 잦은 실패) + `LOCAL_GROK_FALLBACK=true` 조합이라 **로컬 실패 시 grok fallback이 떠서 $10-15/월** 발생. 즉 "grok 태거 비용"의 정체 = 미스사이즈 로컬 모델의 fallback.
+
+**결정 (오퍼스 2차 회의 + grok 독립 검수 + 실측)**:
+- 하네스: ollama → **llama.cpp(llama-server)**. 사유: 6800 XT = **gfx1030(RDNA2)**, vLLM/SGLang은 gfx1100 타깃이고 그들의 배칭 이점은 1-QPS 콜드패스엔 무의미. 단일유저엔 llama.cpp가 정답.
+- 모델: **Qwen3-14B Q5_K_M** (9.8GB GGUF, 로드시 VRAM **11.8GB** — 16GB에 통째 상주). 8b는 카드 낭비, 35b-a3b MoE는 16GB 초과 스필. 14b dense가 sweet spot.
+- 출력: **thinking OFF + json_schema 문법 = valid JSON 보장**(기본 빠른경로, ~6s). thinking ON + json_schema는 grammar 무시 버그(llama.cpp #20345)라 **금지** → thinking은 2-pass deep 모드(`LIBRARIAN_DEEP_THINKING`)에서만 opt-in.
+
+**큐레이션(grok이 짚은 recency-오염 갭 — §21 line 379 재확인)**:
+- SYSTEM_PROMPT 강화: core=DURABLE 정체성 only / sub=현재 작업, "주제를 다루는 것 ≠ 정체성" 명시, **null-preserve 규칙**(새 정체성 없으면 core=null로 보존).
+- 입력 윈도우: 최근50 단일 → **최근25 + 과거25 블렌드**(단일 세션 지배 희석, 과거=정체성 앵커 라벨).
+- cadence: 검증 전까지 보수적(30msg/24h) → **실측 통과 후 .env에서 15msg/2h**. 코드 기본값은 보수적 유지(npm zero-config 안전).
+- 토큰캡 32768 → 2048(8192 ctx 대비 과대 방지). 프롬프트 예시는 실제 유저 정체성 하드코딩 제거 → fictional.
+
+**실측 검증 (오염 테스트 = 바로 이 "모델사냥" 세션 윈도우)**:
+- qwen2.5:14b@ollama AND Qwen3-14B@llama.cpp **둘 다 PASS**: core_profile = "트리플에이랩 대표…" 보존, sub_profile = "vLLM/Qwen3/ROCm 빌드/태깅…" 포착. §21이 "옛 프롬프트엔 14b도 오염"이라 한 조건에서 새 프롬프트가 막아냄.
+
+**인프라 함정 (gfx1030 + ROCm 7.1 + LLVM21, 다음에 또 헤매지 말 것)**:
+- cmake 없음 + PEP668 → `pip install --user --break-system-packages cmake`.
+- HIP configure 실패 "cannot find ROCm device library" → device libs는 `/usr/lib/llvm-21/lib/clang/21/amdgcn/bitcode`에 있음. `cmake -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1030 -DCMAKE_HIP_FLAGS="--rocm-device-lib-path=$DLP"`.
+- **flash-attention 필수 OFF**: `-fa off`. 안 끄면 gfx1030 FA 커널(`ggml_cuda_flash_attn_ext_tile_case<128,128>`, head_dim 128)이 `ggml_abort`로 크래시. (ollama는 자체 FA라 무관)
+- 서버 기동: `llama-server -m Qwen3-14B-Q5_K_M.gguf --jinja -fa off --ctx-size 8192 -ngl 99 --port 8080`. 로딩 6s.
+- codex(MCP)는 자체 샌드박스로 네트워크·파일쓰기 차단 → 빌드 불가, 직접 수행함.
+
+**VRAM 통합 (16GB 강제)**: gemma4:26b(judge, 19GB) + Qwen3-14B 동시 상주 불가가 실증됨. 임베딩은 OpenAI 클라우드(text-embedding-3-large)라 ollama 독립 → **tagger+librarian+judge 전부 `LOCAL_LLM_BASE_URL=:8080`(Qwen3-14B)로 통합, ollama 은퇴**. clusterer만 grok-cloud 잔류. → 콜드패스 클라우드 비용 ≈ $0.
+
+**전 역할 로컬 배선 + 실측 검증 완료 (2026-05-27)**: tagger/clusterer/project_alias_judge 모두 `enableThinking:false`(+tagger·judge는 jsonSchema) 적용. 라이브 Qwen3-14B@8080에 실제 프롬프트로 검증 → 4종 전부 valid shaped JSON, `<think>` 누출 0:
+- tagger: `{p_tag:"centragens", d_tag:["schema-migration","bug-fix","index-rebuild"]}` (후보 매칭 정확)
+- clusterer: root-array(json_object) 4클러스터 정상 (schema/schema-migration 등 병합)
+- judge: `relation:"rename"` (centragens↔센트라젠 한/영 변형 판별), enum 문법 강제 동작
+- 주의: judge는 local일 때 기존엔 JSON 제약 0이었음(자유텍스트) → 이제 jsonSchema+thinking off로 신뢰성 확보. clusterer는 root-array라 jsonSchema 대신 json_object 사용.
+
+**콜드패스 = 독립 데몬 (2026-05-28, 프론티어 3모델 회의 결론)**: Codex(gpt-5.5)+Grok+Gemini 만장일치로 "다중 MCP 인스턴스가 콜드패스를 중복 실행"→advisory lock 권고. Grok+Gemini는 더 근본적으로 "백그라운드 LLM 워커를 ephemeral MCP 수명에 묶은 게 미스매치, 독립 서비스로 빼라"고 수렴. 단 systemd 데몬은 npm zero-config를 깨므로 **패키지엔 안 넣고**, Mortar(헤드리스 처리서버) 전용 인프라로만 둠. (다른 npm 유저는 자기 db·자기 머신 → editor MCP가 콜드패스 돌림, 영향 무관.) 핵심 통찰: 다른 사람은 *내 db를 안 씀* → "zero-config for others"는 내 멀티머신 선택을 제약 안 함.
+
+구현 (shipped):
+- `coldpath` 서브커맨드(index.ts): MCP 없이 콜드패스만 도는 데몬. `COLD_PATH_ENABLED=true` 내부 override(공유 .env의 false는 MCP 단말용). SIGTERM/INT/HUP 핸들러만(stdin 핸들러·watchdog 없음 — 데몬엔 stdin 파이프 없음). DB 명시 connect로 실패 시 exit 1→systemd 재시도.
+- **advisory lock 싱글톤**(worker.ts): `startColdPathWorker`가 전용 PoolClient에서 `pg_try_advisory_lock(4242000017)` 획득; 못 잡으면 콜드패스 skip. 세션레벨(Codex 주의: row 처리 안 감쌈), 프로세스 사망 시 커넥션 드롭→자동 해제. `stopColdPathWorker`가 unlock+release.
+- Mortar systemd 유닛 2개 LIVE: `llama-server`(Qwen3-14B) + `mcp-agents-memory-coldpath`(데몬). 둘 다 enabled(부팅 자동). 데몬 검증: DB connect✅ 락 획득✅ SIGTERM 클린종료✅.
+- 모든 MCP `.env` `COLD_PATH_ENABLED=false` → editor MCP는 순수 단말(save/search), 데몬이 유일 처리기.
+
+**남은 일**: ① 옛 코드 MCP 좀비 정리(락 없어 데몬과 중복 처리; pkill 시 데몬 MainPID 제외 필수 — 데몬도 `build/index.js coldpath`라 매칭됨) ② Claude 재시작→새 MCP는 단말로 뜸 ③ grok fallback 발생률 2~3주 모니터(≈0이면 보험으로 유지) ④ Codex 지적 semantic-drift 하드닝(core 변경 versioned/auditable, sub보다 엄격 게이트) ⑤ (선택) setup-server.sh 이식성 스크립트.
+
+---
+
 ## 반복 검출 패턴 (memory cross-ref)
 
 - `feedback_root_cause_not_eyeball_fix.md` — narrow-first reflex

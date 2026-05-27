@@ -79,6 +79,7 @@ async function clusterDTags(tags: DTagFreq[]): Promise<Cluster[]> {
       system: CLUSTER_SYSTEM,
       user: userPrompt,
       responseFormat: 'json',
+      enableThinking: false,
       maxTokens: 512,
     });
   } catch (err) {
