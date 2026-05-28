@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.9.12 — 2026-05-29
+
+### Cold-path clusterer: local-only valid JSON (d_tag→p_tag auto-promotion finally fires)
+
+The `clusterer` role (d_tag frequency clustering → p_tag auto-promotion) was the
+only cold-path role calling the local model without a `json_schema`, so
+Qwen3-14B returned free-form/invalid JSON and every run fell back to
+no-clustering — auto-promotion never actually fired.
+
+- Add `CLUSTER_SCHEMA` with an **object root** (`{ "clusters": [...] }`); a
+  top-level array is rejected by strict `json_schema`. Mirrors the
+  tagger/librarian/judge schema pattern.
+- Pass `jsonSchema` + `enableThinking: false` to `callRole`; parse `obj.clusters`
+  instead of a bare array.
+- Raise `maxTokens` 512 → 4096 — 50-tag clustering output was being truncated
+  mid-JSON (within the 8192 llama-server context).
+
+Local-only; no grok involved. Verified: clusterer emits valid JSON and
+retrotags rows on the first cycle after restart.
+
 ## 0.9.9 — 2026-05-23
 
 ### `search_memory` device scoping — "search wide, resume narrow"

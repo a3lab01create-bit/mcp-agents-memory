@@ -54,11 +54,10 @@ const CLUSTER_SYSTEM = `You are a keyword clustering assistant for a personal me
 Given a list of d_tags (short hyphenated keywords) with their occurrence counts,
 group semantically similar tags that refer to the same project or topic.
 
-OUTPUT strict JSON array:
-[
-  { "canonical": "<best-slug>", "members": ["<tag1>", "<tag2>", ...] },
-  ...
-]
+OUTPUT strict JSON object (NOT a bare array):
+{ "clusters": [
+  { "canonical": "<best-slug>", "members": ["<tag1>", "<tag2>", ...] }
+] }
 
 Rules:
 - canonical must be one of the input tags (pick the most descriptive one) or a clean slug if none fit
@@ -66,6 +65,29 @@ Rules:
 - Only group tags that clearly refer to the same project/topic
 - Tags with no similar counterparts become their own single-member cluster
 - Do NOT merge unrelated topics just because they share one word`;
+
+/** JSON Schema for clusterer output — wraps the cluster list in an OBJECT root.
+ *  Object root (not a top-level array) so llama.cpp/OpenAI strict json_schema accepts it,
+ *  matching how tagger/librarian/judge schemas already work (TAGGER_SCHEMA etc.). */
+const CLUSTER_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    clusters: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          canonical: { type: 'string' },
+          members: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['canonical', 'members'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['clusters'],
+  additionalProperties: false,
+};
 
 async function clusterDTags(tags: DTagFreq[]): Promise<Cluster[]> {
   if (tags.length === 0) return [];
@@ -78,9 +100,9 @@ async function clusterDTags(tags: DTagFreq[]): Promise<Cluster[]> {
     raw = await callRole('clusterer', {
       system: CLUSTER_SYSTEM,
       user: userPrompt,
-      responseFormat: 'json',
+      jsonSchema: CLUSTER_SCHEMA,
       enableThinking: false,
-      maxTokens: 512,
+      maxTokens: 4096,  // was 512 — 50개 태그 클러스터링 출력이 잘려 invalid JSON 폴백됨 (ctx 8192 내 여유)
     });
   } catch (err) {
     console.error("⚠️ [DTagPromoter] clusterer call failed, falling back to no clustering:", err);
@@ -90,8 +112,9 @@ async function clusterDTags(tags: DTagFreq[]): Promise<Cluster[]> {
 
   let parsed: Array<{ canonical: string; members: string[] }>;
   try {
-    parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) throw new Error("not an array");
+    const obj = JSON.parse(raw);
+    parsed = obj?.clusters;  // object root: { clusters: [...] }
+    if (!Array.isArray(parsed)) throw new Error("no clusters array");
   } catch {
     console.error("⚠️ [DTagPromoter] clusterer returned invalid JSON, falling back:", raw.slice(0, 200));
     return tags.map((t) => ({ canonical: t.tag, members: [t.tag], total: t.cnt }));
