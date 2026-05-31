@@ -824,16 +824,31 @@ async function judgePair(
   const targetMemories = memoriesByTag.get(target.id) ?? [];
   const allowedIds = collectAllowedMemoryIds(pair, sourceMemories, targetMemories);
 
+  // Prompt-only signals copy: drop explicit_statement_previews because the same explicit
+  // statements are already serialized in full below as explicit_user_statements. Keeping
+  // both double-counted the identical content and overflowed ctx 8192 on heavily-discussed
+  // tag pairs (8245/9766 tokens). The DB upsert (upsertSuggestion) still stores the full
+  // signals for debugging — only the LLM prompt is slimmed.
+  const promptSignals = { ...pair.signals };
+  delete promptSignals.explicit_statement_previews;
+
+  // Cap explicit statements fed to the judge. addExplicitStatement is uncapped (pushes every
+  // pattern match), and rows arrive created_at DESC, so slice the most-recent N. A judge needs
+  // only a few clear statements; uncapped accumulation was the primary ctx-8192 overflow.
+  const explicitPromptCap = envInt("PROJECT_ALIAS_EXPLICIT_PROMPT_CAP", 5);
+
   const userPrompt = JSON.stringify(
     {
       task: "Judge whether Tag A and Tag B are the same project identity.",
       candidate_sources: Array.from(pair.sources),
-      signals: pair.signals,
+      signals: promptSignals,
       tag_a_source_candidate: tagPayload(source),
       tag_b_target_candidate: tagPayload(target),
       tag_a_representative_memories: sourceMemories.map(formatMemoryForPrompt),
       tag_b_representative_memories: targetMemories.map(formatMemoryForPrompt),
-      explicit_user_statements: pair.explicitStatements.map(formatMemoryForPrompt),
+      explicit_user_statements: pair.explicitStatements
+        .slice(0, explicitPromptCap)
+        .map(formatMemoryForPrompt),
     },
     null,
     2
