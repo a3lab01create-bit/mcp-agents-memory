@@ -1,152 +1,153 @@
 # mcp-agents-memory
 
-> 사람의 기억을 모티브로 한, AI 에이전트들이 공유하는 장기 기억 MCP 서버.
+> Long-term, time-ordered memory for AI agents — a shared memory pool that persists across sessions and machines, modeled on human memory.
 
-여러 에이전트(Claude, Codex, ChatGPT, Hermes-Agent, OpenClaw 등)가 세션을 넘어 동일한 메모리 풀을 공유하며, 시간 순서대로 기억을 축적·회상하도록 설계.
+Multiple agents (Claude Code, Codex, Gemini CLI, Grok, Antigravity, …) share **one** memory pool, accumulating and recalling memories in chronological order. Each platform/model gets its own view automatically, while project tags let collaborators see each other's relevant context.
 
-> **현재 fresh implementation 진행 중**. 이전 v0.x 시리즈는 `fact_type` 분류 axis로 짜여있어 form vision (시간 + 태그 + 임베딩)과 wrong axis. 상세 → [`RESPEC.md`](./RESPEC.md)
+[![npm](https://img.shields.io/npm/v/mcp-agents-memory.svg)](https://www.npmjs.com/package/mcp-agents-memory)
 
----
-
-## 모티브
-
-- [**supermemory**](https://supermemory.io) — 시맨틱 그래프 기반 보편적 메모리 레이어
-- [**Hermes Agent**](https://github.com/NousResearch/hermes-agent) — MEMORY.md 스타일 자동 갱신, 스킬·규칙 시스템
-
-이 두 프로젝트의 핵심을 합친 형태가 본 프로젝트의 목표.
+> 🇰🇷 한국어 README → [`README.ko.md`](./README.ko.md)
+> Design rationale and decisions → [`RESPEC.md`](./RESPEC.md)
 
 ---
 
-## 핵심 설계
+## Motivation
 
-1. **사람 기억처럼 시간 순서**: 모든 대화가 시간 순서로 raw 저장. 별도 분류(fact_type) X. 시간이 지나면 태그 기반 요약 + 오래된 건 archive.
-2. **자동 모델별 분리**: `agent_platform` / `agent_model` 컬럼만으로 모델별 기억 자동 분리. 별도 카테고리 만들 필요 없음.
-3. **두 트랙 비동기**: Hot Path (raw 즉시 저장, 응답 빠름) ↔ Cold Path (백그라운드 사서가 1분 / 5메시지 단위로 태깅 + 임베딩).
-4. **태그 중심 회상**: 단기는 최근 2-3일 raw, 장기는 태그 중심 요약. 과거 기록 필요 시 날짜 / 태그 / 키워드로 archive에서 retrieval.
+- [**supermemory**](https://supermemory.io) — a universal, semantic-graph memory layer
+- [**Hermes Agent**](https://github.com/NousResearch/hermes-agent) — `MEMORY.md`-style self-updating memory, skills & rules
+
+This project aims to combine the strengths of both: supermemory's recall and Hermes' self-curation, without their weaknesses (machine-locked storage, opaque mutation).
 
 ---
 
-## 아키텍처
+## Core design
 
-### 두 트랙 비동기
+1. **Time-ordered, like human memory** — every turn is stored raw in chronological order. No `fact_type` taxonomy. Older memories are summarized by tag and archived (soft-delete, never destroyed).
+2. **Automatic per-model separation** — the `agent_platform` / `agent_model` columns alone separate memories per model. No manual categories.
+3. **Two asynchronous tracks** — a **Hot Path** (instant raw INSERT, fast response) and a **Cold Path** (a background "librarian" that tags, embeds, clusters, and curates on a 1-minute / 5-message cadence).
+4. **Tag-centric recall** — recent days as raw text, older history as tag-centric summaries. Anything older is retrievable from the archive by date / tag / keyword.
+
+---
+
+## Architecture
+
+### Two asynchronous tracks
 
 ```
-┌─────────────────┐      ┌─────────────────────────┐
-│  Agent          │      │ MCP Server              │
-│  (Claude Code,  │ ───▶ │ ▶ Hot Path (즉시 저장)  │ ──▶ memory 테이블
-│   Codex, ...)   │      └─────────────────────────┘     (raw + role + platform/model)
+┌─────────────────┐      ┌──────────────────────────┐
+│  Agent          │      │ MCP Server               │
+│  (Claude Code,  │ ───▶ │ ▶ Hot Path (instant save)│ ──▶ memory table
+│   Codex, ...)   │      └──────────────────────────┘     (raw + role + platform/model)
 └─────────────────┘                  │
-                                     │  p_tag/d_tag/embedding NULL인 row 누적
+                                     │  rows with NULL p_tag/d_tag/embedding accumulate
                                      ▼
-                        ┌─────────────────────────────┐
-                        │ Cold Path (1분 / 5메시지)   │
-                        │  ├─ Tagger (gemini-2.5-flash)│ ──▶ p_tag, d_tag
-                        │  └─ Embedder (3-large)      │ ──▶ embedding
-                        └─────────────────────────────┘
-                                     │  빈칸 UPDATE
-                                     ▼
-                        ┌─────────────────────────────┐
-                        │ Librarian (memory → user)   │ ──▶ user 테이블
-                        │  핵심 사용자 정보 promote   │     (core_profile / sub_profile)
-                        └─────────────────────────────┘
+                        ┌──────────────────────────────┐
+                        │ Cold Path  (1 min / 5 msgs)   │
+                        │  ├─ Tagger    → p_tag, d_tag   │
+                        │  ├─ Embedder  → embedding      │
+                        │  ├─ Librarian → user profile   │
+                        │  ├─ Clusterer → tag summaries  │
+                        │  └─ AliasPromoter → tag merges │
+                        └──────────────────────────────┘
 ```
 
-### 데이터 모델
+The Cold Path's LLM roles (tagger / librarian / clusterer / project-alias judge) all run on a **single shared backend** — local `Qwen3-14B` via llama.cpp, or a cloud fallback (see [Cold Path LLM backend](#cold-path-llm-backend)).
 
-**`memory` 테이블** — 시간 순서 raw 대화 저장 (단일 테이블, soft delete 아카이브)
+### Data model
 
-| 컬럼 | 설명 |
+**`memory`** — raw, time-ordered conversation log (single table, soft-delete archive)
+
+| Column | Notes |
 |---|---|
-| `user_id` | 사용자 식별 |
-| `agent_platform` | claude-code / codex / chatgpt / hermes-agent / openclaw 등 |
-| `agent_model` | opus-4-7 / gemini-3-pro / gpt-5.5 등 |
-| `subagent` | yes / no (1-level만 추적) |
-| `subagent_model` / `subagent_role` | sub일 때 채움. role은 free-form (lowercase normalize) |
+| `user_id` | user identity |
+| `agent_platform` | claude-code / codex / gemini-cli / grok / antigravity … |
+| `agent_model` | e.g. opus-4-8 / gemini-3-pro / gpt-5.5 |
+| `subagent` | yes / no (1 level tracked) |
+| `subagent_model` / `subagent_role` | filled for subagents; role is free-form (lowercase-normalized) |
 | `role` | `user` / `assistant` |
-| `message` | raw 본문 |
-| `p_tag` | predefined (프로젝트 태그, `project_tags` 참조) |
-| `d_tag` | dynamic (문맥 태그) |
+| `message` | raw body |
+| `p_tag` | predefined project tag (→ `project_tags`) |
+| `d_tag` | dynamic context tags |
 | `embedding` | `vector(3072)` — text-embedding-3-large |
-| `is_active` / `archived_at` | soft delete (무손실 보존) |
-| `is_pinned` | `manage_knowledge`로 강제 기억된 row, archive 면제 |
+| `is_active` / `archived_at` | soft delete (lossless) |
+| `is_pinned` | force-remembered via `manage_knowledge`; exempt from archival |
 | `created_at` / `updated_at` | |
 
-**`user` 테이블** — Librarian이 memory에서 핵심 정보 promote
+**`users`** — core facts the Librarian promotes out of `memory`
 
-| 컬럼 | 설명 |
+| Column | Notes |
 |---|---|
 | `user_id` / `user_name` | |
-| `core_profile` | 아주 중요한 핵심 사용자 정보 |
-| `sub_profile` | 그 외 기억해야 할 사용자 정보 |
-| `created_at` / `updated_at` | |
+| `core_profile` | the most important, durable facts about the user |
+| `sub_profile` | other facts worth remembering |
 
-**`project_tags` 테이블** — 프로젝트 태그 누적 (Cold Path가 동적 추가)
+**`project_tags`** — project tags, grown dynamically by the Cold Path
 
-| 컬럼 | 설명 |
+| Column | Notes |
 |---|---|
 | `id` / `name` / `description` | |
-| `alias_of` | 동의어 사후 병합용 (예: "centragens" ↔ "Centrazen 프로젝트") |
+| `alias_of` | post-hoc merge of synonyms (e.g. "centragens" ↔ "Centrazen project") |
 
 ---
 
-## 멀티머신 — 서버 / 클라이언트 (콜드패스 처리)
+## Multi-machine — server / client
 
-여러 기기가 **하나의 공유 DB**를 쓸 때, Cold Path(태깅·프로필·클러스터링·alias 판정)는 **한 머신에서만** 돌아야 한다 — 안 그러면 같은 row를 여러 기기가 중복 처리하고 클라우드 비용이 배가된다. 같은 패키지를 **config로 역할만** 가른다:
+When several machines share **one** database, the Cold Path (tagging / profiling / clustering / alias judging) must run on **exactly one** of them — otherwise machines double-process the same rows and double the cloud cost. The same package splits roles purely by **config**:
 
-| | 클라이언트 | 서버 (처리) |
+| | Client | Server (processing) |
 |---|---|---|
-| **DB** | 원격 DB 접속 (SSH 터널 등) | DB 호스트 / 직접 접속 |
-| **Cold Path** | `COLD_PATH_ENABLED=false` | 전용 데몬으로 상시 가동 |
-| **하는 일** | `search` / `manage_knowledge`만 | 태깅 · 프로필 · 클러스터링 · alias 판정 |
-| **설정 난이도** | `.env` 몇 줄 (순수 config) | config + 로컬 LLM 인프라 |
+| **DB** | remote (e.g. SSH tunnel) | DB host / direct |
+| **Cold Path** | `COLD_PATH_ENABLED=false` | standalone daemon, always on |
+| **Does** | `search` / `manage_knowledge` only | tagging · profiling · clustering · alias judging |
+| **Setup** | a few `.env` lines | config + local LLM infra |
 
-- **클라이언트**: editor가 띄우는 MCP 서버가 그대로 단말. `.env`에 `COLD_PATH_ENABLED=false`만 추가하면 끝.
-- **서버**: Cold Path를 MCP(=editor) 수명과 분리해 **독립 데몬**으로 상시 가동 (editor를 안 켜도 처리됨):
+- **Client**: the MCP server your editor spawns is the terminal. Just add `COLD_PATH_ENABLED=false`.
+- **Server**: run the Cold Path decoupled from the editor's lifetime, as a standalone daemon (processes even when no editor is open):
   ```bash
-  mcp-agents-memory coldpath    # MCP 서버 없이 Cold Path 워커만 도는 데몬 (systemd 권장)
+  mcp-agents-memory coldpath    # Cold Path worker only, no MCP server (systemd recommended)
   ```
-  데몬은 PostgreSQL advisory lock으로 **싱글톤** 보장 — 인스턴스가 몇 개든 락을 잡은 1개만 처리한다(중복 방지·자동 failover).
+  The daemon is a **singleton** via a PostgreSQL advisory lock — no matter how many instances exist, only the one holding the lock processes (dedup + automatic failover).
 
-### Cold Path LLM 백엔드 (config로 교체)
+### Cold Path LLM backend
 
-`LOCAL_LLM_BASE_URL`로 OpenAI-호환 엔드포인트를 가리키면 로컬/셀프호스트 추론을 쓴다 (llama.cpp, ollama 등). 미설정 시 클라우드(`grok-4-1`) 기본. `LOCAL_GROK_FALLBACK=true`면 로컬 실패 시 grok으로 폴백.
+Point `LOCAL_LLM_BASE_URL` at any OpenAI-compatible endpoint to use local / self-hosted inference (llama.cpp, ollama, …). If unset, a cloud model is used; `LOCAL_GROK_FALLBACK=true` falls back to Grok when local inference fails.
 
-> 예) AMD/NVIDIA GPU에 llama.cpp `llama-server`로 Qwen3-14B를 올리고 `LOCAL_LLM_BASE_URL=http://localhost:8080/v1` → 콜드패스 클라우드 비용 ≈ $0. (json_schema 문법 + thinking off로 valid JSON 보장)
-
----
-
-## 메모리 로드 룰
-
-- **단기 메모리**: 최근 2-3일 raw 그대로, 또는 8000 토큰(약 12000-16000자) 중 먼저 도달하는 것
-  - 토큰 측정은 char-approximate (`char_count / 1.7`) — Hot Path latency 보호
-  - 단기/장기 전환 기간은 env로 tunable (form이 직접 조정 가능)
-- **모델 분리**: 기본 = 같은 `agent_platform` / `agent_model` 기억만. `p_tag` 매칭 시 (= 같은 프로젝트) 협업 agent 기억까지 포함
-- **archive 검색**: 사용자 발화 컨텍스트 ("며칠 전에...") 또는 과거 기록 필요 판단 시 → 날짜 / 태그 / 키워드로 archive에서 retrieval
-- **검색 fallback**: 의미 검색 (cosine) 결과 임계값 미만 시 ILIKE로 fallback (env tunable, 시작 0.3)
+> e.g. serve `Qwen3-14B` with llama.cpp `llama-server` on an AMD/NVIDIA GPU and set `LOCAL_LLM_BASE_URL=http://localhost:8080/v1` → Cold Path cloud cost ≈ $0. (A `json_schema` grammar with thinking disabled guarantees valid JSON.)
 
 ---
 
-## API (Tool 2개)
+## Memory load rules
 
-### `search_memory` — 조회/검색 통합
+- **Short-term**: recent 2–3 days raw, or ~8000 tokens (whichever comes first). Token count is char-approximate (`chars / 1.7`) to protect Hot Path latency. Window is env-tunable.
+- **Model separation**: by default, only memories with the same `agent_platform` / `agent_model`. A `p_tag` match (same project) pulls in collaborating agents' memories too.
+- **Archive search**: on a user cue ("a few days ago…") or when older context is needed, retrieve from the archive by date / tag / keyword.
+- **Search fallback**: when semantic (cosine) results fall below threshold, fall back to `ILIKE` (env-tunable, starts at 0.3).
 
+---
+
+## Tools
+
+The server exposes **4 tools**. Most clients only ever need the first three; `save_message` is a fallback.
+
+### `memory_startup` — session boot brief
+Returns a markdown brief (recent conversations, active projects, user profile) so a new session picks up where the last left off. On supported clients it is injected automatically at connect; call it explicitly to refresh mid-session.
+
+### `search_memory` — unified read / search
 ```ts
 search_memory({
-  query?: string,        // 의미 검색 (vector + ILIKE fallback)
-  p_tag?: string,        // 특정 프로젝트로 한정
-  date_range?: string,   // 기간 한정 (예: "2026-04-29..", "last_week")
-  role?: 'user' | 'assistant',  // user 발화만 / assistant 발화만 (기본 둘 다)
-  agent_platform?: string,      // 플랫폼 한정 (예: 'claude-code'). 생략 또는 '*' = 전 플랫폼
-  device_scope?: 'local' | 'global',  // 'global'(기본)=전 기기 / 'local'=현재 기기(pinned은 기기 무관)
-  limit?: number,        // 최대 결과 수 (기본 10, 최대 50)
-  include_archived?: boolean,   // archived 메모리 포함 (기본 false)
+  query?: string,        // semantic search (vector + ILIKE fallback)
+  p_tag?: string,        // restrict to a project
+  date_range?: string,   // e.g. "2026-04-29..", "last_week"
+  role?: 'user' | 'assistant',
+  agent_platform?: string,      // restrict to a platform; omit or '*' = all
+  device_scope?: 'local' | 'global',  // 'global' (default) = all machines; 'local' = this one
+  limit?: number,        // default 10, max 50
+  include_archived?: boolean,
 })
 ```
+> "When you don't remember, reach for this one." Agents just vary the parameters.
 
-> "기억 안 나면 무조건 이거 하나만 써" — 에이전트가 파라미터 조합만 바꿔서 검색.
-
-### `manage_knowledge` — 저장/수정 통합
-
+### `manage_knowledge` — unified write / edit
 ```ts
 manage_knowledge({
   action: 'add' | 'update' | 'remove',
@@ -154,145 +155,112 @@ manage_knowledge({
   content: string,
 })
 ```
+> Use when the user explicitly says "remember this" / "forget that".
+> `target='memory'` = force-remember (`is_pinned=true`, importance bump, archive-exempt).
+> `manage_knowledge` skips the Cold Path and **syncs tag + embedding immediately**, so the memory is searchable the instant you say "got it".
 
-> 사용자가 명시적으로 "이건 기억해" / "이건 지워" 할 때 사용.
-> `target='memory'` 호출 = 강제 기억 (`is_pinned=true`, importance bump, archive 면제).
-> `manage_knowledge`만큼은 Cold Path 거치지 않고 **즉시 sync tag + embed**. ("기억했어요" 답한 직후 바로 검색 가능 보장)
+### `save_message` — transcript fallback
+For platforms that **don't** auto-capture transcripts, the agent calls this each turn to persist the message. On auto-capturing clients (see below) it must **not** be called — that would duplicate rows.
 
----
+### Automatic capture
 
-## 기술 스택
-
-| 역할 | 사용 기술 |
+| Platform | Auto-capture |
 |---|---|
-| **Embedding** | OpenAI `text-embedding-3-large` (3072 dim) |
-| **Cold Path LLM** (tagger / librarian / clusterer / project-alias judge) | 로컬 `Qwen3-14B` (llama.cpp, json_schema 문법 + thinking off → valid JSON 보장) **또는** 클라우드 `grok-4-1-fast-non-reasoning` — `LOCAL_LLM_BASE_URL`로 선택 |
-| **검색 fallback** | PostgreSQL `ILIKE` (cosine 임계값 미만 시) |
-| **DB** | PostgreSQL + pgvector |
-| **Librarian (memory → user)** | 위 Cold Path 백엔드 공유 — recency-bias 저항 큐레이션(core 정체성 ↔ sub 작업 분리 + null-preserve), 게이트 env tunable |
-| **Skill 시스템** | TBD (다음 라운드) |
+| Claude Code · Codex CLI · Gemini CLI · Grok Build · Antigravity CLI | ✅ transcript captured automatically — do **not** call `save_message` |
+| Everything else | call `save_message(role=…)` each turn |
+
+> Auto-injection of the startup brief / auto-capture depends on the **client**, not the transport — some clients (e.g. desktop/web) don't expose those hooks, so they fall back to explicit tool calls.
 
 ---
 
-## 환경변수 (계획)
+## Tech stack
+
+| Role | Tech |
+|---|---|
+| **Embedding** | OpenAI `text-embedding-3-large` (3072-dim) |
+| **Cold Path LLM** (tagger / librarian / clusterer / project-alias judge) | local `Qwen3-14B` (llama.cpp; `json_schema` grammar + thinking off → valid JSON), **or** cloud `grok-4-1-fast-non-reasoning` fallback — selected via `LOCAL_LLM_BASE_URL` |
+| **Search fallback** | PostgreSQL `ILIKE` (below cosine threshold) |
+| **DB** | PostgreSQL + pgvector |
+| **Librarian** (memory → users) | shares the Cold Path backend — recency-bias-resistant curation (core identity ↔ sub work split, null-preserve), gated by env-tunable thresholds |
+
+---
+
+## Environment variables
+
+See [`.env.example`](./.env.example) for the full, annotated list. The essentials:
 
 ```bash
 # DB
-DB_HOST=...
-DB_PORT=5432
-DB_USER=...
-DB_PASS=...
-DB_NAME=...
+DB_HOST=...      DB_PORT=5432   DB_USER=...   DB_PASS=...   DB_NAME=...
 
-# SSH tunnel (옵션)
-SSH_ENABLED=true
-SSH_HOST=...
+# Keys
+OPENAI_API_KEY=...                 # embedding (required)
+XAI_API_KEY=...                    # Grok (Cold Path cloud + local fallback)
 
-# 모델
-EMBEDDING_MODEL=text-embedding-3-large
-OPENAI_API_KEY=...                 # embedding (필수)
-XAI_API_KEY=...                    # grok-4-1 (Cold Path 기본 + 로컬 폴백)
-
-# Cold Path LLM 백엔드 — 로컬 추론 쓰려면 OpenAI-호환 엔드포인트 지정 (없으면 클라우드)
-LOCAL_LLM_BASE_URL=http://localhost:8080/v1   # llama.cpp / ollama 등
-LOCAL_GROK_FALLBACK=true           # 로컬 실패 시 grok 폴백
-TAGGER_PROVIDER=local              # local / xai
-TAGGER_MODEL=qwen3-14b
-LIBRARIAN_PROVIDER=local
-LIBRARIAN_MODEL=qwen3-14b
+# Cold Path LLM backend — OpenAI-compatible endpoint for local inference (omit → cloud)
+LOCAL_LLM_BASE_URL=http://localhost:8080/v1
+LOCAL_GROK_FALLBACK=true
+TAGGER_PROVIDER=local              TAGGER_MODEL=qwen3-14b
+LIBRARIAN_PROVIDER=local           LIBRARIAN_MODEL=qwen3-14b
 LIBRARIAN_ENABLED=true
-LIBRARIAN_MSG_THRESHOLD=30         # 라이브러리언 게이트 (기본 보수적)
-LIBRARIAN_COOLDOWN_HOURS=24
 
-# Hot/Cold path 제어
-COLD_PATH_ENABLED=true             # false = 단말(Cold Path 안 돎). 멀티머신에선 처리 서버만 true
-COLD_PATH_INTERVAL_SEC=60          # 1분 단위 스케줄
-COLD_PATH_BATCH_SIZE=5             # 또는 5메시지 단위
+# Hot/Cold path control
+COLD_PATH_ENABLED=true             # false = client terminal (no Cold Path); only the server is true
+COLD_PATH_INTERVAL_SEC=60
+COLD_PATH_BATCH_SIZE=5
 
-# 메모리 로드 tunable
-SHORT_TERM_DAYS=3                  # 단기 메모리 윈도우
-SHORT_TERM_TOKEN_LIMIT=8000        # 토큰 리밋 (char-approx)
-SEARCH_FALLBACK_THRESHOLD=0.3      # cosine 미만 시 ILIKE fallback
+# Memory load tunables
+SHORT_TERM_DAYS=3
+SHORT_TERM_TOKEN_LIMIT=8000
+SEARCH_FALLBACK_THRESHOLD=0.3
 
-# Agent 식별 (caller가 self-report)
+# Agent identity (caller self-reports)
 AGENT_PLATFORM=claude-code
-AGENT_MODEL=opus-4-7
-AGENT_KEY=...                      # 옵션, multi-persona 구분용
+AGENT_MODEL=opus-4-8
 ```
 
 ---
 
-## 상태
+## Client setup
 
-| 항목 | 상태 |
-|---|---|
-| `RESPEC.md` 작성 (vision + 결정사항 + nuance + 살릴 자산 / 폐기 코드) | ✅ Done |
-| 새 schema SQL (migration 019) | ✅ Done — `users` + `memory` + `project_tags` 3테이블 |
-| Hot Path 구현 (즉시 raw INSERT) | ✅ Done |
-| Cold Path 구현 (tagger gemini-2.5-flash + embedder 3-large + worker SKIP LOCKED) | ✅ Done |
-| Librarian 구현 (memory → user.core/sub_profile promote) | ✅ Done |
-| MCP Tools (`search_memory` + `manage_knowledge`) | ✅ Done |
-| Migration (legacy ~3582 row → archive 보존 + 재임베딩) | ✅ Done |
-| 핵심 정체성 promote (user.core_profile / sub_profile) | ✅ Done — Librarian v2 (gate + null guard + JSON-in-string guard, qwen3.6:35b-a3b) |
-| Skill 트랙 정리 | ⏳ form 결정 보류, 차후 |
-
----
-
-## 참조 문서
-
-- [`RESPEC.md`](./RESPEC.md) — 현재 vision + 회의 결정사항 + 구현 detail (단일 진실 원천)
-- [`SPEC.md`](./SPEC.md) — 구 SPEC (v0.x 역사 보존, 일부 §3.4 Memory Tier가 본 vision의 원형)
-- [`DEVLOG.md`](./DEVLOG.md) — 운영 이슈, 관찰 로그, 아이디어 적립
-
----
-
-## 가이드 원칙
-
-> 눈앞 문제 해결한다고 전체 구조가 망가지면 안 됨.
-
-매 작업/제안 시 RESPEC.md vision 정합 검증 → "이 fix가 큰 틀과 맞나?" 확인 후 진행.
-"일단 돌게만 만들자"는 멈춤 신호.
-
----
-
-*Status: fresh implementation 준비 단계. 실제 구현은 form 결정 후 진행.*
-
-
-
-gemini cli trust setting 방법
-
-~/.gemini/settings.json
-
-```json
-"mcpServers": {
-    "mcp-agents-memory": {
-      "type": "stdio",
-      "command": "node",
-      "args": [
-        "/Users/hoon/Documents/Playgrounds/mcp-agents-memory/build/index.js"
-      ],
-      "env": {},
-      "trust": true 
-    }
-  }
-```
-
-codex 
-
-~/.codex/config.toml
-
+### Claude Code / Codex
 ```toml
+# ~/.codex/config.toml
 [mcp_servers.mcp-agents-memory]
 command = "mcp-agents-memory"
 args = []
-
-[mcp_servers.mcp-agents-memory.tools.memory_startup]
-approval_mode = "approve"
-
-[mcp_servers.mcp-agents-memory.tools.save_message]
-approval_mode = "approve"
-
-[mcp_servers.mcp-agents-memory.tools.search_memory]
-approval_mode = "approve"
 ```
 
+### Gemini CLI
+```json
+// ~/.gemini/settings.json
+{
+  "mcpServers": {
+    "mcp-agents-memory": {
+      "type": "stdio",
+      "command": "mcp-agents-memory",
+      "args": [],
+      "env": {},
+      "trust": true
+    }
+  }
+}
+```
+
+> Install globally with `npm i -g mcp-agents-memory`, or point `command` at a local `build/index.js`.
+
+---
+
+## Guiding principle
+
+> Solving the problem in front of you must not break the whole structure.
+
+Every change is checked against the `RESPEC.md` vision — "does this fix fit the big picture?" — before proceeding. "Just make it run" is a stop signal.
+
+---
+
+## Reference docs
+
+- [`RESPEC.md`](./RESPEC.md) — current vision, decisions, implementation detail (single source of truth)
+- [`DEVLOG.md`](./DEVLOG.md) — operational issues, observations, ideas
+- [`README.ko.md`](./README.ko.md) — Korean README
