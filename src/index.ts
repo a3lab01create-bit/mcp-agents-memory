@@ -25,6 +25,10 @@ import {
   captureSessionStart as captureAntigravityStart,
   captureSessionEnd as captureAntigravityEnd,
 } from "./auto_save/antigravity_capture.js";
+import {
+  captureSessionStart as captureHermesStart,
+  captureSessionEnd as captureHermesEnd,
+} from "./auto_save/hermes_capture.js";
 import { PACKAGE_VERSION } from "./version.js";
 import fs from "fs";
 
@@ -40,7 +44,7 @@ const STATIC_INSTRUCTIONS = `Long-term memory MCP server (RESPEC v1).
 
 Tools: memory_startup(시작 brief) · search_memory(과거 조회/검색) · manage_knowledge(저장/수정/삭제; 강제기억 is_pinned) · save_message(transcript 미지원 platform fallback).
 
-자동 저장: Claude Code / Codex CLI / Gemini CLI / Grok Build / Antigravity는 transcript 자동 캡처 — save_message 호출 금지(중복 row). 그 외 platform만 매 turn save_message.
+자동 저장: Claude Code / Codex CLI / Gemini CLI / Grok Build / Antigravity / Hermes는 transcript 자동 캡처 — save_message 호출 금지(중복 row). 그 외 platform만 매 turn save_message.
 
 능동 규칙(mandatory): named entity(프로젝트·repo·인물) 언급 시, 또는 과거 선호·결정을 가정하기 전 먼저 search_memory. 작업당 1-2회.
 
@@ -126,6 +130,7 @@ async function shutdown(reason: string): Promise<void> {
         captureGeminiEnd(),
         captureGrokEnd(),
         captureAntigravityEnd(),
+        captureHermesEnd(),
       ]),
       new Promise<void>((resolve) => setTimeout(resolve, 3000)),
     ]);
@@ -255,11 +260,15 @@ async function runMcpServer() {
   // - gemini_capture: ~/.gemini/tmp/<projectKey>/chats/session-*.json
   // - grok_capture: ~/.grok/sessions/<urlencoded-cwd>/<sid>/chat_history.jsonl (recursive watch)
   // - antigravity_capture: ~/.gemini/antigravity-cli/brain/<sid>/.system_generated/logs/transcript_full.jsonl
+  // - hermes_capture: ~/.hermes/state.db (SQLite messages 테이블, id 커서 폴링)
   captureSessionStart(process.cwd());
   captureCodexStart(process.cwd());
   captureGeminiStart(process.cwd());
   captureGrokStart(process.cwd());
   captureAntigravityStart(process.cwd());
+  // Hermes만 async arm (node:sqlite lazy import). arm 완료 전 짧은 창에서는
+  // isHermesArmed()=false라 "mcp" save_message가 정상 저장됨(중복 아님, 무해).
+  void captureHermesStart(process.cwd());
 
   console.error("🚀 Starting Memory MCP Server...");
 

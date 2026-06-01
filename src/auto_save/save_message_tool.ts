@@ -25,6 +25,7 @@ import { resolveAgentIdentity } from "../agent_identity.js";
 import { isCaptureArmed as isGeminiArmed } from "./gemini_capture.js";
 import { isCaptureArmed as isGrokArmed } from "./grok_capture.js";
 import { isCaptureArmed as isAntigravityArmed } from "./antigravity_capture.js";
+import { isCaptureArmed as isHermesArmed } from "./hermes_capture.js";
 
 const DEVICE_NAME = os.hostname();
 
@@ -81,6 +82,26 @@ subagent 컨텍스트라면 subagent=true + subagent_model + subagent_role 함�
       }
       // Antigravity CLI: 과거 DB platform이 antigravity-client / antigravity 일 수 있으므로 startsWith
       if (id.agent_platform?.startsWith("antigravity") && isAntigravityArmed()) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({ stored: false, skipped: "passive capture active" }, null, 2),
+          }],
+        };
+      }
+      // Hermes: MCP clientInfo.name을 "mcp"로 보고함 (live DB 실측). state.db passive
+      // capture가 armed면 (= ~/.hermes/state.db 있는 기기) save_message 수동 호출 불필요 → 중복 방지.
+      //
+      // ⚠️ 주의: 다른 sibling gate(gemini-cli-mcp-client / grok* / antigravity*)는 *고유* platform
+      //   문자열로 매칭하지만, Hermes는 generic catch-all인 bare "mcp"로 매칭한다.
+      //   isHermesArmed()는 "이 *기기*에 Hermes가 있다"는 뜻이지 "이 *요청*이 Hermes다"가 아니다.
+      //   → Hermes 호스트에서 다른 MCP 클라이언트가 똑같이 bare "mcp"로 붙고 save_message에
+      //     의존하면, 그 write가 조용히 드롭된다(Hermes 폴링은 ~/.hermes/state.db만 읽으므로 미포착).
+      //   현재 fleet(claude-code/codex-cli/gemini-cli-mcp-client/grok*/antigravity*)에선 bare "mcp"가
+      //   Hermes 고유로 보이나, 확정은 아님. gate 제거는 불가(save_message는 external_uuid=null이라
+      //   hermes:<id> capture와 dedup 안 됨 → 이중 저장). E2E에서 Hermes clientInfo.version/title 등
+      //   고유 시그널 확인되면 그걸로 좁힐 것.
+      if (id.agent_platform === "mcp" && isHermesArmed()) {
         return {
           content: [{
             type: 'text' as const,
