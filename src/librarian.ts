@@ -30,6 +30,7 @@
 import { db } from "./db.js";
 import { callRole } from "./model_registry.js";
 import { getDefaultUserId } from "./users.js";
+import { budgetMessages } from "./context_budget.js";
 
 // Conservative defaults — until recency-bias curation is verified against a
 // polluted window; fast cadence (15msg/2h) becomes safe only after that.
@@ -261,8 +262,46 @@ export async function runLibrarian(): Promise<void> {
     );
 
     // Sort each slice chronologically for readability.
-    const recentSorted = [...recentR.rows].reverse(); // DESC → ASC
-    const historicalSorted = [...historicalRows]; // already ASC from query
+    let recentSorted = [...recentR.rows].reverse(); // DESC → ASC
+    let historicalSorted = [...historicalRows]; // already ASC from query
+
+    // ctx 예산 맞추기 — 거대 붙여넣기(터미널 덤프 등) 한두 개가 8192를 초과시키던 것 근본 해결.
+    // overheadText = system + 기존 profile + scaffold (메시지 외 전부); 메시지는 그 나머지에 맞춤.
+    // /tokenize 로 정확 측정, recent(현재 활동) 보존 우선, historical(앵커) 먼저 희생.
+    // overheadText = 메시지 외 입력 전부 (system + profile + task + 섹션 헤더).
+    // 섹션 헤더까지 포함해 토큰 과소추정 방지 (per-row [#N @ ts] 래핑은 헬퍼가 추정).
+    const profileBlockForBudget =
+      `EXISTING PROFILE (preserve unless a new durable identity fact appears):\n` +
+      `core_profile:\n${before.core_profile ?? '(empty)'}\n\n` +
+      `sub_profile:\n${before.sub_profile ?? '(empty)'}\n` +
+      `\nEARLIER MESSAGES — historical context (identity anchors, NOT current activity):\n` +
+      `\nRECENT MESSAGES — most recent N messages:\n` +
+      `\nTask: produce updated core_profile and sub_profile JSON per the system prompt.`;
+    // deep mode(2-pass)는 pass-2에서 pass-1 analysis(~MAX_TOKENS)를 재주입하므로 출력 예산 2배.
+    const deepModeForBudget = process.env.LIBRARIAN_DEEP_THINKING === 'true';
+    const budgeted = await budgetMessages({
+      recent: recentSorted,
+      historical: historicalSorted,
+      overheadText: `${SYSTEM_PROMPT}\n${profileBlockForBudget}`,
+      outputReserve: deepModeForBudget ? LIBRARIAN_MAX_TOKENS * 2 : LIBRARIAN_MAX_TOKENS,
+    });
+    recentSorted = budgeted.recent as typeof recentSorted;
+    historicalSorted = budgeted.historical as typeof historicalSorted;
+    if (
+      budgeted.stats.clippedMessages > 0 ||
+      budgeted.stats.droppedHistorical > 0 ||
+      budgeted.stats.droppedRecent > 0 ||
+      budgeted.stats.overBudget
+    ) {
+      console.error(
+        `📚 [Librarian] ctx budget: clipped=${budgeted.stats.clippedMessages}, ` +
+          `droppedHist=${budgeted.stats.droppedHistorical}, ` +
+          `droppedRecent=${budgeted.stats.droppedRecent}, ` +
+          `est=${budgeted.stats.estMessageTokens}/${budgeted.stats.messageBudget}tok ` +
+          `(${budgeted.stats.usedTokenizer ? 'tokenizer' : 'char-fallback'})` +
+          `${budgeted.stats.overBudget ? ' ⚠️OVER-BUDGET' : ''}`
+      );
+    }
 
     const formatRows = (rows: any[], startIdx: number) =>
       rows
