@@ -16,6 +16,7 @@ import { registerSearchMemory } from "./tools/search_memory.js";
 import { registerManageProjectTags } from "./tools/manage_project_tags.js";
 import { registerMemoryStartup } from "./tools/memory_startup.js";
 import { registerSaveMessage } from "./auto_save/save_message_tool.js";
+import { registerTaskPin } from "./tools/task_pin.js";
 
 export function registerTools(server: McpServer): void {
   registerManageKnowledge(server);
@@ -23,4 +24,5 @@ export function registerTools(server: McpServer): void {
   registerManageProjectTags(server);
   registerMemoryStartup(server);
   registerSaveMessage(server);
+  registerTaskPin(server);
 }
