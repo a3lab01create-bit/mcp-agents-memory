@@ -13,6 +13,7 @@
 import { db } from "../db.js";
 import { callRole, callSpec, ROLE_REGISTRY, type ModelSpec } from "../model_registry.js";
 import { judgeProjectTag, shouldApplyJevJudgment } from "./jev_judge.js";
+import { getPrompt } from "../prompts/index.js";
 
 // local 프로바이더 사용 시 실패하면 grok으로 fallback (LOCAL_GROK_FALLBACK=false 로 끄기 가능)
 const GROK_FALLBACK_SPEC: ModelSpec = { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' };
@@ -121,26 +122,23 @@ const TAGGER_SCHEMA: Record<string, unknown> = {
   additionalProperties: false,
 };
 
-const SYSTEM_PROMPT = `Tagger for one user's personal long-term memory across AI agents.
+// PUBLIC GENERIC fallback. The tuned production prompt is loaded at runtime
+// from prompts.local/tagger.md (private core) and is never bundled or published.
+const GENERIC_TAGGER_PROMPT = `Tagger for a user's long-term memory across AI agents.
 
 OUTPUT (strict JSON):
 { "p_tag": "<existing-name>" | "NEW:<slug>" | null, "d_tag": ["<kw>", ...] }
 
-p_tag: ONE project tag. STRONGLY prefer matching the candidate list below —
-  synonyms / near-matches MUST map to an existing candidate (e.g. "Centrazen project" → "centragens").
-  Use "NEW:<slug>" only when the message is clearly about a brand-new project
-  absent from candidates. null when the message is too short / generic to project-tag.
+p_tag: ONE project tag. Prefer matching a name from the candidate list below;
+  map obvious synonyms to an existing candidate. Use "NEW:<slug>" only when the
+  message is clearly about a project absent from the list. null when the message
+  is too short or generic to project-tag.
 
-d_tag: 0-3 short keywords (lowercase, hyphenated) about the topic.
-  e.g. ["bug-fix", "schema", "memory_add"]. Skip if message has no signal.
+d_tag: 0-3 short lowercase hyphenated keywords about the topic. Skip if no signal.
 
 ROLE: input includes role='user' or role='assistant'. For role='assistant',
-  tag the topic — DO NOT treat the assistant's reply as a fact about the user.
-
-Examples:
-- "Centrazen 브랜드 패키지 디자인 시안 검토" + candidates ["centragens"]
-  → {"p_tag": "centragens", "d_tag": ["package-design", "review", "branding"]}
-- "응 ㅋㅋ" → {"p_tag": null, "d_tag": []}`;
+  tag the topic; do not treat the reply as a fact about the user.`;
+const SYSTEM_PROMPT = getPrompt("tagger", GENERIC_TAGGER_PROMPT);
 
 function buildUserPrompt(input: TagInput, candidates: Array<{ name: string; description: string | null }>): string {
   // Slim user prompt — description (보통 길고 가변) 제거, 이름만 (~50% 토큰 절감)

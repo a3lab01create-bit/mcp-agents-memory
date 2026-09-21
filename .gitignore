@@ -8,3 +8,6 @@ scratch/
 .claude/
 claude
 .omc/
+
+# Private tuned prompts (real core) — overlaid at runtime, never published
+prompts.local/
