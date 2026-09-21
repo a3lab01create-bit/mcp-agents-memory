@@ -12,6 +12,7 @@
 
 import { db } from "../db.js";
 import { callRole, callSpec, ROLE_REGISTRY, type ModelSpec } from "../model_registry.js";
+import { judgeProjectTag, shouldApplyJevJudgment } from "./jev_judge.js";
 
 // local 프로바이더 사용 시 실패하면 grok으로 fallback (LOCAL_GROK_FALLBACK=false 로 끄기 가능)
 const GROK_FALLBACK_SPEC: ModelSpec = { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' };
@@ -187,6 +188,25 @@ export async function tagMessage(input: TagInput): Promise<TagResult> {
     parsed = JSON.parse(raw);
   } catch {
     throw new Error(`Tagger returned invalid JSON: ${raw.slice(0, 200)}`);
+  }
+
+  // Jev is only an opinion over existing project-tag candidates. Preserve a
+  // Qwen NEW: proposal exactly: Jev cannot create a new tag, so letting it
+  // answer here would either erase the proposal or misclassify it as an old tag.
+  const qwenProposedNewTag = typeof parsed.p_tag === "string" && parsed.p_tag.startsWith("NEW:");
+  if (!qwenProposedNewTag) {
+    const jev = await judgeProjectTag({
+      message: input.message,
+      role: input.role,
+      agent_platform: input.agent_platform,
+      agent_model: input.agent_model,
+      candidates,
+    });
+    // A missing threshold is fail-closed in shouldApplyJevJudgment(), so merely
+    // setting JEV_ENABLED=true cannot give Jev final authority accidentally.
+    if (jev !== null && shouldApplyJevJudgment(jev)) {
+      parsed.p_tag = jev.choice;
+    }
   }
 
   let p_tag_id: number | null = null;

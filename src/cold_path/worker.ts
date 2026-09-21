@@ -23,6 +23,7 @@ import { embedMessage, vectorToHalfvecSql } from "./embedder.js";
 import { runDtagPromotion } from "./dtag_promoter.js";
 import { runLibrarian } from "../librarian.js";
 import { maybeRunProjectAliasPromoter } from "./project_alias_promoter.js";
+import { beginJevRun } from "./jev_judge.js";
 
 export {
   runProjectAliasPromoter,
@@ -210,6 +211,7 @@ async function recordError(client: any, rowId: number, err: any): Promise<void> 
 async function tick(): Promise<number> {
   if (running) return 0; // re-entry guard (이전 tick이 아직 진행 중)
   running = true;
+  beginJevRun();
 
   const batchSize = envInt('COLD_PATH_BATCH_SIZE', DEFAULT_BATCH);
 
