@@ -12,6 +12,7 @@
 
 import { db } from "../db.js";
 import { callRole, callSpec, ROLE_REGISTRY, type ModelSpec } from "../model_registry.js";
+import { judgeProjectTag, shouldApplyJevJudgment } from "./jev_judge.js";
 
 // local 프로바이더 사용 시 실패하면 grok으로 fallback (LOCAL_GROK_FALLBACK=false 로 끄기 가능)
 const GROK_FALLBACK_SPEC: ModelSpec = { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' };
@@ -31,37 +32,73 @@ export interface TagResult {
   newly_created_p_tag_name?: string;
 }
 
-// 후보 cache: 5분 TTL. project_tags가 자주 바뀌지 않아 매 call DB select 불필요.
-let _candidateCache: { rows: Array<{ id: number; name: string; description: string | null }>; expires: number } | null = null;
+type CandidateStrategy = "oldest" | "frequent";
+type ProjectTagCandidate = { id: number; name: string; description: string | null };
+
+// 후보 cache: 5분 TTL. 전략 또는 limit 변경은 별도 cache key로 분리한다.
+let _candidateCache: { key: string; rows: ProjectTagCandidate[]; expires: number } | null = null;
 const CANDIDATE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Keep the deployed behavior unless an operator explicitly opts into the
+ * frequency-based candidate list. Invalid configuration fails back to oldest.
+ */
+export function candidateSelectionConfig(): { strategy: CandidateStrategy; limit: number } {
+  const configuredStrategy = process.env.TAGGER_CANDIDATE_STRATEGY?.trim().toLowerCase();
+  const strategy: CandidateStrategy = configuredStrategy === "frequent"
+    ? "frequent"
+    : "oldest";
+  const configuredLimit = Number(process.env.TAGGER_CANDIDATE_LIMIT?.trim());
+  const limit = Number.isInteger(configuredLimit) && configuredLimit > 0
+    ? configuredLimit
+    : 20;
+  return { strategy, limit };
+}
 
 /**
  * 기존 project_tags 후보 가져오기 (alias_of 그룹 대표 = alias_of IS NULL row).
  * Tagger prompt에 후보 list로 주입해 explosion 방어.
  *
- * RESPEC §3 cost fix: candidate list cap 50 → 20 (안전한 slim).
- * alias_of 그룹화로 동의어 묶임 → 20개 대표만으로도 대부분 매칭 커버.
- * 5분 cache로 매 call DB select 안 함.
+ * 기본 oldest 전략은 기존 동작을 그대로 보존한다. frequent 전략은 최근 90일
+ * 활성 memory 사용 빈도순으로 canonical tag를 고른다. alias tag 사용도
+ * canonical_project_tag_id()로 대표 tag에 합산한다.
  */
-async function listProjectTagCandidates(limit = 20): Promise<Array<{ id: number; name: string; description: string | null }>> {
+async function listProjectTagCandidates(): Promise<ProjectTagCandidate[]> {
+  const { strategy, limit } = candidateSelectionConfig();
+  const cacheKey = `${strategy}:${limit}`;
   const now = Date.now();
-  if (_candidateCache && _candidateCache.expires > now) {
+  if (_candidateCache && _candidateCache.key === cacheKey && _candidateCache.expires > now) {
     return _candidateCache.rows;
   }
-  const r = await db.query(
-    `SELECT id, name, description
-       FROM project_tags
-      WHERE alias_of IS NULL
-      ORDER BY id ASC
-      LIMIT $1`,
-    [limit]
-  );
-  const rows = r.rows.map((row: any) => ({
+  const r = strategy === "frequent"
+    ? await db.query(
+        `SELECT pt.id, pt.name, pt.description
+           FROM project_tags pt
+           LEFT JOIN memory m
+             ON m.is_active = TRUE
+            AND m.p_tag_id IS NOT NULL
+            AND m.created_at >= NOW() - INTERVAL '90 days'
+            AND canonical_project_tag_id(m.p_tag_id) = pt.id
+          WHERE pt.alias_of IS NULL
+          GROUP BY pt.id
+          ORDER BY COUNT(m.id) DESC, MAX(m.created_at) DESC NULLS LAST, pt.id ASC
+          LIMIT $1`,
+        [limit]
+      )
+    : await db.query(
+        `SELECT id, name, description
+           FROM project_tags
+          WHERE alias_of IS NULL
+          ORDER BY id ASC
+          LIMIT $1`,
+        [limit]
+      );
+  const rows: ProjectTagCandidate[] = r.rows.map((row: any) => ({
     id: Number(row.id),
     name: row.name,
     description: row.description,
   }));
-  _candidateCache = { rows, expires: now + CANDIDATE_CACHE_TTL_MS };
+  _candidateCache = { key: cacheKey, rows, expires: now + CANDIDATE_CACHE_TTL_MS };
   return rows;
 }
 
@@ -187,6 +224,25 @@ export async function tagMessage(input: TagInput): Promise<TagResult> {
     parsed = JSON.parse(raw);
   } catch {
     throw new Error(`Tagger returned invalid JSON: ${raw.slice(0, 200)}`);
+  }
+
+  // Jev is only an opinion over existing project-tag candidates. Preserve a
+  // Qwen NEW: proposal exactly: Jev cannot create a new tag, so letting it
+  // answer here would either erase the proposal or misclassify it as an old tag.
+  const qwenProposedNewTag = typeof parsed.p_tag === "string" && parsed.p_tag.startsWith("NEW:");
+  if (!qwenProposedNewTag) {
+    const jev = await judgeProjectTag({
+      message: input.message,
+      role: input.role,
+      agent_platform: input.agent_platform,
+      agent_model: input.agent_model,
+      candidates,
+    });
+    // A missing threshold is fail-closed in shouldApplyJevJudgment(), so merely
+    // setting JEV_ENABLED=true cannot give Jev final authority accidentally.
+    if (jev !== null && shouldApplyJevJudgment(jev)) {
+      parsed.p_tag = jev.choice;
+    }
   }
 
   let p_tag_id: number | null = null;

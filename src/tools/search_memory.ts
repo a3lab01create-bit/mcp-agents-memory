@@ -149,6 +149,9 @@ date_range 인식 형식:
       if (!includeArchived) {
         filters.push(`m.is_active = TRUE`);
       }
+      // task-pin(entry_type='task')은 일반 회상에서 제외 — 전용 task_pin 도구로만 조회.
+      // (vector + recency 경로 모두 whereSql 재사용하므로 여기 한 곳이면 둘 다 커버)
+      filters.push(`m.entry_type = 'memory'`);
       if (p_tag_id !== null) {
         filters.push(`canonical_project_tag_id(m.p_tag_id) = $${p++}`);
         params.push(p_tag_id);
@@ -229,6 +232,7 @@ date_range 인식 형식:
           let q = 2;
           const ilikeFilters: string[] = [`m.user_id = $1`];
           if (!includeArchived) ilikeFilters.push(`m.is_active = TRUE`);
+          ilikeFilters.push(`m.entry_type = 'memory'`);  // task-pin 회상 제외 (ilike fallback 경로)
           if (p_tag_id !== null) {
             ilikeFilters.push(`canonical_project_tag_id(m.p_tag_id) = $${q++}`);
             ilikeParams.push(p_tag_id);

@@ -95,6 +95,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
       WHERE user_id = $1
         AND is_active = TRUE
         AND is_pinned = TRUE
+        AND entry_type = 'memory'
       ORDER BY created_at DESC
       LIMIT $2`,
     [userId, PINNED_LIMIT]
@@ -131,6 +132,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
           AND agent_platform = $3
           AND device_name = $4
           AND is_pinned = FALSE
+          AND entry_type = 'memory'
         ORDER BY created_at DESC
         LIMIT $5`,
       [userId, String(shortTermDays), currentPlatform, deviceName, RECENT_CURRENT_LIMIT]
@@ -146,6 +148,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
           AND created_at >= NOW() - ($2 || ' days')::INTERVAL
           AND agent_platform != $3
           AND is_pinned = FALSE
+          AND entry_type = 'memory'
         ORDER BY created_at DESC
         LIMIT $4`,
       [userId, String(shortTermDays), currentPlatform, RECENT_OTHERS_LIMIT]
@@ -160,6 +163,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
           AND is_active = TRUE
           AND created_at >= NOW() - ($2 || ' days')::INTERVAL
           AND is_pinned = FALSE
+          AND entry_type = 'memory'
         ORDER BY created_at DESC
         LIMIT $3`,
       [userId, String(shortTermDays), RECENT_CURRENT_LIMIT]
