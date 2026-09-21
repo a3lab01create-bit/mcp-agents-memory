@@ -10,6 +10,7 @@ import { db } from "../db.js";
 import { callSpec, ROLE_REGISTRY } from "../model_registry.js";
 import { getDefaultUserId } from "../users.js";
 import { invalidateCandidateCache } from "./tagger.js";
+import { getPrompt } from "../prompts/index.js";
 
 type AliasRelation =
   | "rename"
@@ -149,29 +150,25 @@ const JUDGE_SCHEMA: Record<string, unknown> = {
   additionalProperties: false,
 };
 
-const JUDGE_SYSTEM_PROMPT = `You are a project-tag alias judge for one user's personal memory system.
+// PUBLIC GENERIC fallback. The tuned production prompt is loaded at runtime
+// from prompts.local/alias_judge.md (private core) and is never bundled or published.
+const GENERIC_ALIAS_JUDGE_PROMPT = `You are a project-tag alias judge for a user's personal memory system.
 
-Decide whether two CANONICAL project tags refer to the same project identity.
+Decide whether two canonical project tags refer to the same project.
 
 OUTPUT strict JSON only:
-{
-  "relation": "rename" | "alias" | "same_project" | "different" | "misfile_suspected" | "insufficient",
+{ "relation": "rename" | "alias" | "same_project" | "different" | "misfile_suspected" | "insufficient",
   "same_project": true | false,
   "source_should_alias_target": true | false,
   "confidence": 0.0,
   "evidence_memory_ids": [],
   "conflict_memory_ids": [],
-  "rationale": ""
-}
+  "rationale": "" }
 
-Rules:
-- "Related" is not the same as "same project". Shared topic, tech stack, or client is not enough.
-- Vector similarity is recall evidence only. Never conclude same_project from vector similarity alone.
-- A colloquial nickname, renamed label, Korean/English spelling variant, or old/new project name can be alias/rename.
-- If only a few memories are filed under the wrong tag, relation must be "misfile_suspected"; do not recommend aliasing the whole tag.
-- If same_project is true, choose direction. source_should_alias_target=true means Tag A should alias Tag B. false means Tag B should alias Tag A.
-- If direction is unclear, use relation="insufficient" or lower confidence.
+- A shared topic, tech stack, or client is not enough for same_project.
+- If only a few memories are filed under the wrong tag, use "misfile_suspected".
 - evidence_memory_ids and conflict_memory_ids must only use supplied memory ids.`;
+const JUDGE_SYSTEM_PROMPT = getPrompt("alias_judge", GENERIC_ALIAS_JUDGE_PROMPT);
 
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];

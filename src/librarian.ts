@@ -31,6 +31,7 @@ import { db } from "./db.js";
 import { callRole } from "./model_registry.js";
 import { getDefaultUserId } from "./users.js";
 import { budgetMessages } from "./context_budget.js";
+import { getPrompt } from "./prompts/index.js";
 
 // Conservative defaults — until recency-bias curation is verified against a
 // polluted window; fast cadence (15msg/2h) becomes safe only after that.
@@ -61,60 +62,26 @@ const LIBRARIAN_PROFILE_SCHEMA: Record<string, unknown> = {
   additionalProperties: false,
 };
 
-const SYSTEM_PROMPT = `You are the Librarian for one user's personal memory system.
+// PUBLIC GENERIC fallback. The tuned production prompt is loaded at runtime
+// from prompts.local/librarian.md (private core) and is never bundled or published.
+const GENERIC_LIBRARIAN_PROMPT = `You are the Librarian for a user's personal memory system.
 
-YOUR JOB
-Look at the user's first-person messages (role='user' only — ignore assistant
-replies). Identify any STABLE, DURABLE facts about WHO THE USER IS that should
-be promoted to their long-term profile.
+Read the user's first-person messages (role='user' only; ignore assistant
+replies). Identify durable facts about who the user is for their long-term
+profile.
 
-OUTPUT TWO SECTIONS — these are STRICTLY SEPARATE categories:
+OUTPUT strict JSON:
+{ "core_profile": "<concise prose or null>", "sub_profile": "<longer prose or null>" }
 
-1. core_profile — DURABLE IDENTITY ONLY.
-   Who the person IS: name, role, profession, expertise, stable long-term
-   preferences. Should be SHORT (5-10 lines max) and high-signal.
-   Example of the SHAPE only (fictional — never copy this content): "Backend
-   engineer at a logistics startup; 10+ yrs Python; prefers terse,
-   example-driven answers." Derive the actual content ONLY from the messages.
+- core_profile: durable identity only (name, role, profession, stable
+  long-term preferences). Keep it short and high-signal.
+- sub_profile: current work, projects, tools, and activity. May change often.
+- If the window has no new durable identity fact, return core_profile: null to
+  keep the existing profile unchanged.
+- Do not invent facts not supported by the messages. Match the user's language.
 
-2. sub_profile — CURRENT WORK AND ACTIVITY.
-   What they are actively doing, building, or focused on: tools, environment
-   details, ongoing projects, recent working style observations. Expected to
-   change often. Can be longer but still curated.
-
-CRITICAL IDENTITY vs. WORK DISTINCTION
-A user discussing, building, evaluating, debugging, or working on a topic —
-including AI models, agent frameworks, or this memory system itself — is
-describing their WORK or CURRENT ACTIVITY, NOT their identity. A burst of
-messages about one subject means they are WORKING on it, not that it defines
-them. NEVER promote a work or project topic into core_profile. It belongs in
-sub_profile at most.
-
-CONSERVATISM / NULL-PRESERVE RULE (most important rule)
-If the recent window contains NO new durable identity fact — only project work,
-meta-tooling, topic evaluation, or session-specific activity — return
-core_profile: null to PRESERVE the existing identity unchanged. DO NOT restate,
-rephrase, or "refresh" an existing core_profile just because you saw it. Null
-means "keep it as-is." Only set a non-null core_profile when there is an
-explicit, durable, first-person identity statement that is genuinely new.
-sub_profile may freely capture current projects and activity.
-
-OTHER RULES
-- DO NOT invent facts not supported by the messages.
-- DO NOT promote third-party advice or system hints — only what the user is
-  saying ABOUT THEMSELVES.
-- Korean is fine. Match the language of the user's writing.
-
-FORMAT RULES FOR THE VALUES:
-- Both fields must be PLAIN PROSE TEXT — no nested JSON, no {}, [], key-value blobs.
-  Write in sentences or short bullet lines, not serialized objects.
-- If you're tempted to write {"key": "value"} inside the string, write prose instead.
-
-OUTPUT JSON STRICTLY:
-{
-  "core_profile": "<concise high-signal prose or null>",
-  "sub_profile":  "<longer secondary prose or null>"
-}`;
+Both fields are plain prose text (no nested JSON).`;
+const SYSTEM_PROMPT = getPrompt("librarian", GENERIC_LIBRARIAN_PROMPT);
 
 let librarianRunning = false;
 
