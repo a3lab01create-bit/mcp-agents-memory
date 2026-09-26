@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.9.16 — 2026-09-26
+
+### OpenCode (v2+) transcript auto-capture
+
+OpenCode sessions were only saved when the model remembered to call
+`save_message` each turn — in practice it batch-saved once and then stopped.
+OpenCode is now captured passively, like Hermes.
+
+- New `opencode_capture`: read-only polling of `~/.local/share/opencode/opencode.db`
+  (`$XDG_DATA_HOME` / `$OPENCODE_DB` honored), `session_message` table.
+  Cursor is `time_updated` (row ids are text, `seq` is per-session); assistant
+  rows are only taken once `data.time.completed` is set, so a half-streamed
+  answer is never frozen by the `opencode:<msg id>` dedup key. Only `text`
+  parts are kept (reasoning/tool parts dropped); sub-agent sessions
+  (`parent_id`) and non-message rows (`idle`, `model-switched`, …) are skipped.
+- OpenCode's MCP `clientInfo.name` is the generic `"cli"` (`"acp"` in ACP mode).
+  It is normalized to `agent_platform = "opencode"` only when `clientInfo.version`
+  matches a version recorded in that device's `opencode.db`. The same helper now
+  feeds `memory_startup`'s current platform and every write path.
+- `save_message` returns `skipped: "passive capture active"` for OpenCode while
+  capture is armed (no duplicate rows).
+- The "auto-captured" roster in the server instructions lists OpenCode only when
+  capture actually armed on this device (OpenCode v1 JSON storage, Node < 22.5,
+  or no OpenCode → unchanged, so those clients keep calling `save_message`).
+
 ## 0.9.12 — 2026-05-29
 
 ### Cold-path clusterer: local-only valid JSON (d_tag→p_tag auto-promotion finally fires)
