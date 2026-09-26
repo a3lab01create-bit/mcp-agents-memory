@@ -3,28 +3,36 @@
  *
  * OpenCode transcript: <data>/opencode/opencode.db (SQLite, WAL), `session_message` 테이블.
  *   <data> = $XDG_DATA_HOME 또는 ~/.local/share (Windows도 같은 경로 — v2.0.18 실측).
- *   $OPENCODE_DB가 경로면 그걸 우선 (":memory:"면 디스크 transcript 없음 → no-op).
+ *   $OPENCODE_DB가 있으면 우선 (상대경로는 OpenCode처럼 data dir 기준, ":memory:"면 no-op).
  *
  * Hermes와 같은 SQLite read-only 폴링 패턴이지만 차이:
- *   - 행 id가 TEXT(`msg_…`)고 seq는 세션별 → 정수 커서 불가, `time_updated`(ms) 커서.
- *     같은 ms 경계는 `>=` 재조회 + seenAtCursor(그 시각에 이미 처리한 id)로 걸러냄.
+ *   - 행 id가 TEXT(`msg_…`)고 seq는 세션별 → 정수 커서 불가.
+ *     `time_created` 색인으로 **최근 LOOKBACK_MS 창**만 읽고, 창 안에서 처리한 id는 done 맵으로 거름.
+ *     (time_updated엔 색인이 없어 매 poll 전체 스캔이 됨. 또 OpenCode는 time 값을 JS에서 찍고
+ *      busy_timeout 5s까지 커밋이 늦을 수 있어, 단조 커서는 늦게 커밋된 행을 영구히 놓친다.)
  *   - assistant 행은 스트리밍 중 계속 UPDATE됨 → `data.time.completed` 있는 행만 저장.
- *     미완성 행을 넣으면 external_uuid dedup이 반쪽 텍스트를 영구 고정하므로 건너뛰고,
- *     완료 시 time_updated가 커서 너머로 올라가 다음 poll에 자연히 잡힌다.
+ *     미완성 행을 넣으면 external_uuid dedup이 반쪽 텍스트를 영구 고정하므로 pending 맵에 두고
+ *     완료될 때까지 PK로 재조회한다 (긴 step은 LOOKBACK 창 밖으로 나가도 계속 추적).
  *   - user: data.text / assistant: data.content[] 중 type="text"만
  *     (reasoning·tool은 protocol noise라 skip, text 없는 tool-only step은 행 자체 skip).
- *   - type="idle" 등 그 외 행 skip — memory.role CHECK는 user/assistant만 허용.
+ *   - type="idle"·"model-switched"·"synthetic" 등 그 외 행 skip — memory.role CHECK는 user/assistant만.
  *   - 하위 세션(session_v2.parent_id 있음 = 서브에이전트 task)은 skip.
- *     Claude Code jsonl capture도 메인 대화 transcript만 받는다.
- *   - model: assistant data.model.id.
+ *     Claude Code jsonl capture도 메인 대화 transcript만 받는다. (서브에이전트의 save_message도
+ *     같은 "cli" 연결이라 gate에 막힘 — 메인 대화만 남기는 의도된 동작.)
+ *   - insert 실패 행은 pending에 넣어 재시도하되 뒤 행들은 계속 처리 (Hermes처럼 한 행이 전체를
+ *     막지 않게). MAX_ROW_ATTEMPTS회 실패하면 포기하고 로그.
  *   - external_uuid = `opencode:<msg id>` (dedup — 같은 기기의 MCP 서버 여러 개가 함께 폴링해도 안전).
+ *
+ * 스키마 게이트: OpenCode v1.18.x도 같은 opencode.db에 session_message를 두지만 session_v2가 없다.
+ * arm 시 session_v2 존재 + 실제 폴링 쿼리 성공을 확인하고, 아니면 arm하지 않는다 → instructions에
+ * OpenCode가 안 올라가 모델이 save_message를 계속 부름. flush의 연속 실패도 disarm으로 이어짐.
  *
  * clientInfo: OpenCode는 MCP clientInfo를 {name: $OPENCODE_CLIENT ?? "cli", version: <opencode 버전>}
  * 으로 보낸다 (v2.0.18 바이너리 실측, acp 모드는 "acp"). "cli"는 흔한 이름이라 이름만으론 판별 불가 →
  * opencode.db `session_v2.version`에 있는 버전과 일치할 때만 OpenCode로 인정 (isOpencodeClientInfo).
  *
- * Option A (live-from-now): arm 시점 max(time_updated)를 커서 초기값으로 → 과거 backfill 안 함.
- * OpenCode v1(JSON 파일 storage)이나 session_message 테이블 없는 DB는 graceful no-op → save_message fallback.
+ * Option A (live-from-now): arm 시점 창 안의 행은 처리 완료로 표시 → 과거 backfill 안 함
+ * (단 그 순간 스트리밍 중인 답변은 pending으로 받아 완료 시 저장).
  */
 
 import * as fs from "node:fs";
@@ -36,14 +44,27 @@ import { getDefaultUserId } from "../users.js";
 const DEVICE_NAME = os.hostname();
 const AGENT_PLATFORM = "opencode";
 const POLL_INTERVAL_MS = 3000;
+/** 늦은 커밋(busy_timeout 5s)·시계 흔들림 여유. 이 창 안의 행을 매 poll 재조회. */
+const LOOKBACK_MS = 30_000;
+/** 이보다 오래 미완성인 pending은 버림 (중단돼 영영 completed 안 찍힌 행). */
+const PENDING_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const MAX_ROW_ATTEMPTS = 5;
+/** open/query 연속 실패 임계 — 넘으면 disarm → save_message fallback 복귀. */
+const MAX_CONSECUTIVE_FAILURES = 5;
 /** OpenCode가 clientInfo.name으로 보내는 값들 ($OPENCODE_CLIENT ?? "cli", acp 모드 "acp"). */
 const OPENCODE_CLIENT_NAMES = new Set(["cli", "acp"]);
 
 function resolveDbPath(): string | null {
+  const dataDir = path.join(
+    process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"),
+    "opencode"
+  );
   const override = process.env.OPENCODE_DB;
-  if (override) return override === ":memory:" ? null : override;
-  const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share");
-  return path.join(dataHome, "opencode", "opencode.db");
+  if (override) {
+    if (override === ":memory:") return null;
+    return path.isAbsolute(override) ? override : path.join(dataDir, override);
+  }
+  return path.join(dataDir, "opencode.db");
 }
 
 // node:sqlite DatabaseSync 클래스 (lazy load). 없으면 null → capture no-op.
@@ -53,24 +74,32 @@ async function loadSqlite(): Promise<any | null> {
   if (_DatabaseSync) return _DatabaseSync;
   if (_sqliteUnavailable) return null;
   try {
-    // node:sqlite는 Node 22.5+ 빌트인. @types/node(node20 타겟)엔 타입이 없어 억제.
+    // node:sqlite는 Node 22.13+/23.4+ 빌트인 (그 전엔 플래그 필요). @types/node(node20 타겟)엔 타입이 없어 억제.
     // @ts-ignore
     const mod: any = await import("node:sqlite");
     _DatabaseSync = mod?.DatabaseSync ?? null;
     if (!_DatabaseSync) _sqliteUnavailable = true;
     return _DatabaseSync;
   } catch {
-    _sqliteUnavailable = true; // Node < 22.5 등
+    _sqliteUnavailable = true; // 구버전 node 등
     return null;
   }
 }
 
-interface CaptureState {
+/** processBatch가 갱신하는 추적 상태. */
+export interface Tracker {
+  /** 지금까지 본 최대 time_created. 조회 하한 = createdCursor - LOOKBACK_MS. */
+  createdCursor: number;
+  /** LOOKBACK 창 안에서 처리 완료한 id → time_created (창 밖은 prune). */
+  done: Map<string, number>;
+  /** 미완성 assistant·insert 실패 행 id → time_created. 창과 무관하게 PK로 재조회. */
+  pending: Map<string, number>;
+  /** 행별 insert 실패 횟수. */
+  failures: Map<string, number>;
+}
+
+interface CaptureState extends Tracker {
   dbPath: string;
-  /** 마지막으로 처리 완료한 time_updated (ms). */
-  cursor: number;
-  /** time_updated === cursor 인 행 중 이미 처리한 id. `>=` 재조회 시 중복 insert 방지. */
-  seenAtCursor: Set<string>;
   /** session_v2.version DISTINCT — clientInfo "cli"가 OpenCode인지 대조용. */
   knownVersions: Set<string>;
 }
@@ -78,9 +107,7 @@ interface CaptureState {
 let _state: CaptureState | null = null;
 let _pollTimer: NodeJS.Timeout | null = null;
 let _flushInProgress = false;
-/** openRo 연속 실패 횟수. 임계 도달 시 disarm → save_message fallback 복귀. */
-let _consecutiveOpenFailures = 0;
-const MAX_OPEN_FAILURES = 5;
+let _consecutiveFailures = 0;
 
 function openRo(DatabaseSync: any, dbPath: string): any | null {
   try {
@@ -93,29 +120,44 @@ function openRo(DatabaseSync: any, dbPath: string): any | null {
 export interface RawRow {
   id: string;
   type: string;
-  time_updated: number;
+  time_created: number;
   data: string;
   parent_id: string | null;
 }
 
-/** time_updated >= cursor 인 행을 시간순으로. 하위 세션 판별용 parent_id 동봉. */
-export function selectRowsSince(db: any, cursor: number): RawRow[] {
-  return db
-    .prepare(
-      `SELECT m.id, m.type, m.time_updated, m.data, s.parent_id
+const ROW_COLUMNS = `m.id, m.type, m.time_created, m.data, s.parent_id
          FROM session_message m
-         LEFT JOIN session_v2 s ON s.id = m.session_id
-        WHERE m.time_updated >= ?
-        ORDER BY m.time_updated ASC, m.id ASC`
-    )
-    .all(cursor)
-    .map((r: any) => ({
-      id: String(r.id),
-      type: String(r.type),
-      time_updated: Number(r.time_updated),
-      data: String(r.data ?? ""),
-      parent_id: r.parent_id == null ? null : String(r.parent_id),
-    }));
+         LEFT JOIN session_v2 s ON s.id = m.session_id`;
+
+function toRawRow(r: any): RawRow {
+  return {
+    id: String(r.id),
+    type: String(r.type),
+    time_created: Number(r.time_created),
+    data: String(r.data ?? ""),
+    parent_id: r.parent_id == null ? null : String(r.parent_id),
+  };
+}
+
+/**
+ * 폴링 대상 행: time_created >= floor (색인 range scan) ∪ pending id들 (PK 조회).
+ * time_created·id 순. 스키마가 안 맞으면 throw (호출부가 arm 거부/실패 카운트).
+ */
+export function selectCandidates(db: any, floor: number, pendingIds: Iterable<string> = []): RawRow[] {
+  const byId = new Map<string, RawRow>();
+  const recent = db
+    .prepare(`SELECT ${ROW_COLUMNS} WHERE m.time_created >= ? ORDER BY m.time_created ASC, m.id ASC`)
+    .all(floor) as any[];
+  for (const r of recent) byId.set(String(r.id), toRawRow(r));
+  const one = db.prepare(`SELECT ${ROW_COLUMNS} WHERE m.id = ?`);
+  for (const id of pendingIds) {
+    if (byId.has(id)) continue;
+    const r = one.get(id);
+    if (r) byId.set(id, toRawRow(r));
+  }
+  return [...byId.values()].sort(
+    (a, b) => a.time_created - b.time_created || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+  );
 }
 
 export type Classified =
@@ -123,10 +165,15 @@ export type Classified =
   | { kind: "pending" }
   | { kind: "row"; role: "user" | "assistant"; message: string; model: string | null };
 
+/** Postgres TEXT는 NUL(0x00)을 거부 → insert가 영구 실패하지 않도록 제거. */
+function clean(text: string): string {
+  return text.replace(/\u0000/g, "").trim();
+}
+
 /**
  * session_message 행 1개 → 저장 여부 판정. 순수 함수 (fixture로 단위테스트 가능).
  *   - skip: 저장 안 함, 처리 완료로 간주 (idle·하위 세션·빈 텍스트·파싱 실패)
- *   - pending: 스트리밍 중인 assistant — 처리 완료로 치지 않음 (완료 후 재조회)
+ *   - pending: 스트리밍 중인 assistant — 완료될 때까지 재조회
  *   - row: 저장 대상
  */
 export function classifyRow(r: RawRow): Classified {
@@ -141,61 +188,57 @@ export function classifyRow(r: RawRow): Classified {
   }
 
   if (r.type === "user") {
-    const message = typeof data?.text === "string" ? data.text.trim() : "";
+    const message = typeof data?.text === "string" ? clean(data.text) : "";
     return message ? { kind: "row", role: "user", message, model: null } : { kind: "skip" };
   }
 
   if (!data?.time?.completed) return { kind: "pending" };
-  let message = "";
+  const texts: string[] = [];
   for (const part of Array.isArray(data.content) ? data.content : []) {
-    if (part && part.type === "text" && typeof part.text === "string") {
-      message += (message ? "\n" : "") + part.text;
-    }
+    if (part && part.type === "text" && typeof part.text === "string") texts.push(part.text);
   }
-  message = message.trim();
+  const message = clean(texts.join("\n"));
   if (!message) return { kind: "skip" }; // reasoning/tool-only step
   const model = typeof data.model?.id === "string" ? data.model.id : null;
   return { kind: "row", role: "assistant", message, model };
 }
 
 export interface BatchResult {
-  cursor: number;
-  seenAtCursor: Set<string>;
   inserted: number;
   dedup: number;
-  skipped: number;
+  failed: number;
+  gaveUp: number;
 }
 
 /**
- * selectRowsSince 결과를 시간순 처리하고 다음 커서를 계산. insert는 주입 (true=신규, false=dedup).
- *   - 이미 처리한 경계 행(time_updated === cursor && seen) → 건너뜀
- *   - pending(스트리밍 중) → 처리 완료로 치지 않음. 완료되면 time_updated가 올라가 다시 잡힘
- *   - insert 실패 → 그 행 앞에서 멈춤 (다음 poll에 그 행부터 재시도)
+ * selectCandidates 결과를 처리하고 Tracker를 갱신. insert는 주입 (true=신규, false=dedup).
+ *   - done에 있는 행 → 건너뜀
+ *   - pending(스트리밍 중) → pending 맵에 두고 다음 poll에 PK 재조회
+ *   - insert 실패 → pending에 넣어 재시도, 뒤 행은 계속 처리. MAX_ROW_ATTEMPTS회면 포기(done)
  */
 export async function processBatch(
   raw: RawRow[],
-  cursor: number,
-  seenAtCursor: Set<string>,
+  t: Tracker,
   insert: (row: RawRow, c: Extract<Classified, { kind: "row" }>) => Promise<boolean>
 ): Promise<BatchResult> {
-  let nextCursor = cursor;
-  let seen = new Set(seenAtCursor);
   let inserted = 0;
   let dedup = 0;
-  let skipped = 0;
+  let failed = 0;
+  let gaveUp = 0;
   const markDone = (r: RawRow) => {
-    if (r.time_updated > nextCursor) {
-      nextCursor = r.time_updated;
-      seen = new Set([r.id]);
-    } else if (r.time_updated === nextCursor) {
-      seen.add(r.id);
-    }
+    t.done.set(r.id, r.time_created);
+    t.pending.delete(r.id);
+    t.failures.delete(r.id);
   };
 
   for (const r of raw) {
-    if (r.time_updated === cursor && seenAtCursor.has(r.id)) continue;
+    if (r.time_created > t.createdCursor) t.createdCursor = r.time_created;
+    if (t.done.has(r.id)) continue;
     const c = classifyRow(r);
-    if (c.kind === "pending") continue;
+    if (c.kind === "pending") {
+      t.pending.set(r.id, r.time_created);
+      continue;
+    }
     if (c.kind === "skip") {
       markDone(r);
       continue;
@@ -205,24 +248,46 @@ export async function processBatch(
       else dedup++;
       markDone(r);
     } catch (err) {
-      console.error(
-        `⚠️ [OpenCode] insert failed at ${r.id}:`,
-        err instanceof Error ? err.message : err
-      );
-      skipped++;
-      break;
+      const attempts = (t.failures.get(r.id) ?? 0) + 1;
+      if (attempts >= MAX_ROW_ATTEMPTS) {
+        console.error(
+          `⚠️ [OpenCode] insert ${attempts}회 실패 — ${r.id} 포기:`,
+          err instanceof Error ? err.message : err
+        );
+        markDone(r);
+        gaveUp++;
+      } else {
+        t.failures.set(r.id, attempts);
+        t.pending.set(r.id, r.time_created);
+        failed++;
+      }
     }
   }
-  return { cursor: nextCursor, seenAtCursor: seen, inserted, dedup, skipped };
+
+  // 창 밖 done은 다시 조회될 일이 없으니 정리. 오래된 pending(중단된 step)도 정리.
+  const floor = t.createdCursor - LOOKBACK_MS;
+  for (const [id, tc] of t.done) if (tc < floor) t.done.delete(id);
+  for (const [id, tc] of t.pending) {
+    if (tc < t.createdCursor - PENDING_MAX_AGE_MS) {
+      t.pending.delete(id);
+      t.failures.delete(id);
+    }
+  }
+  return { inserted, dedup, failed, gaveUp };
 }
 
 function loadKnownVersions(db: any): Set<string> {
-  try {
-    const rows = db.prepare(`SELECT DISTINCT version FROM session_v2`).all() as Array<{ version: unknown }>;
-    return new Set(rows.map((r) => String(r.version)).filter(Boolean));
-  } catch {
-    return new Set();
-  }
+  const rows = db.prepare(`SELECT DISTINCT version FROM session_v2`).all() as Array<{ version: unknown }>;
+  return new Set(rows.map((r) => String(r.version)).filter(Boolean));
+}
+
+function hasV2Schema(db: any): boolean {
+  const rows = db
+    .prepare(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('session_message', 'session_v2')`
+    )
+    .all() as Array<{ name: string }>;
+  return rows.length === 2;
 }
 
 /** save_message tool이 중복 저장 방지 여부 판단에 사용. */
@@ -247,14 +312,14 @@ export async function captureSessionStart(_cwd: string): Promise<void> {
     _pollTimer = null;
   }
   _state = null;
-  _consecutiveOpenFailures = 0;
+  _consecutiveFailures = 0;
   const dbPath = resolveDbPath();
   if (!dbPath || !fs.existsSync(dbPath)) return; // OpenCode 미설치 기기 → no-op
 
   const DatabaseSync = await loadSqlite();
   if (!DatabaseSync) {
     console.error(
-      "📝 [OpenCode] node:sqlite 미지원 (Node < 22.5?) — capture 비활성, save_message fallback"
+      "📝 [OpenCode] node:sqlite 미지원 (Node < 22.13?) — capture 비활성, save_message fallback"
     );
     return;
   }
@@ -265,38 +330,43 @@ export async function captureSessionStart(_cwd: string): Promise<void> {
     return;
   }
 
-  let cursor = 0;
-  let knownVersions: Set<string>;
+  let state: CaptureState;
   try {
+    if (!hasV2Schema(db)) {
+      console.error("📝 [OpenCode] session_v2 스키마 아님 (OpenCode v1?) — capture 비활성, save_message fallback");
+      return;
+    }
     const row = db
-      .prepare(`SELECT COALESCE(MAX(time_updated), 0) AS m FROM session_message`)
+      .prepare(`SELECT COALESCE(MAX(time_created), 0) AS m FROM session_message`)
       .get() as { m: number };
-    cursor = Number(row?.m ?? 0);
-    knownVersions = loadKnownVersions(db);
+    const createdCursor = Number(row?.m ?? 0);
+    state = {
+      dbPath,
+      createdCursor,
+      done: new Map(),
+      pending: new Map(),
+      failures: new Map(),
+      knownVersions: loadKnownVersions(db),
+    };
+    // 실제 폴링 쿼리를 한 번 돌려 스키마 호환 확인 (실패 시 arm 거부) + live-from-now 기준선:
+    // 창 안의 기존 행은 처리 완료, 스트리밍 중 답변만 pending으로.
+    for (const r of selectCandidates(db, createdCursor - LOOKBACK_MS)) {
+      if (classifyRow(r).kind === "pending") state.pending.set(r.id, r.time_created);
+      else state.done.set(r.id, r.time_created);
+    }
   } catch (err) {
-    // v1 storage 등 session_message 테이블 없는 DB
     console.error(
-      "📝 [OpenCode] session_message 조회 실패 — capture 비활성:",
+      "📝 [OpenCode] opencode.db 조회 실패 — capture 비활성:",
       err instanceof Error ? err.message : err
     );
-    try { db.close(); } catch {}
     return;
-  }
-  try { db.close(); } catch {}
-
-  // arm 시점 cursor와 같은 ms 행은 과거분 → seenAtCursor로 채워 재조회 시 제외.
-  const seenAtCursor = new Set<string>();
-  _state = { dbPath, cursor, seenAtCursor, knownVersions };
-  const db2 = openRo(DatabaseSync, dbPath);
-  if (db2) {
-    try {
-      for (const r of selectRowsSince(db2, cursor)) seenAtCursor.add(r.id);
-    } catch {}
-    try { db2.close(); } catch {}
+  } finally {
+    try { db.close(); } catch {}
   }
 
+  _state = state;
   console.error(
-    `📝 [OpenCode] capture armed: cursor=${cursor} versions=[${[...knownVersions].join(",")}] (live-from-now)`
+    `📝 [OpenCode] capture armed: cursor=${state.createdCursor} versions=[${[...state.knownVersions].join(",")}] (live-from-now)`
   );
 
   _pollTimer = setInterval(() => {
@@ -304,8 +374,22 @@ export async function captureSessionStart(_cwd: string): Promise<void> {
   }, POLL_INTERVAL_MS);
 }
 
-async function flush(): Promise<{ inserted: number; dedup: number; skipped: number }> {
-  const empty = { inserted: 0, dedup: 0, skipped: 0 };
+/** open/query 실패 1회 기록. 연속 임계 도달 시 disarm — 안 그러면 isCaptureArmed()=true로
+ *  save_message gate가 fallback까지 막아 silent total loss가 됨 (Hermes와 동일).
+ *  단 instructions는 시작 시점에 고정이라 "OpenCode 자동 저장" 문구는 남는다 (Hermes와 같은 한계). */
+function recordFailure(what: string, err?: unknown): void {
+  _consecutiveFailures++;
+  if (_consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+    console.error(
+      `📝 [OpenCode] ${what} ${_consecutiveFailures}회 연속 실패 — capture 비활성(save_message fallback 복귀):`,
+      err instanceof Error ? err.message : err ?? ""
+    );
+    resetCaptureState();
+  }
+}
+
+async function flush(): Promise<BatchResult> {
+  const empty: BatchResult = { inserted: 0, dedup: 0, failed: 0, gaveUp: 0 };
   if (!_state || _flushInProgress) return empty;
   _flushInProgress = true;
 
@@ -314,30 +398,27 @@ async function flush(): Promise<{ inserted: number; dedup: number; skipped: numb
     _flushInProgress = false;
     return empty;
   }
-  const db = openRo(DatabaseSync, _state.dbPath);
+  const state = _state;
+  const db = openRo(DatabaseSync, state.dbPath);
   if (!db) {
-    // 연속 실패 시 disarm — 안 그러면 isCaptureArmed()=true로 save_message gate가
-    // fallback까지 막아 silent total loss가 됨 (Hermes와 동일).
-    _consecutiveOpenFailures++;
-    if (_consecutiveOpenFailures >= MAX_OPEN_FAILURES) {
-      console.error(
-        `📝 [OpenCode] openRo ${_consecutiveOpenFailures}회 연속 실패 — capture 비활성(save_message fallback 복귀)`
-      );
-      resetCaptureState();
-    }
+    recordFailure("openRo");
     _flushInProgress = false;
     return empty;
   }
-  _consecutiveOpenFailures = 0;
 
-  let inserted = 0;
-  let dedup = 0;
-  let skipped = 0;
+  let result = empty;
   try {
-    _state.knownVersions = loadKnownVersions(db);
-    const raw = selectRowsSince(db, _state.cursor);
+    let raw: RawRow[];
+    try {
+      state.knownVersions = loadKnownVersions(db);
+      raw = selectCandidates(db, state.createdCursor - LOOKBACK_MS, state.pending.keys());
+      _consecutiveFailures = 0;
+    } catch (err) {
+      recordFailure("query", err);
+      return empty;
+    }
     let userId: number | null = null;
-    const r = await processBatch(raw, _state.cursor, _state.seenAtCursor, async (row, c) => {
+    result = await processBatch(raw, state, async (row, c) => {
       userId ??= await getDefaultUserId();
       const res = await insertRawMemory({
         user_id: userId,
@@ -350,14 +431,6 @@ async function flush(): Promise<{ inserted: number; dedup: number; skipped: numb
       });
       return res.inserted;
     });
-    if (_state) {
-      // await 도중 resetCaptureState()로 disarm됐을 수 있음
-      _state.cursor = r.cursor;
-      _state.seenAtCursor = r.seenAtCursor;
-    }
-    inserted = r.inserted;
-    dedup = r.dedup;
-    skipped = r.skipped;
   } catch (err) {
     console.error(
       "⚠️ [OpenCode] flush error:",
@@ -368,12 +441,13 @@ async function flush(): Promise<{ inserted: number; dedup: number; skipped: numb
     _flushInProgress = false;
   }
 
-  if (inserted || dedup || skipped) {
+  const { inserted, dedup, failed, gaveUp } = result;
+  if (inserted || dedup || failed || gaveUp) {
     console.error(
-      `📝 [OpenCode] flush: inserted=${inserted}, dedup=${dedup}, skipped=${skipped}, cursor=${_state?.cursor}`
+      `📝 [OpenCode] flush: inserted=${inserted}, dedup=${dedup}, failed=${failed}, gaveUp=${gaveUp}, pending=${state.pending.size}`
     );
   }
-  return { inserted, dedup, skipped };
+  return result;
 }
 
 export async function captureSessionEnd(): Promise<{
@@ -394,12 +468,12 @@ export async function captureSessionEnd(): Promise<{
   if (!_state) return { inserted: 0, skipped: 0, error: "session not armed" };
 
   const r = await flush();
-  if (r.inserted || r.skipped) {
+  if (r.inserted || r.failed || r.gaveUp) {
     console.error(
-      `📝 [OpenCode] final flush: inserted=${r.inserted}, dedup=${r.dedup}, skipped=${r.skipped}`
+      `📝 [OpenCode] final flush: inserted=${r.inserted}, dedup=${r.dedup}, failed=${r.failed}, gaveUp=${r.gaveUp}`
     );
   }
-  return { inserted: r.inserted, skipped: r.skipped };
+  return { inserted: r.inserted, skipped: r.failed + r.gaveUp };
 }
 
 export function resetCaptureState(): void {

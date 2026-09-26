@@ -167,7 +167,7 @@ For platforms that **don't** auto-capture transcripts, the agent calls this each
 | Platform | Auto-capture |
 |---|---|
 | Claude Code · Codex CLI · Gemini CLI · Grok Build · Antigravity CLI | ✅ transcript captured automatically — do **not** call `save_message` |
-| Hermes · OpenCode (v2+) | ✅ same, read from their local SQLite store (needs Node ≥ 22.5 for `node:sqlite`; otherwise falls back to `save_message`) |
+| Hermes · OpenCode (v2+) | ✅ same, read from their local SQLite store (needs `node:sqlite`, unflagged from Node 22.13; otherwise falls back to `save_message`) |
 | Everything else | call `save_message(role=…)` each turn |
 
 > Auto-injection of the startup brief / auto-capture depends on the **client**, not the transport — some clients (e.g. desktop/web) don't expose those hooks, so they fall back to explicit tool calls.

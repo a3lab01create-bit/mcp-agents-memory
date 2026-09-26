@@ -8,13 +8,22 @@ OpenCode sessions were only saved when the model remembered to call
 `save_message` each turn — in practice it batch-saved once and then stopped.
 OpenCode is now captured passively, like Hermes.
 
-- New `opencode_capture`: read-only polling of `~/.local/share/opencode/opencode.db`
+- New `opencode_capture`: read-only poll of `~/.local/share/opencode/opencode.db`
   (`$XDG_DATA_HOME` / `$OPENCODE_DB` honored), `session_message` table.
-  Cursor is `time_updated` (row ids are text, `seq` is per-session); assistant
-  rows are only taken once `data.time.completed` is set, so a half-streamed
+  Each poll reads only the last 30 s by the `time_created` index (row ids are
+  text, `seq` is per-session, `time_updated` is unindexed); ids already handled
+  inside that window are remembered, so late commits are still picked up.
+  Assistant rows are only taken once `data.time.completed` is set — a
+  still-streaming step is tracked by id until it completes, so a half-streamed
   answer is never frozen by the `opencode:<msg id>` dedup key. Only `text`
   parts are kept (reasoning/tool parts dropped); sub-agent sessions
   (`parent_id`) and non-message rows (`idle`, `model-switched`, …) are skipped.
+  A row that fails to insert is retried without blocking later rows, and given
+  up after 5 attempts; NUL bytes are stripped.
+- Capture only arms on the v2 schema (`session_v2` present and the poll query
+  succeeds). OpenCode v1.18.x shares the same `opencode.db` path but has no
+  `session_v2`, so it stays on `save_message`. Repeated open/query failures
+  disarm capture.
 - OpenCode's MCP `clientInfo.name` is the generic `"cli"` (`"acp"` in ACP mode).
   It is normalized to `agent_platform = "opencode"` only when `clientInfo.version`
   matches a version recorded in that device's `opencode.db`. The same helper now
@@ -22,8 +31,9 @@ OpenCode is now captured passively, like Hermes.
 - `save_message` returns `skipped: "passive capture active"` for OpenCode while
   capture is armed (no duplicate rows).
 - The "auto-captured" roster in the server instructions lists OpenCode only when
-  capture actually armed on this device (OpenCode v1 JSON storage, Node < 22.5,
-  or no OpenCode → unchanged, so those clients keep calling `save_message`).
+  capture actually armed on this device (OpenCode v1.18, Node without
+  `node:sqlite`, or no OpenCode → unchanged, so those clients keep calling
+  `save_message`).
 
 ## 0.9.12 — 2026-05-29
 
