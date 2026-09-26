@@ -20,7 +20,10 @@
  *     Claude Code jsonl capture도 메인 대화 transcript만 받는다. (서브에이전트의 save_message도
  *     같은 "cli" 연결이라 gate에 막힘 — 메인 대화만 남기는 의도된 동작.)
  *   - insert 실패 행은 pending에 넣어 재시도하되 뒤 행들은 계속 처리 (Hermes처럼 한 행이 전체를
- *     막지 않게). MAX_ROW_ATTEMPTS회 실패하면 포기하고 로그.
+ *     막지 않게). 데이터 자체 오류(pg SQLSTATE 22/23)만 MAX_ROW_ATTEMPTS회 후 포기 — 연결 끊김 등
+ *     일시 오류는 횟수에 안 넣고 계속 재시도 (DB 재시작 동안의 대화를 버리지 않게).
+ *   - fork된 세션은 원본 행을 새 id로 복사하되 time_created는 원본 값 유지 → 세션 생성 시각보다
+ *     이른 행은 복사본이라 skip (중복 저장 방지).
  *   - external_uuid = `opencode:<msg id>` (dedup — 같은 기기의 MCP 서버 여러 개가 함께 폴링해도 안전).
  *
  * 스키마 게이트: OpenCode v1.18.x도 같은 opencode.db에 session_message를 두지만 session_v2가 없다.
@@ -32,7 +35,7 @@
  * opencode.db `session_v2.version`에 있는 버전과 일치할 때만 OpenCode로 인정 (isOpencodeClientInfo).
  *
  * Option A (live-from-now): arm 시점 창 안의 행은 처리 완료로 표시 → 과거 backfill 안 함
- * (단 그 순간 스트리밍 중인 답변은 pending으로 받아 완료 시 저장).
+ * (단 창 안에서 스트리밍 중인 답변은 pending으로 받아 완료 시 저장. 창보다 먼저 시작된 step은 안 받음).
  */
 
 import * as fs from "node:fs";
@@ -53,6 +56,8 @@ const MAX_ROW_ATTEMPTS = 5;
 const MAX_CONSECUTIVE_FAILURES = 5;
 /** OpenCode가 clientInfo.name으로 보내는 값들 ($OPENCODE_CLIENT ?? "cli", acp 모드 "acp"). */
 const OPENCODE_CLIENT_NAMES = new Set(["cli", "acp"]);
+/** v2+만 session_v2에 기록 → capture 대상. v1 세션도 마이그레이션되며 버전이 복사되므로 대조에서 제외. */
+const V2_VERSION_RE = /^([2-9]|\d{2,})\./;
 
 function resolveDbPath(): string | null {
   const dataDir = path.join(
@@ -123,9 +128,14 @@ export interface RawRow {
   time_created: number;
   data: string;
   parent_id: string | null;
+  /** fork 세션이면 fork 원본 세션 id (session_v2.fork_session_id). */
+  fork_session_id?: string | null;
+  /** session_v2.time_created — fork 복사본 판별용. */
+  session_created?: number | null;
 }
 
-const ROW_COLUMNS = `m.id, m.type, m.time_created, m.data, s.parent_id
+const ROW_COLUMNS = `m.id, m.type, m.time_created, m.data, s.parent_id,
+         s.fork_session_id, s.time_created AS session_created
          FROM session_message m
          LEFT JOIN session_v2 s ON s.id = m.session_id`;
 
@@ -136,7 +146,14 @@ function toRawRow(r: any): RawRow {
     time_created: Number(r.time_created),
     data: String(r.data ?? ""),
     parent_id: r.parent_id == null ? null : String(r.parent_id),
+    fork_session_id: r.fork_session_id == null ? null : String(r.fork_session_id),
+    session_created: r.session_created == null ? null : Number(r.session_created),
   };
+}
+
+/** 조회 창 하한. 미래 시각 행 하나가 창을 미래로 밀어 새 행을 놓치지 않게 현재 시각으로 clamp. */
+function windowFloor(t: { createdCursor: number }): number {
+  return Math.min(t.createdCursor, Date.now()) - LOOKBACK_MS;
 }
 
 /**
@@ -178,6 +195,10 @@ function clean(text: string): string {
  */
 export function classifyRow(r: RawRow): Classified {
   if (r.parent_id) return { kind: "skip" };
+  // fork 복사본: 원본 time_created 유지 → fork 세션 생성보다 이르다 (원본 세션에서 이미 저장됨)
+  if (r.fork_session_id && r.session_created != null && r.time_created < r.session_created) {
+    return { kind: "skip" };
+  }
   if (r.type !== "user" && r.type !== "assistant") return { kind: "skip" };
 
   let data: any;
@@ -248,6 +269,9 @@ export async function processBatch(
       else dedup++;
       markDone(r);
     } catch (err) {
+      t.pending.set(r.id, r.time_created); // 창과 무관하게 PK로 재시도
+      failed++;
+      if (!isDataError(err)) continue; // 연결 끊김 등 일시 오류 → 횟수 안 셈, 계속 재시도
       const attempts = (t.failures.get(r.id) ?? 0) + 1;
       if (attempts >= MAX_ROW_ATTEMPTS) {
         console.error(
@@ -255,17 +279,16 @@ export async function processBatch(
           err instanceof Error ? err.message : err
         );
         markDone(r);
+        failed--;
         gaveUp++;
       } else {
         t.failures.set(r.id, attempts);
-        t.pending.set(r.id, r.time_created);
-        failed++;
       }
     }
   }
 
   // 창 밖 done은 다시 조회될 일이 없으니 정리. 오래된 pending(중단된 step)도 정리.
-  const floor = t.createdCursor - LOOKBACK_MS;
+  const floor = windowFloor(t);
   for (const [id, tc] of t.done) if (tc < floor) t.done.delete(id);
   for (const [id, tc] of t.pending) {
     if (tc < t.createdCursor - PENDING_MAX_AGE_MS) {
@@ -274,6 +297,13 @@ export async function processBatch(
     }
   }
   return { inserted, dedup, failed, gaveUp };
+}
+
+/** pg 데이터 오류(SQLSTATE class 22 data exception / 23 integrity violation)만 true.
+ *  이 행은 재시도해도 영원히 실패 → 포기 대상. 그 외(연결·타임아웃·code 없음)는 일시 오류. */
+function isDataError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "string" && /^(22|23)/.test(code);
 }
 
 function loadKnownVersions(db: any): Set<string> {
@@ -302,7 +332,7 @@ export function isCaptureArmed(): boolean {
 export function isOpencodeClientInfo(name?: string | null, version?: string | null): boolean {
   if (!name) return false;
   if (name.toLowerCase() === "opencode") return true;
-  if (!_state || !version) return false;
+  if (!_state || !version || !V2_VERSION_RE.test(version)) return false;
   return OPENCODE_CLIENT_NAMES.has(name) && _state.knownVersions.has(version);
 }
 
@@ -350,7 +380,7 @@ export async function captureSessionStart(_cwd: string): Promise<void> {
     };
     // 실제 폴링 쿼리를 한 번 돌려 스키마 호환 확인 (실패 시 arm 거부) + live-from-now 기준선:
     // 창 안의 기존 행은 처리 완료, 스트리밍 중 답변만 pending으로.
-    for (const r of selectCandidates(db, createdCursor - LOOKBACK_MS)) {
+    for (const r of selectCandidates(db, windowFloor(state))) {
       if (classifyRow(r).kind === "pending") state.pending.set(r.id, r.time_created);
       else state.done.set(r.id, r.time_created);
     }
@@ -411,7 +441,7 @@ async function flush(): Promise<BatchResult> {
     let raw: RawRow[];
     try {
       state.knownVersions = loadKnownVersions(db);
-      raw = selectCandidates(db, state.createdCursor - LOOKBACK_MS, state.pending.keys());
+      raw = selectCandidates(db, windowFloor(state), state.pending.keys());
       _consecutiveFailures = 0;
     } catch (err) {
       recordFailure("query", err);
