@@ -10,6 +10,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { collectBrief, formatBriefMarkdown } from "../briefing.js";
+import { detectClientPlatform } from "../agent_identity.js";
 
 export function registerMemoryStartup(server: McpServer): void {
   server.registerTool(
@@ -40,12 +41,7 @@ agent_platform_filter=false.`,
       let currentPlatform: string | null = null;
       const useFilter = args.agent_platform_filter ?? true;
       if (useFilter) {
-        try {
-          const cv = server.server.getClientVersion();
-          currentPlatform = cv?.name ?? null;
-        } catch {
-          currentPlatform = null;
-        }
+        currentPlatform = detectClientPlatform(server);
       }
       const brief = await collectBrief({
         shortTermDays: args.short_term_days,

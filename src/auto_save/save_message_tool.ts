@@ -26,6 +26,7 @@ import { isCaptureArmed as isGeminiArmed } from "./gemini_capture.js";
 import { isCaptureArmed as isGrokArmed } from "./grok_capture.js";
 import { isCaptureArmed as isAntigravityArmed } from "./antigravity_capture.js";
 import { isCaptureArmed as isHermesArmed } from "./hermes_capture.js";
+import { isCaptureArmed as isOpencodeArmed } from "./opencode_capture.js";
 
 const DEVICE_NAME = os.hostname();
 
@@ -102,6 +103,18 @@ subagent 컨텍스트라면 subagent=true + subagent_model + subagent_role 함�
       //   hermes:<id> capture와 dedup 안 됨 → 이중 저장). E2E에서 Hermes clientInfo.version/title 등
       //   고유 시그널 확인되면 그걸로 좁힐 것.
       if (id.agent_platform === "mcp" && isHermesArmed()) {
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({ stored: false, skipped: "passive capture active" }, null, 2),
+          }],
+        };
+      }
+
+      // OpenCode: clientInfo.name은 흔한 "cli"지만 agent_identity가 opencode.db 버전 대조로
+      //   "opencode"로 정규화한다 (모델이 agent_platform="opencode"를 직접 넘겨도 동일).
+      //   대조 실패 시엔 "cli"로 남아 gate를 통과 → 저장됨 (누락 대신 중복 쪽으로 실패).
+      if (id.agent_platform === "opencode" && isOpencodeArmed()) {
         return {
           content: [{
             type: 'text' as const,

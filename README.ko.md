@@ -58,7 +58,7 @@
 | 컬럼 | 설명 |
 |---|---|
 | `user_id` | 사용자 식별 |
-| `agent_platform` | claude-code / codex / chatgpt / hermes-agent / openclaw 등 |
+| `agent_platform` | claude-code / codex / chatgpt / hermes-agent / openclaw / opencode 등 |
 | `agent_model` | opus-4-7 / gemini-3-pro / gpt-5.5 등 |
 | `subagent` | yes / no (1-level만 추적) |
 | `subagent_model` / `subagent_role` | sub일 때 채움. role은 free-form (lowercase normalize) |

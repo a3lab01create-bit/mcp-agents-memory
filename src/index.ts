@@ -29,6 +29,11 @@ import {
   captureSessionStart as captureHermesStart,
   captureSessionEnd as captureHermesEnd,
 } from "./auto_save/hermes_capture.js";
+import {
+  captureSessionStart as captureOpencodeStart,
+  captureSessionEnd as captureOpencodeEnd,
+  isCaptureArmed as isOpencodeArmed,
+} from "./auto_save/opencode_capture.js";
 import { PACKAGE_VERSION } from "./version.js";
 import fs from "fs";
 
@@ -38,17 +43,24 @@ const BRIEF_DB_TIMEOUT_MS = 5000;
 const INSTRUCTIONS_MAX_CHARS = Number(process.env.INSTRUCTIONS_MAX_CHARS ?? 1900);
 const INSTRUCTIONS_SEP = "\n\n---\n\n";
 
-const STATIC_INSTRUCTIONS = `Long-term memory MCP server (RESPEC v1).
+// OpenCode는 이 기기에서 capture가 armed일 때만 자동 저장 목록에 올린다 — v1(JSON storage)이나
+// Node < 22.5처럼 capture가 못 뜨는 환경에서 "save_message 호출 금지"를 읽고 저장이 0건이 되는 것 방지.
+// → runMcpServer가 captureOpencodeStart를 buildInstructions보다 먼저 await.
+function staticInstructions(): string {
+  const autoCaptured = "Claude Code / Codex CLI / Gemini CLI / Grok Build / Antigravity / Hermes" +
+    (isOpencodeArmed() ? " / OpenCode" : "");
+  return `Long-term memory MCP server (RESPEC v1).
 
 ▶ 세션 시작 시 \`memory_startup\`을 한 번 호출해 최근 대화·활성 프로젝트·상세 프로필 맥락을 이어받으세요.
 
 Tools: memory_startup(시작 brief) · search_memory(과거 조회/검색) · manage_knowledge(저장/수정/삭제; 강제기억 is_pinned) · save_message(transcript 미지원 platform fallback).
 
-자동 저장: Claude Code / Codex CLI / Gemini CLI / Grok Build / Antigravity / Hermes는 transcript 자동 캡처 — save_message 호출 금지(중복 row). 그 외 platform만 매 turn save_message.
+자동 저장: ${autoCaptured}는 transcript 자동 캡처 — save_message 호출 금지(중복 row). 그 외 platform만 매 turn save_message.
 
 능동 규칙(mandatory): named entity(프로젝트·repo·인물) 언급 시, 또는 과거 선호·결정을 가정하기 전 먼저 search_memory. 작업당 1-2회.
 
 호출 시 agent_model 명시 (subagent면 subagent:true + subagent_model/role 동봉).`;
+}
 
 const STATIC_INSTRUCTIONS_BRIEF_UNAVAILABLE = `\n\n---\n\n⚠️ 시작 brief를 불러오지 못했습니다 (DB 연결 또는 쿼리 timeout). \`memory_startup\` tool을 명시 호출해 brief를 받으세요.`;
 
@@ -71,6 +83,7 @@ function detectBootPlatformFromEnv(): string | null {
 }
 
 async function buildInstructions(): Promise<string> {
+  const STATIC_INSTRUCTIONS = staticInstructions();
   try {
     const work = (async () => {
       const { db } = await import("./db.js");
@@ -121,7 +134,7 @@ async function shutdown(reason: string): Promise<void> {
   stopParentWatchdog();
 
   // 1. Final JSONL flush — INSERT raw rows. fs.watch 살아있는 동안 대부분
-  //    이미 들어왔지만 마지막 1-2건 잡힘. cross-platform (Claude Code / Codex / Gemini / Grok / Antigravity) 병렬.
+  //    이미 들어왔지만 마지막 1-2건 잡힘. cross-platform (Claude Code / Codex / Gemini / Grok / Antigravity / Hermes / OpenCode) 병렬.
   try {
     await Promise.race([
       Promise.allSettled([
@@ -131,6 +144,7 @@ async function shutdown(reason: string): Promise<void> {
         captureGrokEnd(),
         captureAntigravityEnd(),
         captureHermesEnd(),
+        captureOpencodeEnd(),
       ]),
       new Promise<void>((resolve) => setTimeout(resolve, 3000)),
     ]);
@@ -232,6 +246,10 @@ Required settings:
 }
 
 async function runMcpServer() {
+  // OpenCode capture는 instructions의 자동 저장 목록을 좌우하므로 buildInstructions보다 먼저 arm.
+  // (opencode.db 없는 기기는 existsSync 한 번으로 즉시 no-op)
+  await captureOpencodeStart(process.cwd());
+
   // §1 fix: brief 동적 주입을 위해 DB 먼저 연결 (5s timeout). 실패 시 static 폴백.
   const instructions = await buildInstructions();
 
@@ -261,6 +279,8 @@ async function runMcpServer() {
   // - grok_capture: ~/.grok/sessions/<urlencoded-cwd>/<sid>/chat_history.jsonl (recursive watch)
   // - antigravity_capture: ~/.gemini/antigravity-cli/brain/<sid>/.system_generated/logs/transcript_full.jsonl
   // - hermes_capture: ~/.hermes/state.db (SQLite messages 테이블, id 커서 폴링)
+  // - opencode_capture: ~/.local/share/opencode/opencode.db (SQLite session_message, time_updated 커서 폴링)
+  //   — instructions 목록 때문에 runMcpServer 맨 앞에서 이미 arm됨.
   captureSessionStart(process.cwd());
   captureCodexStart(process.cwd());
   captureGeminiStart(process.cwd());

@@ -11,6 +11,7 @@
  */
 
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { isOpencodeClientInfo } from "./auto_save/opencode_capture.js";
 
 export interface AgentIdentity {
   agent_platform: string;
@@ -41,17 +42,7 @@ export function resolveAgentIdentity(
   args: AgentIdentityArgs
 ): AgentIdentity {
   // clientInfo로 platform 자동 감지 (caller args 있으면 그게 우선)
-  let detectedPlatform = 'unknown';
-  try {
-    const clientVersion = server.server.getClientVersion();
-    if (clientVersion?.name) {
-      detectedPlatform = clientVersion.name;
-    }
-  } catch {
-    // 초기화 전 또는 SDK 버전 차이 — 폴백
-  }
-
-  const agent_platform = args.agent_platform ?? detectedPlatform;
+  const agent_platform = args.agent_platform ?? detectClientPlatform(server) ?? 'unknown';
   const agent_model = args.agent_model ?? 'unknown';
 
   const subagent = args.subagent === true;
@@ -65,4 +56,28 @@ export function resolveAgentIdentity(
     subagent_model,
     subagent_role,
   };
+}
+
+let _loggedClientInfo = false;
+
+/**
+ * MCP clientInfo.name → agent_platform. 대부분 name 그대로지만, OpenCode는 흔한 이름 "cli"로
+ * 접속하므로 opencode.db 버전 대조가 맞을 때만 "opencode"로 정규화한다.
+ * memory_startup(current platform)과 resolveAgentIdentity가 같은 판정을 쓰도록 공용화.
+ * handshake 전이거나 name이 없으면 null.
+ */
+export function detectClientPlatform(server: McpServer): string | null {
+  try {
+    const cv = server.server.getClientVersion();
+    if (!cv?.name) return null;
+    const platform = isOpencodeClientInfo(cv.name, cv.version) ? "opencode" : cv.name;
+    if (!_loggedClientInfo) {
+      _loggedClientInfo = true;
+      console.error(`📝 [client] clientInfo=${cv.name}@${cv.version ?? "?"} → agent_platform=${platform}`);
+    }
+    return platform;
+  } catch {
+    // 초기화 전 또는 SDK 버전 차이 — 폴백
+    return null;
+  }
 }
