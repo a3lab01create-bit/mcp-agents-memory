@@ -58,25 +58,36 @@ function skipWhitespace(s: string, i: number): number {
   return i;
 }
 
+/**
+ * 버즈용: 봉투 안 <context>의 위치. 설명서(<base>) 봉투면 설명서와 설정 블록을 건너뛰고,
+ * <context>로 시작하면 그 자리. 못 찾으면 null. 정리와 venue 읽기가 같이 쓴다
+ * (그래서 정리가 거절한 턴도 채널은 읽을 수 있다).
+ */
+function locateBuzzContext(text: string): { rest: string; pos: number } | null {
+  if (!text.startsWith("<base>")) return CONTEXT_OPEN.test(text.slice(0, 12)) ? { rest: text, pos: 0 } : null;
+  const baseEnd = text.indexOf("</base>");
+  if (baseEnd < 0) return null;
+  // 설명서 안에 예시 <context> 등이 있으므로 설명서 뒤부터 읽는다.
+  const rest = text.slice(baseEnd + "</base>".length);
+  let pos = skipWhitespace(rest, 0);
+  for (;;) {
+    const name = PREAMBLE_BLOCKS.find((b) => rest.startsWith(`<${b}>`, pos));
+    if (!name) break;
+    const close = rest.indexOf(`</${name}>`, pos);
+    if (close < 0) return null;
+    pos = skipWhitespace(rest, close + name.length + 3);
+  }
+  return CONTEXT_OPEN.test(rest.slice(pos, pos + 12)) ? { rest, pos } : null;
+}
+
 export function cleanBuzzEnvelope(message: string): string | null {
   try {
     const text = message.trimStart();
     if (!text.startsWith("<base>")) return null;
-    const baseEnd = text.indexOf("</base>");
-    if (baseEnd < 0) return null;
-    // 설명서 안에 예시 <context> 등이 있으므로 설명서 뒤부터 읽는다.
-    const rest = text.slice(baseEnd + "</base>".length);
+    const loc = locateBuzzContext(text);
+    if (!loc) return null;
+    const { rest, pos } = loc;
 
-    let pos = skipWhitespace(rest, 0);
-    for (;;) {
-      const name = PREAMBLE_BLOCKS.find((b) => rest.startsWith(`<${b}>`, pos));
-      if (!name) break;
-      const close = rest.indexOf(`</${name}>`, pos);
-      if (close < 0) return null;
-      pos = skipWhitespace(rest, close + name.length + 3);
-    }
-
-    if (!CONTEXT_OPEN.test(rest.slice(pos, pos + 12))) return null;
     const bodyStart = rest.indexOf("\n", pos) + 1;
     const contextClose = rest.indexOf(CONTEXT_CLOSE, bodyStart - 1);
     if (contextClose < 0) return null;
@@ -148,5 +159,47 @@ export function buzzEmbeddingText(message: string): string {
     return text || message;
   } catch {
     return message;
+  }
+}
+
+/**
+ * 버즈용: <context>로 시작하는 버즈 턴(정리본, 또는 설명서 없는 봉투)에서 venue를 읽는다.
+ *   Scope: dm                          → "buzz:dm"
+ *   Scope: thread|channel + Channel: X (#uuid) → "buzz:X"
+ *   버즈 턴인데 채널 줄을 못 읽음        → "buzz"
+ * 버즈 턴이 아니면 null.
+ */
+export function venueFromBuzzContext(message: string): string | null {
+  if (!CONTEXT_OPEN.test(message.slice(0, 12))) return null;
+  const end = message.indexOf(CONTEXT_CLOSE);
+  if (end < 0) return null;
+  const lines = message.slice(0, end).split("\n").map((l) => l.replace(/\r$/, ""));
+  const scope = lines.find((l) => l.startsWith("Scope: "))?.slice("Scope: ".length).trim();
+  if (scope !== "thread" && scope !== "channel" && scope !== "dm") return null;
+  if (scope === "dm") return "buzz:dm";
+  const channel = lines.find((l) => l.startsWith("Channel: "))?.trimEnd();
+  const m = channel ? /^Channel: (.+?) \(#[0-9a-f-]{36}\)$/.exec(channel) : null;
+  return m ? `buzz:${m[1]}` : "buzz";
+}
+
+/**
+ * 버즈용: 버즈 턴 모양인지 — 설명서 봉투(<base>…)이거나, <context> 바로 뒤에 이번 턴
+ * 블록이 오는 정리본/설명서 없는 봉투. 채널을 못 읽더라도 버즈 턴임을 알 때 쓴다.
+ */
+export function looksLikeBuzzTurn(message: string): boolean {
+  const text = message.trimStart();
+  if (text.startsWith("<base>")) return true;
+  if (!CONTEXT_OPEN.test(text.slice(0, 12))) return false;
+  const close = text.indexOf(CONTEXT_CLOSE);
+  return close >= 0 && TURN_OPEN.test(text.slice(close + CONTEXT_CLOSE.length));
+}
+
+/** 버즈용: 원문 봉투(<base>…)든 정리본이든 venue를 읽는다 — 정리가 거절한 턴도. */
+export function venueFromBuzzMessage(message: string): string | null {
+  try {
+    const loc = locateBuzzContext(message.trimStart());
+    return loc ? venueFromBuzzContext(loc.rest.slice(loc.pos)) : null;
+  } catch {
+    return null;
   }
 }

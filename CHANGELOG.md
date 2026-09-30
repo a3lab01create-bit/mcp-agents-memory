@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.9.19 — 2026-10-01
+
+### Where a conversation happened (`venue`)
+
+`agent_platform` says which program ran a turn; it cannot tell a Buzz group
+channel from a 1:1 terminal session on the same machine at the same time. Recalled
+memories could not show whether something was said in a shared room or privately.
+
+- New nullable column `memory.venue` (migration `029_venue`, metadata-only, same
+  lock-timeout retry as 028): `terminal` · `buzz:<channel>` · `buzz:dm` · `buzz`
+  (Buzz, channel unreadable) · `slack` · `auto` · `subagent` · NULL (unknown).
+- Claude Code capture: a session's venue comes from its first user turn — a Buzz
+  envelope → Buzz, `entrypoint: cli` → `terminal`, a Slack marker → `slack`,
+  otherwise `auto`. Buzz rows carry the channel of their turn; a reply takes the
+  channel of the turn before it (after a restart, the last turn is found by
+  reading the transcript backwards from the end).
+- Hermes capture: `sessions.source` — `acp` → the Buzz channel of the turn
+  (replies follow the preceding turn, seeded from `state.db` after a restart),
+  `slack`, `cli` → `terminal`, `subagent`. An `acp` session that never showed a
+  Buzz envelope stays NULL.
+- Other platforms: user turns that are Buzz envelopes get their channel from the
+  `<context>` block; other rows stay NULL for now.
+- `search_memory`: every result carries `venue`, and a new optional `venue`
+  filter narrows by prefix (`buzz`) or exactly (`buzz:DevRoom`).
+- `memory_startup` brief: each line shows the venue, and a Buzz turn shows the
+  person's words on one line instead of its `<context>` block.
+- Databases without the column keep working: capture stores rows without venue
+  (one warning; migrate and restart), and search/brief skip venue.
+- Existing rows are not changed by this release.
+- `npm run check:envelope` now bundles the self-check with esbuild.
+
 ## 0.9.18 — 2026-09-30
 
 ### Embedding input for cleaned Buzz turns

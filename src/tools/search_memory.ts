@@ -18,9 +18,11 @@ import { db } from "../db.js";
 import { getDefaultUserId } from "../users.js";
 import { embedMessage, vectorToHalfvecSql } from "../cold_path/embedder.js";
 import os from "node:os";
+import { hasMemoryColumn } from "../memory_columns.js";
 
 const DEFAULT_LIMIT = 10;
 const DEFAULT_FALLBACK_THRESHOLD = 0.3;
+
 
 function parseDateRange(s: string | undefined): Date | null {
   if (!s) return null;
@@ -83,6 +85,8 @@ interface SearchRow {
   is_pinned: boolean;
   created_at: Date;
   similarity?: number;
+  /** 대화가 오간 자리 (migration 029 전 DB면 null). */
+  venue?: string | null;
 }
 
 export function registerSearchMemory(server: McpServer): void {
@@ -114,6 +118,9 @@ date_range 인식 형식:
         ),
         limit: z.number().int().min(1).max(50).optional().describe(`최대 결과 수 (default ${DEFAULT_LIMIT})`),
         include_archived: z.boolean().optional().describe("archived 메모리도 포함 (default false)"),
+        venue: z.string().optional().describe(
+          "대화가 오간 자리로 한정. 'buzz'(버즈 전체) / 'buzz:<채널>'(그 채널, 예: buzz:DevRoom) / 'buzz:dm' / 'terminal'(사람과 1:1) / 'slack' / 'auto'. 결과마다 venue가 붙어 나온다."
+        ),
       },
     },
     async (args) => {
@@ -176,6 +183,17 @@ date_range 인식 형식:
         filters.push(`(m.device_name = $${p++} OR m.is_pinned = TRUE)`);
         params.push(localDevice);
       }
+      const withVenue = await hasMemoryColumn("venue");  // migration 029 전 DB면 venue 없이 동작
+      const venueSel = withVenue ? ", m.venue" : "";
+      // 'buzz' → buzz 전체(buzz, buzz:*), 콜론이 있으면 정확히 그 자리
+      const venueFilter = (n: number) =>
+        args.venue!.includes(":")
+          ? `lower(m.venue) = lower($${n})`
+          : `(lower(m.venue) = lower($${n}) OR lower(m.venue) LIKE lower($${n}) || ':%')`;
+      if (args.venue && withVenue) {
+        filters.push(venueFilter(p++));
+        params.push(args.venue);
+      }
       const whereSql = filters.join(' AND ');
 
       let used: 'vector' | 'ilike' | 'recency' = 'recency';
@@ -194,7 +212,7 @@ date_range 인식 형식:
 
           const r = await db.query(
             `SELECT m.id, m.role, m.message, m.agent_platform, m.agent_model, m.device_name,
-                    pt.name AS p_tag_name, m.d_tag, m.is_pinned, m.created_at,
+                    pt.name AS p_tag_name, m.d_tag, m.is_pinned, m.created_at${venueSel},
                     1 - (m.embedding <=> $${vecParam}::halfvec) AS similarity
                FROM memory m
                LEFT JOIN project_tags pt ON pt.id = canonical_project_tag_id(m.p_tag_id)
@@ -215,6 +233,7 @@ date_range 인식 형식:
             d_tag: row.d_tag ?? [],
             is_pinned: row.is_pinned,
             created_at: row.created_at,
+            venue: row.venue ?? null,
             similarity: Number(row.similarity),
           }));
           if (rows.length > 0) {
@@ -253,13 +272,17 @@ date_range 인식 형식:
             ilikeFilters.push(`(m.device_name = $${q++} OR m.is_pinned = TRUE)`);
             ilikeParams.push(localDevice);
           }
+          if (args.venue && withVenue) {
+            ilikeFilters.push(venueFilter(q++));
+            ilikeParams.push(args.venue);
+          }
           ilikeFilters.push(`m.message ILIKE $${q++}`);
           ilikeParams.push(`%${args.query}%`);
           ilikeParams.push(limit);
 
           const r = await db.query(
             `SELECT m.id, m.role, m.message, m.agent_platform, m.agent_model, m.device_name,
-                    pt.name AS p_tag_name, m.d_tag, m.is_pinned, m.created_at
+                    pt.name AS p_tag_name, m.d_tag, m.is_pinned, m.created_at${venueSel}
                FROM memory m
                LEFT JOIN project_tags pt ON pt.id = canonical_project_tag_id(m.p_tag_id)
               WHERE ${ilikeFilters.join(' AND ')}
@@ -279,6 +302,7 @@ date_range 인식 형식:
               d_tag: row.d_tag ?? [],
               is_pinned: row.is_pinned,
               created_at: row.created_at,
+              venue: row.venue ?? null,
             }));
             used = 'ilike';
             topSimilarity = undefined;
@@ -289,7 +313,7 @@ date_range 인식 형식:
         params.push(limit);
         const r = await db.query(
           `SELECT m.id, m.role, m.message, m.agent_platform, m.agent_model, m.device_name,
-                  pt.name AS p_tag_name, m.d_tag, m.is_pinned, m.created_at
+                  pt.name AS p_tag_name, m.d_tag, m.is_pinned, m.created_at${venueSel}
              FROM memory m
              LEFT JOIN project_tags pt ON pt.id = canonical_project_tag_id(m.p_tag_id)
             WHERE ${whereSql}
@@ -308,6 +332,7 @@ date_range 인식 형식:
           d_tag: row.d_tag ?? [],
           is_pinned: row.is_pinned,
           created_at: row.created_at,
+          venue: row.venue ?? null,
         }));
         used = 'recency';
       }
@@ -320,6 +345,9 @@ date_range 인식 형식:
             threshold: used === 'ilike' ? threshold : undefined,
             top_similarity: topSimilarity,
             count: rows.length,
+            ...(args.venue && !withVenue
+              ? { note: "이 DB엔 아직 venue 칸이 없어(migration 029 전) venue 필터를 적용하지 않았습니다." }
+              : {}),
             results: rows,
           }, null, 2),
         }],
