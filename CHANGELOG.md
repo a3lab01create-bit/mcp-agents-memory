@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.9.17 — 2026-09-30
+
+### Buzz envelope cleanup at capture time (+ raw original kept)
+
+Some Buzz ACP adapters (observed: Hermes, Grok CLI, OpenCode, Antigravity CLI)
+hand each turn to the agent as one user message wrapped in a large envelope —
+a ~17k-char platform manual, agent settings, and a re-quote of the earlier
+thread — with the actual new message at the very end. Captured as-is, this
+pushed the cold-path tagger past the local model's context (falling back to the
+remote model) and made the embedding (first 8,000 chars) see only the manual, so
+envelope rows were near-identical vectors (avg cosine 0.985 vs 0.36 for normal
+rows).
+
+- New `cleanBuzzEnvelope()` (`src/auto_save/buzz_envelope.ts`): for a `user`
+  message that starts with `<base>…</base>`, reads the envelope in order —
+  `<agent-instructions>` / `<core-memory>`, then `<context>`, then an optional
+  history block (`<thread-context>` / `<conversation-context>`) directly after
+  it, then the turn blocks (`<buzz-event(s)>`, `<what-you-were-working-on>`,
+  `<new-message-arrived-while-you-were-working>`). It drops the manual, the
+  settings blocks and the history, keeps `<context>` verbatim and the whole turn
+  from its first block to the end. Nostr `Tags:`/`Parsed:` lines (with 64-hex
+  ids) are dropped. Blocks joined by a single space (Grok CLI) are handled. Any
+  unexpected block, an ambiguous history boundary, or a turn block showing up
+  inside a part that would be dropped returns `null` and the message is stored
+  unchanged. When the history quotes its own closing tag, the result is `null` or
+  keeps a little extra history — never less of the turn.
+- `insertRawMemory` stores the cleaned text in `message` (what search, tagging
+  and embedding read) and the untouched original in the new `raw_message`
+  column. Pinned (`is_pinned`) rows, `assistant` rows, and rows saved with a
+  precomputed tag or embedding are never rewritten.
+- Migration `028_raw_message`: nullable `memory.raw_message TEXT` (no rewrite
+  of existing rows). It takes the table lock with `lock_timeout = 5s` and
+  retries, so a running cold-path batch cannot make captures queue behind it
+  for long. If the column is missing (migration not yet run), capture keeps
+  working and stores envelopes unchanged, with a warning; restart the process
+  after migrating.
+- Checked read-only against 188 real envelope rows: all recognized; in every
+  row the turn from its first block to the end is kept byte-identical and the
+  cut falls right after the history/context close; 0 false positives on 8,000
+  other rows; ~88% fewer characters. Self-check (synthetic, incl. quoted-tag and
+  pathological inputs): `node scripts/check_buzz_envelope.ts`.
+- Existing rows are not changed by this release.
+
 ## 0.9.16 — 2026-09-26
 
 ### OpenCode (v2+) transcript auto-capture
