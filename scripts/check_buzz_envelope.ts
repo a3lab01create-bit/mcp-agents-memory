@@ -4,7 +4,7 @@
  *   node scripts/check_buzz_envelope.ts        # Node ≥ 22.18 (type stripping)
  */
 import assert from "node:assert/strict";
-import { cleanBuzzEnvelope } from "../src/auto_save/buzz_envelope.ts";
+import { buzzEmbeddingText, cleanBuzzEnvelope } from "../src/auto_save/buzz_envelope.ts";
 
 const HEX = "a".repeat(64);
 const BASE = [
@@ -30,7 +30,7 @@ const CONTEXT = [
 const HISTORY = '<thread-context included="2" total="2" truncated="false">\n[earlier] HISTORY-SENTINEL\n</thread-context>';
 const EVENT = [
   '<buzz-event type="@mention">',
-  "Event ID: abc",
+  `Event ID: ${HEX}`,
   "From: Owner",
   "Content: NEW-MESSAGE-SENTINEL please check the deploy",
   `Tags: [["e","${HEX}","","reply"],["p","${HEX}"]]`,
@@ -149,6 +149,34 @@ check("병적 입력도 빠르게 끝남", () => {
   cleanBuzzEnvelope(BASE + "\n" + "<context>\n".repeat(60000));
   cleanBuzzEnvelope(BASE + "\n" + CONTEXT + '\n<thread-context x>\n' + "</x> ".repeat(200000));
   cleanBuzzEnvelope(BASE + "\n<context>\n" + "q\n".repeat(2_000_000) + "</context>\n<buzz-event>\nREAL");
+  const ms = performance.now() - t0;
+  assert.ok(ms < 500, `${ms.toFixed(0)}ms`);
+});
+
+check("임베딩 입력: 정리된 버즈 턴은 방 정보·이벤트 머리글 빼고 사람 말만", () => {
+  const cleaned = clean(BASE, PREAMBLE, CONTEXT, HISTORY, EVENT)!;
+  const out = buzzEmbeddingText(cleaned);
+  assert.ok(!out.includes("<context>") && !out.includes("Project slug") && !out.includes("Event ID:"));
+  assert.ok(out.includes("Content: NEW-MESSAGE-SENTINEL please check the deploy") && out.includes("From: Owner"));
+  assert.equal(buzzEmbeddingText(out), out, "두 번 적용해도 같음");
+});
+
+check("임베딩 입력: 버즈 턴 모양이 아니면 그대로", () => {
+  assert.equal(buzzEmbeddingText("평범한 메시지"), "평범한 메시지");
+  const withHistory = [CONTEXT, HISTORY, EVENT].join("\n");
+  assert.equal(buzzEmbeddingText(withHistory), withHistory, "context 뒤에 이전 대화 블록이 끼면 손대지 않음");
+  const contextOnly = CONTEXT + "\n그냥 글";
+  assert.equal(buzzEmbeddingText(contextOnly), contextOnly, "context 뒤가 이번 턴 블록이 아님");
+});
+
+check("임베딩 입력: 사람이 쓴 비슷한 줄은 남기고, 병적인 줄도 빠르게", () => {
+  const turn = [CONTEXT, '<buzz-event type="m">', `Event ID: ${HEX}`, "Kind: 9", "Time: 2026-09-16T09:48:34+00:00",
+    "Content: 회의 잡자", "Time: 3pm Thursday", "Kind: urgent", `Tags: [["p","${HEX}"]]`, "</buzz-event>"].join("\n");
+  const out = buzzEmbeddingText(turn);
+  assert.ok(!out.includes("Event ID:") && !out.includes("Kind: 9") && !out.includes("2026-09-16T") && !out.includes("Tags:"));
+  assert.ok(out.includes("Time: 3pm Thursday") && out.includes("Kind: urgent"));
+  const t0 = performance.now();
+  buzzEmbeddingText(CONTEXT + "\n<buzz-event>\nFrom: x" + " (npub:".repeat(150000) + "\u2028");
   const ms = performance.now() - t0;
   assert.ok(ms < 500, `${ms.toFixed(0)}ms`);
 });

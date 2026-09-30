@@ -20,6 +20,7 @@ import { db } from "../db.js";
 import type { PoolClient } from "pg";
 import { tagMessage } from "./tagger.js";
 import { embedMessage, vectorToHalfvecSql } from "./embedder.js";
+import { buzzEmbeddingText } from "../auto_save/buzz_envelope.js";
 import { runDtagPromotion } from "./dtag_promoter.js";
 import { runLibrarian } from "../librarian.js";
 import { maybeRunProjectAliasPromoter } from "./project_alias_promoter.js";
@@ -142,7 +143,8 @@ async function processOne(client: any, row: ColdRow): Promise<void> {
     promises.push(
       (async () => {
         try {
-          embedding = await embedMessage(row.message);
+          // 정리된 버즈 턴은 방 정보·이벤트 머리글을 뺀 사람 말로만 임베딩 (저장 본문은 그대로)
+          embedding = await embedMessage(buzzEmbeddingText(row.message));
         } catch (err) {
           embedError = err;
         }
