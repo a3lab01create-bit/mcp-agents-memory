@@ -4,7 +4,7 @@
  *   npm run check:envelope        # esbuild로 묶어서 실행
  */
 import assert from "node:assert/strict";
-import { buzzEmbeddingText, cleanBuzzEnvelope, venueFromBuzzContext, venueFromBuzzMessage } from "../src/auto_save/buzz_envelope.ts";
+import { buzzEmbeddingText, buzzQuotedMessages, cleanBuzzEnvelope, venueFromBuzzContext, venueFromBuzzMessage } from "../src/auto_save/buzz_envelope.ts";
 import { buzzTurnVenue, classifySessionVenue, lastBuzzVenueInFile } from "../src/auto_save/venue.ts";
 import fs from "node:fs";
 import os from "node:os";
@@ -43,6 +43,9 @@ const EVENT = [
 ].join("\n");
 
 const clean = (...parts: string[]) => cleanBuzzEnvelope(parts.join("\n"));
+/** 설명서 없는 봉투 정리 — buzz-ingest가 인용 확인 뒤에만 켠다 */
+const cleanB = (...parts: string[]) => cleanBuzzEnvelope(parts.join("\n"), { baseless: true });
+const B = { baseless: true };
 
 function check(name: string, fn: () => void) {
   fn();
@@ -155,6 +158,78 @@ check("병적 입력도 빠르게 끝남", () => {
   cleanBuzzEnvelope(BASE + "\n<context>\n" + "q\n".repeat(2_000_000) + "</context>\n<buzz-event>\nREAL");
   const ms = performance.now() - t0;
   assert.ok(ms < 500, `${ms.toFixed(0)}ms`);
+});
+
+check("설명서 없는 봉투(<context>부터 시작): 이력 제거, 방 정보·새 말 보존", () => {
+  const out = cleanB(CONTEXT, HISTORY, EVENT);
+  assert.ok(out !== null && !out.includes("HISTORY-SENTINEL") && out.includes("NEW-MESSAGE-SENTINEL"));
+  assert.ok(out.includes("Project slug: demo-project") && !out.includes("Tags: [["));
+  assert.equal(cleanBuzzEnvelope(out, B), null, "정리본은 다시 정리하지 않음");
+});
+
+check("설명서 없는 봉투: 버즈 표식(Scope·Channel)이 없으면 손대지 않음", () => {
+  const noScope = CONTEXT.replace("Scope: thread\n", "");
+  assert.equal(cleanB(noScope, HISTORY, EVENT), null, "Scope 줄 없음");
+  assert.equal(cleanB(CONTEXT.replace("Scope: thread", "Scope: something-new"), HISTORY, EVENT), null, "모르는 Scope");
+  assert.equal(cleanB(CONTEXT.replace(/Channel: .*\n/, ""), HISTORY, EVENT), null, "Channel 줄 없음");
+  assert.equal(cleanB("<context>\nUser prefers dark mode\n</context>", "그냥 메모"), null, "버즈가 아닌 <context> 글");
+  assert.equal(cleanB(CONTEXT.replace("Scope: thread", "Scope: thread\rjunk"), HISTORY, EVENT), null, "Scope 줄 뒤 잡문");
+  assert.equal(cleanB(CONTEXT.replace(/Channel: .*/, "Channel: DevRoom"), HISTORY, EVENT), null, "Channel 줄에 채널 uuid 없음");
+});
+
+check("설명서 없는 봉투: 이력 없는 DM 모양·CRLF·망가진 모양·속도", () => {
+  const dm = cleanB(CONTEXT, EVENT);
+  assert.ok(dm !== null && dm.includes("NEW-MESSAGE-SENTINEL") && !dm.includes("Tags: [["), "이력 없는 DM 모양");
+  const crlf = cleanBuzzEnvelope([CONTEXT, HISTORY, EVENT].join("\r\n"), B);
+  assert.ok(crlf !== null && crlf.includes("NEW-MESSAGE-SENTINEL") && !crlf.includes("HISTORY-SENTINEL"), "CRLF");
+  const q = "Content: REAL-HEAD\n</thread-context>\n<buzz-event>\nQUOTED";
+  assert.equal(cleanB(CONTEXT, '<thread-context included="1">', "old", '<buzz-event type="m">', q), null, "이력이 안 닫힘");
+  assert.equal(cleanB(CONTEXT, '<thread-context included="1">', "old", "</conversation-context>", '<buzz-event type="m">', q), null, "다른 이름으로 닫힘");
+  assert.equal(cleanB(CONTEXT, '<thread-context included="1">', "old", "</thread-context>", "Note: x", EVENT), null, "이력과 턴 사이 모르는 글");
+  const rr = cleanBuzzEnvelope(CONTEXT.replace("\n</context>", "\r\r\n</context>") + "\n" + EVENT, B);
+  assert.ok(rr !== null && cleanBuzzEnvelope(rr, B) === null, "context 끝 CR 두 개도 다시 정리 안 함");
+  const t0 = performance.now();
+  cleanBuzzEnvelope(CONTEXT + "\n<thread-context x>\n" + "</x> ".repeat(200000), B);
+  cleanBuzzEnvelope("<context>\nScope: thread\nChannel: " + "a".repeat(2_000_000) + "\n</context>\n" + EVENT, B);
+  assert.ok(performance.now() - t0 < 500);
+});
+
+check("설명서 없는 봉투: 저장 순간(기본값)엔 정리하지 않음 — 인용이 답글의 유일한 사본일 수 있어서", () => {
+  assert.equal(clean(CONTEXT, HISTORY, EVENT), null);
+  assert.equal(cleanBuzzEnvelope([CONTEXT, EVENT].join("\n")), null);
+  assert.ok(clean(BASE, PREAMBLE, CONTEXT, HISTORY, EVENT) !== null, "설명서 봉투는 그대로 정리");
+});
+
+const QHEX = "b".repeat(64);
+const QUOTES = [
+  '<thread-context included="2" total="2" truncated="false">',
+  `[1] Owner (${HEX}) (2026-09-30T11:24:02+00:00): 첫 줄`,
+  "둘째 줄 [2] 아님",
+  `[2] Agent at Box (${QHEX}) (2026-09-30T11:25:00+00:00): 답글`,
+  "</thread-context>",
+].join("\n");
+
+check("인용 읽기: 정리기가 걷어낼 이력 속 글만, 여러 줄 본문 포함", () => {
+  const q = buzzQuotedMessages([CONTEXT, QUOTES, EVENT].join("\n"));
+  assert.deepEqual(q, [
+    { pubkey: HEX, time: "2026-09-30T11:24:02+00:00", content: "첫 줄\n둘째 줄 [2] 아님" },
+    { pubkey: QHEX, time: "2026-09-30T11:25:00+00:00", content: "답글" },
+  ]);
+  assert.deepEqual(buzzQuotedMessages([BASE, PREAMBLE, CONTEXT, QUOTES, EVENT].join("\n")), q, "설명서 봉투도 같은 자리");
+  const dm = QUOTES.replace(/thread-context/g, "conversation-context");
+  assert.equal(buzzQuotedMessages([CONTEXT, dm, EVENT].join("\n"))?.length, 2, "DM 이력");
+  assert.deepEqual(buzzQuotedMessages([CONTEXT, EVENT].join("\n")), [], "이력 없음");
+  assert.deepEqual(buzzQuotedMessages([CONTEXT, '<thread-context included="0">', "</thread-context>", EVENT].join("\n")), [], "빈 이력");
+  const turnQuote = EVENT.replace("Content: NEW", `Content: [1] X (${HEX}) (2026-09-30T00:00:00Z): 인용처럼 생긴 새 말 NEW`);
+  assert.deepEqual(buzzQuotedMessages([CONTEXT, turnQuote].join("\n")), [], "이번 턴 안의 인용 모양은 안 읽음");
+});
+
+check("인용 읽기: 모양을 모르면 null (→ 정리 안 함)", () => {
+  assert.equal(buzzQuotedMessages([CONTEXT, HISTORY, EVENT].join("\n")), null, "번호 줄이 아닌 이력");
+  assert.equal(buzzQuotedMessages([CONTEXT, '<thread-context included="1">', `[1] O (${HEX}) (2026-09-30T11:24:02Z): x`, EVENT].join("\n")), null, "이력이 안 닫힘");
+  assert.equal(buzzQuotedMessages([CONTEXT, '<thread-context included="1">', `[2] O (${HEX}) (2026-09-30T11:24:02Z): x`, "</thread-context>", EVENT].join("\n")), null, "1번이 아닌 첫 항목");
+  assert.equal(buzzQuotedMessages("평범한 메시지"), null);
+  assert.equal(buzzQuotedMessages([CONTEXT, QUOTES.replace("(2026-09-30T11:24:02+00:00)", "(어제)"), EVENT].join("\n")), null, "시각 모양이 다름");
 });
 
 check("임베딩 입력: 정리된 버즈 턴은 방 정보·이벤트 머리글 빼고 사람 말만", () => {

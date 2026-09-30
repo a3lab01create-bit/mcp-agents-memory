@@ -106,7 +106,7 @@
   mcp-agents-memory coldpath    # MCP 서버 없이 Cold Path 워커만 도는 데몬 (systemd 권장)
   ```
   데몬은 PostgreSQL advisory lock으로 **싱글톤** 보장 — 인스턴스가 몇 개든 락을 잡은 1개만 처리한다(중복 방지·자동 failover).
-- **버즈 (선택)**: `mcp-agents-memory buzz-ingest`는 지정한 신원이 멤버인 버즈 방의 채팅을 공식 `buzz` CLI로 한 건씩 메모리에 옮긴다. 타이머로 돌리고, 설정은 CHANGELOG 0.9.20 참고.
+- **버즈 (선택)**: `mcp-agents-memory buzz-ingest`는 지정한 신원이 멤버인 버즈 방의 채팅을 공식 `buzz` CLI로 한 건씩 메모리에 옮긴다. 인용된 글이 전부 행으로 들어오면 캡처된 버즈 턴의 이전 대화 인용도 걷어낸다(원문은 `raw_message`, 끄려면 `--no-reclean`). 타이머로 돌리고, 설정은 CHANGELOG 0.9.20–0.9.21 참고.
 
 ### Cold Path LLM 백엔드 (config로 교체)
 
