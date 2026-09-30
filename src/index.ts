@@ -234,6 +234,12 @@ Usage:
   mcp-agents-memory coldpath        Run ONLY the cold-path worker as a standalone always-on daemon (no MCP server). For the processing/GPU machine via systemd.
   mcp-agents-memory setup           Interactive setup — write config to ~/.config/mcp-agents-memory/.env and run migrations.
   mcp-agents-memory migrate         Apply any pending DB migrations against the configured database.
+  mcp-agents-memory buzz-ingest [--dry-run] [--max N]
+                                    (Buzz only) Copy chat messages from the Buzz rooms the CLI identity is a member of
+                                    into memory, one row per message, via the official \`buzz\` CLI. Oldest first, at most
+                                    N per run (default 20). Needs BUZZ_RELAY_URL, BUZZ_PRIVATE_KEY and BUZZ_INGEST_OWNER
+                                    (the memory owner's pubkeys, comma-separated) in the environment of this command only —
+                                    not in the shared .env; optional BUZZ_CLI.
   mcp-agents-memory help            Show this message.
 
 Configuration is loaded from (first hit wins):
@@ -368,6 +374,17 @@ async function cli() {
   if (cmd === "setup") {
     const { runSetupWizard } = await import("./setup.js");
     await runSetupWizard();
+    process.exit(0);
+  }
+
+  if (cmd === "buzz-ingest") {
+    // buzz용 — Buzz 정본을 한 번 가져오고 끝난다 (타이머가 주기적으로 부름)
+    const { runBuzzIngest, parseIngestArgs } = await import("./auto_save/buzz_ingest.js");
+    const opts = parseIngestArgs(process.argv.slice(3));
+    await db.connect();
+    const report = await runBuzzIngest(opts);
+    console.log(JSON.stringify({ dryRun: opts.dryRun ?? false, ...report }));
+    await db.close();
     process.exit(0);
   }
 

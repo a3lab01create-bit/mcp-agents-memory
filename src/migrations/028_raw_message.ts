@@ -13,6 +13,8 @@ const MIGRATION_NAME = "028_raw_message";
  *   raw_message IS NULL      → message가 곧 원문 (기존 모든 행, 일반 캡처)
  *   raw_message IS NOT NULL  → raw_message가 캡처 원문, message는 그 정리본
  *                              (이후 manage_knowledge update로 message만 고쳐졌을 수 있음)
+ *   agent_platform = 'buzz'  → (0.9.20 buzz-ingest) raw_message는 버즈 본문, message는
+ *                              `[작성자] 본문` — 봉투 정리본이 아니므로 재정리 스크립트에서 제외할 것
  *
  * nullable·기본값 없음이라 기존 행 재작성이 없다 (메타데이터만 변경).
  *
