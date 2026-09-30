@@ -24,6 +24,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { insertRawMemory } from "../hot_path.js";
+import { buzzTurnVenue } from "./venue.js";
 import { getDefaultUserId } from "../users.js";
 
 const DEVICE_NAME = os.hostname();
@@ -56,6 +57,12 @@ interface CaptureState {
   cursor: number;
   /** session_id → sessions.model (없으면 null). 중복 조회 방지. */
   modelCache: Map<string, string | null>;
+  /** session_id → sessions.source (acp / slack / cli / subagent …). */
+  sourceCache: Map<string, string | null>;
+  /** acp(버즈) 세션: 가장 최근 턴의 venue. 답글은 이걸 따른다. */
+  buzzVenue: Map<string, string | null>;
+  /** 저장 실패로 다음 poll에 재시도하는 행: 처음 계산한 venue를 그대로 쓴다. */
+  venueByRow: Map<number, string | null>;
 }
 
 let _state: CaptureState | null = null;
@@ -128,6 +135,56 @@ export function parseNewRows(db: any, afterId: number): ParseResult {
   return { rows, maxId };
 }
 
+/** sessions.source 조회 (세션별 캐시). 실패/없음 → null. */
+export function lookupSource(db: any, sessionId: string, cache: Map<string, string | null>): string | null {
+  if (cache.has(sessionId)) return cache.get(sessionId)!;
+  let source: string | null = null;
+  try {
+    const row = db.prepare(`SELECT source FROM sessions WHERE id = ? LIMIT 1`).get(sessionId) as
+      | { source?: string | null }
+      | undefined;
+    source = row?.source ?? null;
+  } catch {
+    source = null;
+  }
+  cache.set(sessionId, source);
+  return source;
+}
+
+const SOURCE_VENUE: Record<string, string> = { slack: "slack", cli: "terminal", subagent: "subagent", cron: "auto" };
+
+/**
+ * 한 행의 venue. acp(버즈) 세션은 한 세션이 여러 채널을 번갈아 처리하므로 턴마다
+ * 방 정보에서 채널을 읽고, 답글은 같은 세션의 바로 앞 턴 채널을 따른다. 재시작 직후처럼
+ * 앞 턴을 아직 못 봤으면 state.db에서 그 세션의 직전 user 턴을 찾아본다.
+ * 버즈 봉투를 한 번도 못 본 acp 세션은 버즈라고 단정하지 않고 null.
+ */
+export function rowVenue(db: any, row: ParsedRow, state: Pick<CaptureState, "sourceCache" | "buzzVenue">): string | null {
+  const source = lookupSource(db, row.sessionId, state.sourceCache);
+  if (source !== "acp") return source ? SOURCE_VENUE[source] ?? null : null;
+  const own = row.role === "user" ? buzzTurnVenue(row.message) : null;
+  if (own) {
+    state.buzzVenue.set(row.sessionId, own);
+    return own;
+  }
+  if (!state.buzzVenue.has(row.sessionId)) {
+    let seeded: string | null = null;
+    try {
+      const prev = db
+        .prepare(`SELECT content FROM messages WHERE session_id = ? AND id < ? AND role = 'user' ORDER BY id DESC LIMIT 20`)
+        .all(row.sessionId, row.id) as Array<{ content: string | null }>;
+      for (const p of prev) {
+        seeded = p.content ? buzzTurnVenue(p.content) : null;
+        if (seeded) break;
+      }
+    } catch {
+      seeded = null;
+    }
+    state.buzzVenue.set(row.sessionId, seeded);
+  }
+  return state.buzzVenue.get(row.sessionId) ?? null;
+}
+
 /** sessions.model 조회 (세션별 캐시). 실패/없음 → null. */
 export function lookupModel(
   db: any,
@@ -193,7 +250,7 @@ export async function captureSessionStart(_cwd: string): Promise<void> {
   }
   try { db.close(); } catch {}
 
-  _state = { cursor: maxId, modelCache: new Map() };
+  _state = { cursor: maxId, modelCache: new Map(), sourceCache: new Map(), buzzVenue: new Map(), venueByRow: new Map() };
   console.error(`📝 [Hermes] capture armed: cursor=${maxId} (live-from-now)`);
 
   if (_pollTimer) clearInterval(_pollTimer);
@@ -243,6 +300,11 @@ async function flush(): Promise<{ inserted: number; dedup: number; skipped: numb
           r.role === "user"
             ? null
             : lookupModel(db, r.sessionId, _state.modelCache) ?? "unknown";
+        let venue = _state.venueByRow.get(r.id);
+        if (venue === undefined) {
+          try { venue = rowVenue(db, r, _state); } catch { venue = null; }
+          _state.venueByRow.set(r.id, venue);
+        }
         try {
           const res = await insertRawMemory({
             user_id: userId,
@@ -252,7 +314,9 @@ async function flush(): Promise<{ inserted: number; dedup: number; skipped: numb
             message: r.message,
             external_uuid: `hermes:${r.id}`,
             device_name: DEVICE_NAME,
+            venue,
           });
+          _state.venueByRow.delete(r.id);
           if (res.inserted) inserted++;
           else dedup++;
         } catch (err) {

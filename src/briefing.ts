@@ -17,6 +17,8 @@
  *     (없으면 8건 cross-platform)
  */
 
+import { hasMemoryColumn } from "./memory_columns.js";
+import { buzzEmbeddingText } from "./auto_save/buzz_envelope.js";
 import * as os from "node:os";
 import { db } from "./db.js";
 import { getDefaultUserId } from "./users.js";
@@ -43,6 +45,8 @@ export interface BriefMessage {
   role: string;
   agent_platform: string;
   device_name: string | null;
+  /** 대화가 오간 자리 (terminal / buzz:<채널> / …). 모르면 null. */
+  venue?: string | null;
   preview: string;
   created_at: Date;
 }
@@ -76,6 +80,8 @@ export interface CollectBriefOpts {
 
 /** brief 데이터 수집. Hot Path INSERT가 빈번할 때도 빠르게 (~50ms) 동작 목표. */
 export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefData> {
+  // migration 029 전 DB면 venue 없이 동작
+  const venueSel = (await hasMemoryColumn("venue")) ? ", venue" : "";
   const userId = opts.userId ?? (await getDefaultUserId());
   const shortTermDays = opts.shortTermDays ?? Number(process.env.SHORT_TERM_DAYS ?? 3);
   const currentPlatform = opts.currentPlatform ?? null;
@@ -90,7 +96,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
 
   // 중요 고정 메모리 (Pinned)
   const pinnedMsgs = await db.query(
-    `SELECT role, agent_platform, device_name, message, created_at
+    `SELECT role, agent_platform, device_name, message, created_at${venueSel}
        FROM memory
       WHERE user_id = $1
         AND is_active = TRUE
@@ -124,7 +130,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
   if (currentPlatform) {
     // current platform + 현재 기기 메시지 우선 (연속성: "이 기기에서 뭐 하다 끊겼나")
     const currentMsgs = await db.query(
-      `SELECT role, agent_platform, device_name, message, created_at
+      `SELECT role, agent_platform, device_name, message, created_at${venueSel}
          FROM memory
         WHERE user_id = $1
           AND is_active = TRUE
@@ -141,7 +147,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
 
     // other platforms 메시지 (preview)
     const othersMsgs = await db.query(
-      `SELECT role, agent_platform, device_name, message, created_at
+      `SELECT role, agent_platform, device_name, message, created_at${venueSel}
          FROM memory
         WHERE user_id = $1
           AND is_active = TRUE
@@ -157,7 +163,7 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
   } else {
     // cross-platform 통합 brief (legacy 동작)
     const msgs = await db.query(
-      `SELECT role, agent_platform, device_name, message, created_at
+      `SELECT role, agent_platform, device_name, message, created_at${venueSel}
          FROM memory
         WHERE user_id = $1
           AND is_active = TRUE
@@ -208,11 +214,18 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
 }
 
 function rowToMsg(r: any): BriefMessage {
+  // 버즈 턴은 방 정보·이벤트 머리글·태그 줄 대신 사람 말만 한 줄로 (자리는 venue 표시가 대신한다)
+  const raw = String(r.message ?? '');
+  const buzz = buzzEmbeddingText(raw);
+  const text = buzz === raw
+    ? raw
+    : buzz.split("\n").filter((l) => !/^<\/?[a-z-]+(\s[^>]*)?>\s*$/.test(l)).join(" ").replace(/\s+/g, " ").trim();
   return {
     role: r.role,
     agent_platform: r.agent_platform,
     device_name: r.device_name ?? null,
-    preview: String(r.message ?? '').slice(0, MAX_PREVIEW_STORE),
+    venue: r.venue ?? null,
+    preview: text.slice(0, MAX_PREVIEW_STORE),
     created_at: r.created_at,
   };
 }
@@ -403,7 +416,8 @@ function fitSection(heading: string, lines: string[], budget: { remaining: numbe
 function formatMsgLine(m: BriefMessage, showPlatform: boolean, maxPreview: number = PREVIEW_COMPACT): string {
   const dt = m.created_at?.toISOString?.().slice(11, 16) ?? '';
   const device = m.device_name ? `@${m.device_name} ` : '';
-  const platformTag = showPlatform ? `${m.agent_platform} ${device}` : device;
+  const venue = m.venue ? `${m.venue} ` : '';
+  const platformTag = (showPlatform ? `${m.agent_platform} ${device}` : device) + venue;
   // m.preview는 MAX_PREVIEW_STORE까지 저장돼 있음 → context별 maxPreview로 슬라이스.
   // invariant(MAX_PREVIEW_STORE > maxPreview) 덕에 length > maxPreview면 '실제로 더 길다'가 보장됨.
   const truncated = m.preview.length > maxPreview;

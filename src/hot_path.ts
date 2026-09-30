@@ -9,12 +9,36 @@
 
 import { db } from "./db.js";
 import { cleanBuzzEnvelope } from "./auto_save/buzz_envelope.js";
+import { buzzTurnVenue } from "./auto_save/venue.js";
+
+type OptionalColumn = "raw_message" | "venue";
 
 /**
- * migration 028 전 DB면 raw_message 칸이 없다 → 봉투도 원문 그대로 저장
+ * 마이그레이션 전 DB면 새 칸(028 raw_message, 029 venue)이 없다 → 그 칸 없이 저장
  * (지금까지와 같은 동작). 한 번 확인되면 이 프로세스에선 다시 시도하지 않는다.
  */
-let rawMessageColumnMissing = false;
+const missingColumns = new Set<OptionalColumn>();
+const MISSING_COLUMN_EFFECT: Record<OptionalColumn, string> = {
+  raw_message: "Buzz 봉투 정리가 시작됩니다. 그 전까지는 원문 그대로 저장합니다.",
+  venue: "대화 자리(venue) 기록이 시작됩니다. 그 전까지는 venue 없이 저장합니다.",
+};
+
+/**
+ * 42703(undefined_column)이 우리 선택 칸 때문인지. 메시지는 서버 언어마다 따옴표가
+ * 달라서(»venue«, « venue » …) 에러 위치(position)로 SQL에서 칸 이름을 읽는다.
+ * position이 없으면 메시지에 칸 이름이 들어 있는지로 판단한다.
+ */
+function missingOptionalColumn(
+  err: unknown,
+  sql: string,
+  cols: Array<[OptionalColumn, string]>
+): OptionalColumn | undefined {
+  const e = err as { code?: string; message?: string; position?: string };
+  if (e.code !== "42703") return undefined;
+  const at = Number(e.position);
+  const named = at > 0 ? /^[a-z_]+/.exec(sql.slice(at - 1))?.[0] : undefined;
+  return cols.find(([c]) => (named ? c === named : !!e.message?.includes(c)))?.[0];
+}
 
 export interface HotPathInsertParams {
   user_id: number;                 // users.user_id FK
@@ -55,6 +79,12 @@ export interface HotPathInsertParams {
   external_uuid?: string | null;
   /** MCP 서버 시작 시 os.hostname()으로 캡처한 기기명. null이면 unknown. */
   device_name?: string | null;
+  /**
+   * 대화가 오간 자리 (migration 029 참고: terminal / buzz:<채널> / buzz:dm / slack /
+   * auto / subagent). 캡처가 세션 정보로 아는 경우에만 넘긴다. 안 넘기면 받은 말(user)이
+   * 버즈 턴일 때만 방 정보에서 읽고, 그 밖엔 NULL.
+   */
+  venue?: string | null;
 }
 
 export interface HotPathInsertResult {
@@ -102,54 +132,65 @@ export async function insertRawMemory(
       ? cleanBuzzEnvelope(message)
       : null;
 
-  const insert = (text: string, raw: string | null) =>
-    db.query(
+  // venue: 캡처가 알려준 값 우선. 없으면 받은 말(user)이 버즈 턴일 때만 방 정보에서 읽는다.
+  const venue = params.venue ?? (role === "user" ? buzzTurnVenue(cleaned ?? message) : null);
+
+  const optional: Array<[OptionalColumn, string]> = [];
+  if (cleaned !== null) optional.push(["raw_message", message]);
+  if (venue) optional.push(["venue", venue]);
+
+  const buildInsert = (cols: Array<[OptionalColumn, string]>) => {
+    // raw_message 칸을 못 쓰면 정리본 대신 원문을 message에 둔다 (원문 보존이 먼저)
+    const text = cols.some(([c]) => c === "raw_message") ? cleaned! : message;
+    const sql =
       `INSERT INTO memory (
          user_id, agent_platform, agent_model,
          subagent, subagent_model, subagent_role,
          role, message,
          p_tag_id, d_tag, embedding,
          is_pinned, tag_processed, external_uuid,
-         device_name${raw !== null ? ", raw_message" : ""}
+         device_name${cols.map(([c]) => `, ${c}`).join("")}
        ) VALUES (
          $1, $2, $3,
          $4, $5, $6,
          $7, $8,
          $9, $10::text[], $11::halfvec,
          $12, $13, $14,
-         $15${raw !== null ? ", $16" : ""}
+         $15${cols.map((_, i) => `, $${16 + i}`).join("")}
        )
        ON CONFLICT (external_uuid) WHERE external_uuid IS NOT NULL
          DO NOTHING
-       RETURNING id, created_at`,
-      [
-        user_id, agent_platform, agent_model,
-        subagent, subagent_model, subagent_role,
-        role, text,
-        p_tag_id, d_tag, embeddingSql,
-        is_pinned, tagProcessed, external_uuid,
-        device_name,
-        ...(raw !== null ? [raw] : []),
-      ]
-    );
+       RETURNING id, created_at`;
+    const values = [
+      user_id, agent_platform, agent_model,
+      subagent, subagent_model, subagent_role,
+      role, text,
+      p_tag_id, d_tag, embeddingSql,
+      is_pinned, tagProcessed, external_uuid,
+      device_name,
+      ...cols.map(([, v]) => v),
+    ];
+    return { sql, values };
+  };
 
+  let cols = optional.filter(([c]) => !missingColumns.has(c));
   let result;
-  if (cleaned !== null && !rawMessageColumnMissing) {
+  for (;;) {
+    const { sql, values } = buildInsert(cols);
     try {
-      result = await insert(cleaned, message);
+      result = await db.query(sql, values);
+      break;
     } catch (err) {
-      // 42703 undefined_column — migration 028 미적용 DB
-      const e = err as { code?: string; message?: string };
-      if (e.code !== "42703" || !e.message?.includes("raw_message")) throw err;
-      rawMessageColumnMissing = true;
+      // 42703 undefined_column — 해당 마이그레이션 미적용 DB면 그 칸만 빼고 다시 저장
+      const missing = missingOptionalColumn(err, sql, cols);
+      if (!missing) throw err;
+      missingColumns.add(missing);
       console.error(
-        "⚠️ [HotPath] memory.raw_message 칸이 없습니다 — `mcp-agents-memory migrate` 실행 후 " +
-          "이 프로세스를 재시작해야 Buzz 봉투 정리가 시작됩니다. 그 전까지는 원문 그대로 저장합니다."
+        `⚠️ [HotPath] memory.${missing} 칸이 없습니다 — \`mcp-agents-memory migrate\` 실행 후 ` +
+          `이 프로세스를 재시작해야 ${MISSING_COLUMN_EFFECT[missing]}`
       );
-      result = await insert(message, null);
+      cols = cols.filter(([c]) => c !== missing);
     }
-  } else {
-    result = await insert(message, null);
   }
 
   if (result.rows.length === 0) {

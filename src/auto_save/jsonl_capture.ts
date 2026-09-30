@@ -36,6 +36,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { insertRawMemory } from "../hot_path.js";
+import { buzzTurnVenue, classifySessionVenue, lastBuzzVenueInFile, type SessionVenueKind } from "./venue.js";
 import { getDefaultUserId } from "../users.js";
 
 const CLIENT_PLATFORM = "claude-code"; // 본 모듈은 Claude Code 전용
@@ -51,6 +52,10 @@ interface FileState {
   /** Claude Code가 tool 컨텍스트 재구성 시 같은 user 메시지를 다른 uuid로 재기록.
    *  uuid 기반 external_uuid만으론 dedup 불가 → content 기반 dedup (role::text). */
   contentSeen: Set<string>;
+  /** 세션의 대화 자리 — 첫 user 턴으로 한 번 정한다 (undefined = 아직 안 봄, null = 모름). */
+  venueKind?: SessionVenueKind | null;
+  /** 버즈 세션: 가장 최근 턴의 venue (답글은 이걸 따른다). undefined = 아직 안 찾아봄. */
+  buzzVenue?: string | null;
 }
 
 interface DirState {
@@ -217,6 +222,8 @@ export interface ParsedEntry {
   subagent?: boolean;
   subagent_model?: string;
   subagent_role?: string;
+  /** Claude Code가 줄마다 남기는 실행 방식 (cli = 대화형, sdk-cli / sdk-ts = 프로그램 실행). */
+  entrypoint?: string;
 }
 
 /** Claude Code JSONL entry → ParsedEntry. parse 실패 / type 무효 시 null. */
@@ -264,8 +271,37 @@ export function parseEntry(line: string): ParsedEntry | null {
     role: entry.type,
     message: messageText,
     agent_model,
+    entrypoint: typeof entry.entrypoint === "string" ? entry.entrypoint : undefined,
   };
 }
+
+const HEAD_SCAN_BYTES = 2 * 1024 * 1024;
+
+/**
+ * 세션 파일 앞부분에서 첫 user 턴을 찾아 대화 자리를 정한다.
+ * 첫 user 턴이 아직 안 써졌으면 undefined (다음 flush에 다시 본다). 앞 2MB를 다 봤는데도
+ * 없으면(첫 줄이 거대한 경우 등) null로 포기한다.
+ */
+function sessionVenueKind(jsonlPath: string): SessionVenueKind | null | undefined {
+  const fd = fs.openSync(jsonlPath, "r");
+  try {
+    const size = fs.fstatSync(fd).size;
+    const buf = Buffer.allocUnsafe(Math.min(HEAD_SCAN_BYTES, size));
+    fs.readSync(fd, buf, 0, buf.length, 0);
+    for (const line of buf.toString("utf-8").split("\n")) {
+      const parsed = line.trim() ? parseEntry(line) : null;
+      if (parsed?.role === "user") return classifySessionVenue(parsed.message, parsed.entrypoint);
+    }
+    return size >= HEAD_SCAN_BYTES ? null : undefined;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+const userTextOf = (line: string): string | null => {
+  const parsed = parseEntry(line);
+  return parsed?.role === "user" ? parsed.message : null;
+};
 
 /**
  * 한 jsonl 파일의 cursor부터 마지막 완성 line까지 읽고 INSERT, cursor 전진.
@@ -304,6 +340,11 @@ async function flushDeltaForFile(
   const lines = parsable.split("\n");
   const userId = await getDefaultUserId();
 
+  if (fileState.venueKind === undefined) {
+    try { fileState.venueKind = sessionVenueKind(jsonlPath); } catch { fileState.venueKind = null; }
+  }
+  const deltaStart = fileState.cursorBytes;
+
   let inserted = 0, skipped = 0, dedup = 0;
 
   for (const line of lines) {
@@ -320,6 +361,17 @@ async function flushDeltaForFile(
     fileState.contentSeen.add(ck);
 
     const externalUuid = `claude-code:${fileState.sessionId}:${parsed.uuid}`;
+    // 버즈 세션은 한 세션이 여러 채널을 번갈아 처리한다 → 답글은 바로 앞 턴의 채널을 따른다.
+    let venue: string | null = fileState.venueKind ?? null;
+    if (fileState.venueKind === "buzz") {
+      const own = parsed.role === "user" ? buzzTurnVenue(parsed.message) : null;
+      if (own) {
+        fileState.buzzVenue = own;
+      } else if (fileState.buzzVenue === undefined) {
+        try { fileState.buzzVenue = lastBuzzVenueInFile(jsonlPath, deltaStart, userTextOf); } catch { fileState.buzzVenue = null; }
+      }
+      venue = own ?? fileState.buzzVenue ?? "buzz";
+    }
     // user role: agent_model = null (사람이 친 거, N/A). assistant: 모델 명 (없으면 'unknown').
     const agentModel = parsed.role === 'user' ? null : (parsed.agent_model ?? 'unknown');
     try {
@@ -331,6 +383,7 @@ async function flushDeltaForFile(
         message: parsed.message,
         external_uuid: externalUuid,
         device_name: DEVICE_NAME,
+        venue,
       });
       if (result.inserted) inserted++;
       else dedup++;
