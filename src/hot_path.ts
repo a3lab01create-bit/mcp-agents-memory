@@ -8,6 +8,13 @@
  */
 
 import { db } from "./db.js";
+import { cleanBuzzEnvelope } from "./auto_save/buzz_envelope.js";
+
+/**
+ * migration 028 전 DB면 raw_message 칸이 없다 → 봉투도 원문 그대로 저장
+ * (지금까지와 같은 동작). 한 번 확인되면 이 프로세스에선 다시 시도하지 않는다.
+ */
+let rawMessageColumnMissing = false;
 
 export interface HotPathInsertParams {
   user_id: number;                 // users.user_id FK
@@ -88,34 +95,62 @@ export async function insertRawMemory(
   // tag_processed: 사전 p_tag_id 채워졌으면 TRUE, 아니면 FALSE (Cold Path 처리 대상)
   const tagProcessed = p_tag_id !== null;
 
-  const result = await db.query(
-    `INSERT INTO memory (
-       user_id, agent_platform, agent_model,
-       subagent, subagent_model, subagent_role,
-       role, message,
-       p_tag_id, d_tag, embedding,
-       is_pinned, tag_processed, external_uuid,
-       device_name
-     ) VALUES (
-       $1, $2, $3,
-       $4, $5, $6,
-       $7, $8,
-       $9, $10::text[], $11::halfvec,
-       $12, $13, $14,
-       $15
-     )
-     ON CONFLICT (external_uuid) WHERE external_uuid IS NOT NULL
-       DO NOTHING
-     RETURNING id, created_at`,
-    [
-      user_id, agent_platform, agent_model,
-      subagent, subagent_model, subagent_role,
-      role, message,
-      p_tag_id, d_tag, embeddingSql,
-      is_pinned, tagProcessed, external_uuid,
-      device_name,
-    ]
-  );
+  // Buzz ACP 봉투는 걷어낸 본문을 message(검색·태깅 대상)에, 원문은 raw_message에.
+  // 강제기억(is_pinned)이나 태그·임베딩을 미리 채워 온 저장은 그 본문 기준이라 손대지 않는다.
+  const cleaned =
+    role === "user" && !is_pinned && p_tag_id === null && embeddingSql === null
+      ? cleanBuzzEnvelope(message)
+      : null;
+
+  const insert = (text: string, raw: string | null) =>
+    db.query(
+      `INSERT INTO memory (
+         user_id, agent_platform, agent_model,
+         subagent, subagent_model, subagent_role,
+         role, message,
+         p_tag_id, d_tag, embedding,
+         is_pinned, tag_processed, external_uuid,
+         device_name${raw !== null ? ", raw_message" : ""}
+       ) VALUES (
+         $1, $2, $3,
+         $4, $5, $6,
+         $7, $8,
+         $9, $10::text[], $11::halfvec,
+         $12, $13, $14,
+         $15${raw !== null ? ", $16" : ""}
+       )
+       ON CONFLICT (external_uuid) WHERE external_uuid IS NOT NULL
+         DO NOTHING
+       RETURNING id, created_at`,
+      [
+        user_id, agent_platform, agent_model,
+        subagent, subagent_model, subagent_role,
+        role, text,
+        p_tag_id, d_tag, embeddingSql,
+        is_pinned, tagProcessed, external_uuid,
+        device_name,
+        ...(raw !== null ? [raw] : []),
+      ]
+    );
+
+  let result;
+  if (cleaned !== null && !rawMessageColumnMissing) {
+    try {
+      result = await insert(cleaned, message);
+    } catch (err) {
+      // 42703 undefined_column — migration 028 미적용 DB
+      const e = err as { code?: string; message?: string };
+      if (e.code !== "42703" || !e.message?.includes("raw_message")) throw err;
+      rawMessageColumnMissing = true;
+      console.error(
+        "⚠️ [HotPath] memory.raw_message 칸이 없습니다 — `mcp-agents-memory migrate` 실행 후 " +
+          "이 프로세스를 재시작해야 Buzz 봉투 정리가 시작됩니다. 그 전까지는 원문 그대로 저장합니다."
+      );
+      result = await insert(message, null);
+    }
+  } else {
+    result = await insert(message, null);
+  }
 
   if (result.rows.length === 0) {
     // ON CONFLICT skip — 기존 row 가져오기
