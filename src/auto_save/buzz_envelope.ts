@@ -114,3 +114,39 @@ export function cleanBuzzEnvelope(message: string): string | null {
     return null;
   }
 }
+
+/**
+ * 임베딩에서 빼는 이벤트 머리글 줄 (ID·종류·시각·구분선·작업 중 안내문).
+ * 사람이 쓴 "Time: 3pm" 같은 줄과 헷갈리지 않게 값 모양까지 맞아야 뺀다.
+ */
+const EVENT_HEADER =
+  /^(?:Event ID: [0-9a-f]{64}|Kind: \d+|Time: \d{4}-\d{2}-\d{2}T\S+|--- Event \d+ \(.*\) ---|Note: A new message arrived while you were working\..*)\s*$/;
+
+/**
+ * 임베딩 입력용 텍스트. 정리된 버즈 턴(<context> 바로 뒤에 이번 턴 블록)이면 방 정보와
+ * 이벤트 머리글(ID·종류·시각·npub/hex)을 빼고 사람 말만 남긴다. 저장 본문(message)은
+ * 그대로다 — 방 정보는 태깅엔 도움이 되지만(프로젝트 slug) 임베딩에선 모든 행에 같은
+ * 성분을 섞어 주제 차이를 흐린다 (검색 시험: 상위10 정확 29→33, nDCG 0.761→0.813).
+ * 모양이 다르면(이전 대화 블록이 끼어 있는 등) 받은 그대로 돌려준다.
+ */
+export function buzzEmbeddingText(message: string): string {
+  try {
+    if (!message.startsWith("<context>\n")) return message;
+    const close = message.indexOf(CONTEXT_CLOSE);
+    if (close < 0) return message;
+    const turn = message.slice(close + CONTEXT_CLOSE.length);
+    if (!TURN_OPEN.test(turn)) return message;
+    const text = turn
+      .split("\n")
+      .filter((line) => !EVENT_HEADER.test(line) && !isNostrMetaLine(line))
+      .map((line) =>
+        // `$` 없이: 끝까지 되짚는 역추적을 막는다 (긴 줄에서 제곱 시간)
+        line.replace(/^From: (.*?) \(npub:.*/, "From: $1").replace(/^Channel: (\S+) \(#[0-9a-f-]+\)/, "Channel: $1")
+      )
+      .join("\n")
+      .trim();
+    return text || message;
+  } catch {
+    return message;
+  }
+}

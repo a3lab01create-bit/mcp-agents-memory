@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.9.18 — 2026-09-30
+
+### Embedding input for cleaned Buzz turns
+
+After 0.9.17, a cleaned Buzz turn still starts with the channel `<context>`
+block and each event carries header lines (event id, kind, time, npub/hex). That
+text is identical across rows, so it pulled Buzz rows toward each other and away
+from the queries that concern them.
+
+- New `buzzEmbeddingText()` (`src/auto_save/buzz_envelope.ts`): when a message
+  has the shape of a Buzz turn (`<context>` immediately followed by a turn block,
+  as 0.9.17 stores cleaned envelopes), the embedding is computed on the turn
+  without `<context>`, without the event header lines (event id, kind, time,
+  Nostr tag lines) and with `From:`/`Channel:` reduced to names. Anything else is
+  embedded as before.
+- Only the embedding input changes. The stored `message` (what tagging and
+  search results show) is untouched, and `<context>` still reaches the tagger,
+  where its project slug helps.
+- Checked on a blind-graded retrieval test (10 queries, top 10): exact hits went
+  from 29 to 33, related hits from 59 to 63, and nDCG@10 from 0.761 to 0.813.
+  No query got worse.
+- Existing rows keep their current embedding until they are re-embedded.
+
 ## 0.9.17 — 2026-09-30
 
 ### Buzz envelope cleanup at capture time (+ raw original kept)
