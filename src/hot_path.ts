@@ -85,6 +85,13 @@ export interface HotPathInsertParams {
    * 버즈 턴일 때만 방 정보에서 읽고, 그 밖엔 NULL.
    */
   venue?: string | null;
+  /**
+   * 원문을 따로 보관할 때 (buzz용 정본 가져오기: message는 `[작성자] 본문`, 원문은 버즈 본문 그대로).
+   * 봉투 정리가 일어나면 정리 전 원문이 우선한다.
+   */
+  raw_message?: string | null;
+  /** 말한 시각이 따로 있을 때 (buzz용 정본 가져오기: 버즈 이벤트 시각). 없으면 저장 시각. */
+  created_at?: Date | null;
 }
 
 export interface HotPathInsertResult {
@@ -135,13 +142,18 @@ export async function insertRawMemory(
   // venue: 캡처가 알려준 값 우선. 없으면 받은 말(user)이 버즈 턴일 때만 방 정보에서 읽는다.
   const venue = params.venue ?? (role === "user" ? buzzTurnVenue(cleaned ?? message) : null);
 
+  const raw = cleaned !== null ? message : (params.raw_message ?? null);
   const optional: Array<[OptionalColumn, string]> = [];
-  if (cleaned !== null) optional.push(["raw_message", message]);
+  if (raw !== null) optional.push(["raw_message", raw]);
   if (venue) optional.push(["venue", venue]);
 
   const buildInsert = (cols: Array<[OptionalColumn, string]>) => {
     // raw_message 칸을 못 쓰면 정리본 대신 원문을 message에 둔다 (원문 보존이 먼저)
-    const text = cols.some(([c]) => c === "raw_message") ? cleaned! : message;
+    const text = cleaned !== null && cols.some(([c]) => c === "raw_message") ? cleaned : message;
+    const extra: Array<[string, unknown]> = [
+      ...cols,
+      ...(params.created_at ? [["created_at", params.created_at] as [string, unknown]] : []),
+    ];
     const sql =
       `INSERT INTO memory (
          user_id, agent_platform, agent_model,
@@ -149,14 +161,14 @@ export async function insertRawMemory(
          role, message,
          p_tag_id, d_tag, embedding,
          is_pinned, tag_processed, external_uuid,
-         device_name${cols.map(([c]) => `, ${c}`).join("")}
+         device_name${extra.map(([c]) => `, ${c}`).join("")}
        ) VALUES (
          $1, $2, $3,
          $4, $5, $6,
          $7, $8,
          $9, $10::text[], $11::halfvec,
          $12, $13, $14,
-         $15${cols.map((_, i) => `, $${16 + i}`).join("")}
+         $15${extra.map((_, i) => `, $${16 + i}`).join("")}
        )
        ON CONFLICT (external_uuid) WHERE external_uuid IS NOT NULL
          DO NOTHING
@@ -168,7 +180,7 @@ export async function insertRawMemory(
       p_tag_id, d_tag, embeddingSql,
       is_pinned, tagProcessed, external_uuid,
       device_name,
-      ...cols.map(([, v]) => v),
+      ...extra.map(([, v]) => v),
     ];
     return { sql, values };
   };

@@ -107,6 +107,7 @@ When several machines share **one** database, the Cold Path (tagging / profiling
   mcp-agents-memory coldpath    # Cold Path worker only, no MCP server (systemd recommended)
   ```
   The daemon is a **singleton** via a PostgreSQL advisory lock — no matter how many instances exist, only the one holding the lock processes (dedup + automatic failover).
+- **Buzz (optional)**: `mcp-agents-memory buzz-ingest` copies chat messages from the Buzz rooms a given identity is a member of into memory, one row per message, through the official `buzz` CLI. Run it from a timer; see CHANGELOG 0.9.20 for the settings.
 
 ### Cold Path LLM backend
 

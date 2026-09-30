@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.9.20 — 2026-10-01
+
+### Buzz messages as their own rows (`buzz-ingest`, Buzz only)
+
+A Buzz room reached memory only through the envelope an agent received (the
+quoted thread window), and an agent's own Buzz replies are sent by a tool call,
+so its capture never holds their text. The quoted window was the only searchable
+copy of those replies.
+
+- New subcommand `mcp-agents-memory buzz-ingest [--dry-run] [--max N]`
+  (`src/auto_save/buzz_ingest.ts`, Buzz only): copies Buzz chat messages into
+  memory, one row per message, through the official `buzz` CLI (`channels list`,
+  `messages get`, `users get`). It never reads Buzz's database, so Buzz's own
+  access rules decide the scope: only rooms the CLI identity is a member of
+  (`channels list --member`).
+- Row shape: `external_uuid = buzz:<event id>` (re-runs never duplicate),
+  `agent_platform = buzz`, `role = user` for the memory owner's pubkeys in
+  `BUZZ_INGEST_OWNER` and `assistant` for everyone else (the librarian builds the
+  owner's profile from `user` rows), `created_at` = the message time,
+  `venue = buzz:<channel>` or `buzz:dm`, `message = "[display name] text"`,
+  `raw_message` = the text exactly as in Buzz.
+- No state file: each room is read newest-first until a page contains a message
+  memory already has, plus 48 hours further back (a message posted late by a
+  device with a slow clock is still picked up). New messages are stored
+  oldest-first, at most `--max` (default 20) per run, so a first run over a long
+  history trickles in without holding up the cold-path queue, and the next run
+  continues where it stopped. If paging misbehaves (an empty follow-up page, a
+  page that does not move back), the run stops instead of leaving a gap.
+- Edits (kind 40003): the latest edit replaces the text (author label kept) and
+  the row is re-tagged and re-embedded. Deletions (kind 5 / 9005): the row is
+  hidden (`is_active = false`), never deleted; pinned rows are left alone.
+- Author labels use `display_name`, else `name`, else the first 8 hex of the
+  pubkey. Every profile lookup also asks for the CLI identity's own profile and
+  stops if it is missing, since the CLI prints a bad response as an empty list
+  (so the CLI identity needs a profile).
+- Every CLI call happens before the first write: if the output does not have the
+  expected shape, the run writes nothing and exits non-zero, so a watcher can
+  tell that Buzz changed. `--dry-run` also reports messages of kinds this
+  version does not copy yet (40002, 40008, 45001, 45003) as `unsupported`.
+- The `buzz` child process gets only `PATH`, `HOME`, locale/proxy/TLS variables
+  and `BUZZ_*` — not database credentials or API keys.
+- Known limits: an author with no profile at copy time (or a message signed by
+  the relay key, e.g. workflows) keeps the 8-hex label; an edit that is later
+  deleted is not reverted; if one room keeps paging abnormally, every room waits
+  (a stop is preferred to a gap); each run reads the last 48 hours of every room,
+  so a room with thousands of messages a day needs a longer interval.
+- `insertRawMemory` accepts an optional `created_at` and `raw_message`.
+- Nothing runs unless you call the subcommand (e.g. from a timer).
+
 ## 0.9.19 — 2026-10-01
 
 ### Where a conversation happened (`venue`)
