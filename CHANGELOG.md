@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.17 — 2026-09-30
 
 ### Buzz envelope cleanup at capture time (+ raw original kept)
 
