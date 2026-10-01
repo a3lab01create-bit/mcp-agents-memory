@@ -24,6 +24,8 @@
  *
  * 수정(kind 40003)은 최신 수정본으로 본문을 바꾸고 태깅·임베딩을 다시 하게 한다.
  * 삭제(kind 5 / 9005)는 행을 지우지 않고 숨긴다(is_active=false).
+ * 원본 행이 쌓이면 설명서 없는 봉투(<context>부터)의 이력(인용)을 걷어낸다 — 인용 글이 전부
+ * 원본 행(같은 초·같은 본문)으로 있을 때만. 실행당 새 글을 넣고 남은 예산만큼.
  * 모든 CLI 호출이 첫 쓰기 전에 끝난다 — 출력 모양이 예상과 다르면 아무것도 쓰지 않고
  * 에러로 끝난다. 버즈가 바뀐 것이니 감시 쪽이 알아채고 그때 맞춘다.
  *
@@ -37,6 +39,7 @@
 import { execFile } from "node:child_process";
 import { db } from "../db.js";
 import { insertRawMemory } from "../hot_path.js";
+import { buzzQuotedMessages, cleanBuzzEnvelope, looksLikeBuzzTurn, venueFromBuzzMessage } from "./buzz_envelope.js";
 import { getDefaultUserId } from "../users.js";
 
 const KIND_CHAT = 9;
@@ -70,8 +73,10 @@ export interface BuzzChannel {
 
 export interface BuzzIngestOptions {
   dryRun?: boolean;
-  /** 한 번에 넣을 새 글 최대 건수 (오래된 것부터). */
+  /** 한 번에 넣을 새 글 최대 건수 (오래된 것부터). 봉투 정리도 남은 몫 안에서 한다. */
   max?: number;
+  /** 설명서 없는 봉투 정리 단계를 끈다. */
+  noReclean?: boolean;
 }
 
 export interface BuzzIngestReport {
@@ -81,6 +86,12 @@ export interface BuzzIngestReport {
   edited: number;
   hidden: number;
   byVenue: Record<string, number>;
+  /** 이력을 걷어낸 설명서 없는 봉투 수 */
+  recleaned: number;
+  /** 정리할 수 있지만 이번 예산을 넘어 다음 실행으로 미룬 봉투 수 */
+  envelopesReady: number;
+  /** 이력이 있는데 이 단계로는 못 정리하는 버즈 봉투 수 (인용 글이 같은 방 원본 행으로 다 있지 않거나 모양을 모름) */
+  envelopesStuck: number;
   /** --dry-run 때만: 아직 가져오지 않는 종류의 글 수 (최신 한 쪽 기준). */
   unsupported?: number;
 }
@@ -352,6 +363,86 @@ async function hideDeleted(targets: string[], dryRun: boolean): Promise<number> 
   return Number(r.rows[0]?.n ?? 0);
 }
 
+const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+
+/**
+ * 설명서 없는 봉투 정리. 봉투의 이력(인용)이 에이전트 버즈 답글의 유일한 사본일 수 있어서 저장
+ * 순간엔 정리하지 않고, 인용 글이 전부 같은 방·같은 초·같은 본문의 버즈 원본 행으로 있을 때만
+ * message=정리본, raw_message=원문으로 바꾸고 태깅·임베딩을 다시 하게 한다. 나중에 고친 글을
+ * 인용한 봉투(인용엔 고치기 전 문장)나 CLI 신원이 못 보는 방의 봉투는 그대로 둔다.
+ * 원본 행이 숨겨진 글(버즈에서 지움)도 확인된 것으로 친다 — 버즈의 최신 상태를 따른다.
+ * 콜드패스 워커가 그 행을 잡고 있으면 2초만 기다리고, 넘으면 다음 실행에 한다.
+ */
+async function recleanEnvelopes(
+  userId: number,
+  budget: number,
+  dryRun: boolean
+): Promise<{ recleaned: number; ready: number; stuck: number }> {
+  const rows = (await db.query(
+    `SELECT id, message, venue FROM memory
+      WHERE user_id = $1 AND role = 'user' AND raw_message IS NULL AND message LIKE '<context>%'
+        AND agent_platform <> 'buzz' AND is_active AND NOT is_pinned
+      ORDER BY created_at, id`,
+    [userId]
+  )).rows;
+  type Cand = { id: number; message: string; cleaned: string; venue: string; quotes: Array<{ ms: number; text: string }> };
+  const cands: Cand[] = [];
+  let stuck = 0; // 버즈 봉투인데 걷어낼 이력이 있고(또는 모양을 몰라) 이번 단계로는 못 정리하는 것
+  for (const r of rows) {
+    const cleaned = cleanBuzzEnvelope(r.message, { baseless: true });
+    const quotes = buzzQuotedMessages(r.message);
+    if (cleaned === null && quotes !== null && quotes.length === 0) continue; // 걷어낼 게 없음
+    // 버즈 자리만 (terminal/slack/auto 같은 다른 자리는 버즈 봉투가 아님)
+    const venue =
+      [r.venue, venueFromBuzzMessage(r.message)].find((v): v is string => typeof v === "string" && v.startsWith("buzz")) ?? null;
+    const q = (quotes ?? []).map((x) => ({ ms: Date.parse(x.time), text: norm(x.content) }));
+    if (cleaned === null || quotes === null || !venue || q.some((x) => !Number.isFinite(x.ms))) {
+      if (venue || looksLikeBuzzTurn(r.message)) stuck++;
+      continue;
+    }
+    cands.push({ id: Number(r.id), message: r.message, cleaned, venue, quotes: q });
+  }
+  const times = [...new Set(cands.flatMap((c) => c.quotes.map((x) => x.ms)))];
+  const have = new Set<string>(); // venue \0 ms \0 본문
+  if (times.length) {
+    const r = await db.query(
+      `SELECT venue, created_at, raw_message FROM memory
+        WHERE user_id = $1 AND agent_platform = 'buzz' AND external_uuid LIKE 'buzz:%'
+          AND raw_message IS NOT NULL AND created_at = ANY($2::timestamptz[])`,
+      [userId, times.map((ms) => new Date(ms).toISOString())]
+    );
+    for (const row of r.rows) have.add(`${row.venue}\0${new Date(row.created_at).getTime()}\0${norm(row.raw_message)}`);
+  }
+  const ready = cands.filter((c) => c.quotes.every((x) => have.has(`${c.venue}\0${x.ms}\0${x.text}`)));
+  stuck += cands.length - ready.length;
+  let n = 0;
+  for (const c of ready.slice(0, Math.max(0, budget))) {
+    if (dryRun) {
+      n++;
+      continue;
+    }
+    const client = await db.getClient();
+    try {
+      await client.query("BEGIN");
+      await client.query("SET LOCAL lock_timeout = '2s'");
+      const r = await client.query(
+        `UPDATE memory
+            SET message = $2, raw_message = $3, tag_processed = FALSE, embedding = NULL, cold_error = NULL
+          WHERE id = $1 AND raw_message IS NULL AND message = $3`,
+        [c.id, c.cleaned, c.message]
+      );
+      await client.query("COMMIT");
+      n += r.rowCount ?? 0;
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      if ((err as { code?: string }).code !== "55P03") throw err; // 잠금 대기 초과 → 다음 실행에
+    } finally {
+      client.release();
+    }
+  }
+  return { recleaned: n, ready: ready.length - n, stuck };
+}
+
 export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzIngestReport> {
   const dryRun = opts.dryRun ?? false;
   const max = opts.max ?? 20;
@@ -395,10 +486,16 @@ export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzI
     inserted: 0,
     edited: 0,
     hidden: 0,
+    recleaned: 0,
+    envelopesReady: 0,
+    envelopesStuck: 0,
     byVenue: {},
     ...(dryRun ? { unsupported } : {}),
   };
-  const userId = dryRun ? 0 : await getDefaultUserId();
+  // --dry-run은 아무것도 쓰지 않는다 — 기본 사용자가 아직 없으면 만들지 않고 봉투 단계를 건너뛴다
+  const userId = dryRun
+    ? Number((await db.query(`SELECT user_id FROM users WHERE user_name = $1`, [process.env.USER_NAME ?? "hoon"])).rows[0]?.user_id ?? 0)
+    : await getDefaultUserId();
   for (const { e, venue } of batch) {
     report.byVenue[venue] = (report.byVenue[venue] ?? 0) + 1;
     if (dryRun) {
@@ -426,6 +523,14 @@ export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzI
   }
   report.edited = await applyEdits(latestEdits(edits), dryRun);
   report.hidden = await hideDeleted([...deleteTargets], dryRun);
+  // 5) 새 글을 넣고 남은 예산만큼 봉투 이력 걷어내기 (DB만). 실제 실행은 새 원본 행이 들어간 뒤라
+  //    방금 인용도 확인된다; --dry-run은 이번 새 글을 안 넣으므로 그만큼 적게 센다.
+  if (!opts.noReclean && userId > 0) {
+    const env = await recleanEnvelopes(userId, max - batch.length, dryRun);
+    report.recleaned = env.recleaned;
+    report.envelopesReady = env.ready;
+    report.envelopesStuck = env.stuck;
+  }
   return report;
 }
 
@@ -434,6 +539,7 @@ export function parseIngestArgs(argv: string[]): BuzzIngestOptions {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--dry-run") opts.dryRun = true;
+    else if (a === "--no-reclean") opts.noReclean = true;
     else if (a === "--max") {
       const v = argv[++i];
       if (v === undefined || !/^\d+$/.test(v)) throw new Error("--max: 0 이상의 정수");

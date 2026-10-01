@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.9.21 — 2026-10-01
+
+### Base-less Buzz envelopes cleaned once their quotes exist as rows (Buzz only)
+
+Some Buzz ACP adapters send the Buzz manual through the system role, so the
+captured turn starts at `<context>` and carries the quoted thread window
+(`<thread-context>` / `<conversation-context>`) but no `<base>`. That window was
+left alone because it could be the only searchable copy of an agent's Buzz
+replies. Since 0.9.20 those messages are rows of their own.
+
+- `cleanBuzzEnvelope(message, { baseless: true })` also accepts an envelope that
+  starts at `<context>`, when the context carries the Buzz markers
+  (`Scope: thread|channel|dm` and a `Channel: … (#<uuid>)` line). The hot path
+  still calls it without the option, so nothing changes at capture time.
+- New `buzzQuotedMessages()` reads the entries of the history block the cleaner
+  would drop (`[n] name (pubkey) (time): text`, multi-line text kept); unknown
+  shapes return null.
+- `buzz-ingest` gains a final, database-only step: a base-less envelope of the
+  same memory owner is cleaned (`message` = context + turn, `raw_message` = the
+  original, re-tagged and re-embedded) only when every quoted message exists as
+  a `buzz:` row of the same room (`venue`), the same second and the same text.
+  It uses the budget left after new messages (`--max`) and skips a row the
+  cold-path worker is holding (2 s lock timeout, retried next run). Envelopes
+  that quote a message as it was before a later edit, or quote rooms the CLI
+  identity cannot see, stay as they are. `--no-reclean` turns the step off.
+- Buzz's latest state wins: a quote whose row was later hidden (deleted in
+  Buzz) or edited still counts as covered, so its old wording remains only in
+  the envelope's `raw_message`.
+- The run report adds `recleaned`, `envelopesReady` (cleanable, deferred by the
+  budget) and `envelopesStuck` (Buzz turns with a history window this step
+  cannot clean).
+
 ## 0.9.20 — 2026-10-01
 
 ### Buzz messages as their own rows (`buzz-ingest`, Buzz only)

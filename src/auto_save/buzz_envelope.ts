@@ -21,6 +21,13 @@
  * + 이번 턴 내용만 남긴 본문을 돌려준다. 원본 보존은 호출자 몫 (hot_path가
  * raw_message 칸에 저장).
  *
+ * 설명서를 system 쪽으로 보내는 어댑터(관측: claude-code, hermes 일부)는 <base>와
+ * 설정 블록 없이 <context>부터 시작하는 봉투를 남긴다. 이 형태는 `{ baseless: true }`로
+ * 부를 때만, <context>에 버즈 표식(`Scope: thread|channel|dm`, `Channel:` 줄)이 있으면
+ * 정리한다. 저장 순간(hot path)엔 정리하지 않는다 — 이력(인용)이 에이전트 버즈 답글의
+ * 유일한 사본일 수 있어서, buzz-ingest가 인용 글이 전부 버즈 원본 행으로 있는지
+ * (buzzQuotedMessages) 확인한 뒤에 정리한다.
+ *
  * 봉투는 앞에서부터 순서대로 읽는다. 기대한 자리에 기대한 블록이 없거나 이력
  * 경계가 애매하면 null → 호출자는 원본을 그대로 저장한다. 이력 안에 닫는
  * 태그가 인용된 경우엔 null이거나 이력을 조금 더 남길 뿐, 이번 턴은 자르지 않는다.
@@ -40,7 +47,16 @@ const TURN_OPEN = /^\s*<(?:what-you-were-working-on|buzz-events?|new-message-arr
 const TURN_IN_DROPPED = /(?:^|>)[ \t]*<(?:what-you-were-working-on|buzz-events?|new-message-arrived-while-you-were-working)[\s>]/m;
 
 const CONTEXT_OPEN = /^<context>\r?\n/;
+
+/**
+ * 설명서 없는 봉투를 버즈 턴으로 인정하는 표식: <context> 첫 줄이 Scope이고,
+ * Channel 줄이 채널 uuid로 끝난다 (실데이터 915건 전부 이 모양).
+ */
+const BUZZ_SCOPE = /^Scope: (?:thread|channel|dm)\r?\n/;
+const BUZZ_CHANNEL = /(?:^|\n)Channel: .+ \(#[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\)\r?(?=\n|$)/;
 const CONTEXT_CLOSE = "\n</context>";
+/** 이력 속 인용 한 건 — buzz-acp가 `[n] 이름 (pubkey) (시각): 본문` 으로 붙인다 (본문은 자르지 않음). */
+const QUOTE_ENTRY = /^\[(\d+)\] .*? \(([0-9a-f]{64})\) \((\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))\): ?/;
 
 /**
  * Nostr 이벤트 꼬리표 줄 (hex 태그 배열 / 파싱 요약) — 사람 말이 아님.
@@ -80,10 +96,12 @@ function locateBuzzContext(text: string): { rest: string; pos: number } | null {
   return CONTEXT_OPEN.test(rest.slice(pos, pos + 12)) ? { rest, pos } : null;
 }
 
-export function cleanBuzzEnvelope(message: string): string | null {
+export function cleanBuzzEnvelope(message: string, opts: { baseless?: boolean } = {}): string | null {
   try {
     const text = message.trimStart();
-    if (!text.startsWith("<base>")) return null;
+    const hasBase = text.startsWith("<base>");
+    // 설명서 없는 봉투는 호출자가 이력 보존을 확인했을 때만(buzz-ingest의 인용 확인) 정리한다
+    if (!hasBase && !opts.baseless) return null;
     const loc = locateBuzzContext(text);
     if (!loc) return null;
     const { rest, pos } = loc;
@@ -91,7 +109,8 @@ export function cleanBuzzEnvelope(message: string): string | null {
     const bodyStart = rest.indexOf("\n", pos) + 1;
     const contextClose = rest.indexOf(CONTEXT_CLOSE, bodyStart - 1);
     if (contextClose < 0) return null;
-    const contextBody = rest.slice(bodyStart, contextClose).replace(/\r$/, "");
+    const contextBody = rest.slice(bodyStart, contextClose).replace(/\r+$/, "");
+    if (!hasBase && !(BUZZ_SCOPE.test(contextBody) && BUZZ_CHANNEL.test(contextBody))) return null;
     const tail = rest.slice(contextClose + CONTEXT_CLOSE.length);
 
     let turnStart = 0;
@@ -121,6 +140,51 @@ export function cleanBuzzEnvelope(message: string): string | null {
     const cleaned = `<context>\n${contextBody}\n</context>\n\n${turnText}`;
     if (cleaned.length >= message.length) return null;
     return cleaned;
+  } catch {
+    return null;
+  }
+}
+
+/** 이력 속 인용 한 건 (buzzQuotedMessages가 돌려줌). */
+export interface BuzzQuote {
+  pubkey: string;
+  /** ISO 시각 (버즈 이벤트 created_at, 초 단위) */
+  time: string;
+  content: string;
+}
+
+/**
+ * 버즈용: cleanBuzzEnvelope가 걷어낼 이력(<thread-context>/<conversation-context>) 속 인용 글.
+ * 정리기와 같은 자리(<context> 바로 뒤 첫 이력 블록, 첫 닫는 태그까지)를 읽는다.
+ * 이력이 없으면 [], 모양을 모르면 null → 호출자는 정리하지 않는다.
+ */
+export function buzzQuotedMessages(message: string): BuzzQuote[] | null {
+  try {
+    const loc = locateBuzzContext(message.trimStart());
+    if (!loc) return null;
+    const { rest, pos } = loc;
+    const contextClose = rest.indexOf(CONTEXT_CLOSE, pos);
+    if (contextClose < 0) return null;
+    const tail = rest.slice(contextClose + CONTEXT_CLOSE.length);
+    const history = HISTORY_OPEN.exec(tail);
+    if (!history) return [];
+    const closeTag = `</${history[1]}>`;
+    const close = tail.indexOf(closeTag, history[0].length);
+    if (close < 0) return null;
+    const body = tail.slice(history[0].length, close).replace(/^\r?\n/, "").replace(/\r?\n$/, "");
+    if (!body.trim()) return [];
+    const out: BuzzQuote[] = [];
+    for (const line of body.split(/\r?\n/)) {
+      const e = QUOTE_ENTRY.exec(line);
+      if (e && Number(e[1]) === out.length + 1) {
+        out.push({ pubkey: e[2], time: e[3], content: line.slice(e[0].length) });
+      } else if (out.length > 0) {
+        out[out.length - 1].content += "\n" + line;
+      } else {
+        return null;
+      }
+    }
+    return out;
   } catch {
     return null;
   }
