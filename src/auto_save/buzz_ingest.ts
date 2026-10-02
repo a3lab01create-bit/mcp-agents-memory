@@ -103,8 +103,20 @@ export interface BuzzIngestReport {
   envelopesReady: number;
   /** 이력이 있는데 이 단계로는 못 정리하는 버즈 봉투 수 (인용 글이 같은 방 원본 행으로 다 있지 않거나 모양을 모름) */
   envelopesStuck: number;
+  /** envelopesStuck을 사유별로 (합 = envelopesStuck) */
+  envelopesStuckBy: StuckBreakdown;
   /** --dry-run 때만: 아직 가져오지 않는 종류의 글 수 (최신 한 쪽 기준). */
   unsupported?: number;
+}
+
+/** 못 정리한 봉투의 사유. 한 봉투는 하나로만 센다 (앞의 것 우선). */
+export interface StuckBreakdown {
+  /** 모양을 못 읽음 (정리기 거절·인용 줄·자리·시각, 본문이 다른 인용에 다음 번호 줄이 붙음) — 늘면 버즈 형식이 바뀐 신호, 고치면 풀린다 */
+  shape: number;
+  /** 같은 방·같은 초의 원본 행이 없는 인용이 있음 (CLI 신원이 못 보는 방 등) — 그 봉투가 유일한 사본이라 그대로 둔다 */
+  noRow: number;
+  /** 원본 행은 다 있는데 본문이 다른 인용이 있음 (대개 인용된 뒤에 고친 글) — 그대로 둔다 */
+  textDiffers: number;
 }
 
 class BuzzShapeError extends Error {}
@@ -456,12 +468,14 @@ async function healBaseEnvelopes(
  * message=정리본, raw_message=원문으로 바꾸고 태깅·임베딩을 다시 하게 한다. 나중에 고친 글을
  * 인용한 봉투(인용엔 고치기 전 문장)나 CLI 신원이 못 보는 방의 봉투는 그대로 둔다.
  * 원본 행이 숨겨진 글(버즈에서 지움)도 확인된 것으로 친다 — 버즈의 최신 상태를 따른다.
+ * 못 정리한 봉투는 사유별로 센다 — 늘어도 괜찮은 것(noRow·textDiffers)과 고쳐야 풀리는 것(shape)이
+ * 한 숫자에 섞이지 않게.
  */
 async function recleanEnvelopes(
   userId: number,
   budget: number,
   dryRun: boolean
-): Promise<{ recleaned: number; ready: number; stuck: number }> {
+): Promise<{ recleaned: number; ready: number; stuck: number; by: StuckBreakdown }> {
   const rows = (await db.query(
     `SELECT id, message, venue FROM memory
       WHERE user_id = $1 AND role = 'user' AND raw_message IS NULL AND message LIKE '<context>%'
@@ -469,9 +483,14 @@ async function recleanEnvelopes(
       ORDER BY created_at, id`,
     [userId]
   )).rows;
-  type Cand = { id: number; message: string; cleaned: string; venue: string; quotes: Array<{ ms: number; text: string }> };
+  type Cand = {
+    id: number; message: string; cleaned: string; venue: string; quotes: Array<{ ms: number; text: string }>;
+    /** 인용 본문에 다음 번호(`[k] `)로 시작하는 줄이 있음 — 못 읽은 인용 머리가 본문에 붙었을 수 있다 */
+    misread: boolean;
+  };
   const cands: Cand[] = [];
-  let stuck = 0; // 버즈 봉투인데 걷어낼 이력이 있고(또는 모양을 몰라) 이번 단계로는 못 정리하는 것
+  // 버즈 봉투인데 걷어낼 이력이 있고(또는 모양을 몰라) 이번 단계로는 못 정리하는 것
+  const by: StuckBreakdown = { shape: 0, noRow: 0, textDiffers: 0 };
   for (const r of rows) {
     const cleaned = cleanBuzzEnvelope(r.message, { baseless: true });
     const quotes = buzzQuotedMessages(r.message);
@@ -481,13 +500,15 @@ async function recleanEnvelopes(
       [r.venue, venueFromBuzzMessage(r.message)].find((v): v is string => typeof v === "string" && v.startsWith("buzz")) ?? null;
     const q = (quotes ?? []).map((x) => ({ ms: Date.parse(x.time), text: norm(x.content) }));
     if (cleaned === null || quotes === null || !venue || q.some((x) => !Number.isFinite(x.ms))) {
-      if (venue || looksLikeBuzzTurn(r.message)) stuck++;
+      if (venue || looksLikeBuzzTurn(r.message)) by.shape++;
       continue;
     }
-    cands.push({ id: Number(r.id), message: r.message, cleaned, venue, quotes: q });
+    const misread = quotes.some((x, i) => x.content.split("\n").some((line) => line.startsWith(`[${i + 2}] `)));
+    cands.push({ id: Number(r.id), message: r.message, cleaned, venue, quotes: q, misread });
   }
   const times = [...new Set(cands.flatMap((c) => c.quotes.map((x) => x.ms)))];
   const have = new Set<string>(); // venue \0 ms \0 본문
+  const slots = new Set<string>(); // venue \0 ms — 본문이 달라도 그 자리에 원본 행이 있는지
   if (times.length) {
     const r = await db.query(
       `SELECT venue, created_at, raw_message FROM memory
@@ -495,15 +516,24 @@ async function recleanEnvelopes(
           AND raw_message IS NOT NULL AND created_at = ANY($2::timestamptz[])`,
       [userId, times.map((ms) => new Date(ms).toISOString())]
     );
-    for (const row of r.rows) have.add(`${row.venue}\0${new Date(row.created_at).getTime()}\0${norm(row.raw_message)}`);
+    for (const row of r.rows) {
+      const slot = `${row.venue}\0${new Date(row.created_at).getTime()}`;
+      slots.add(slot);
+      have.add(`${slot}\0${norm(row.raw_message)}`);
+    }
   }
-  const ready = cands.filter((c) => c.quotes.every((x) => have.has(`${c.venue}\0${x.ms}\0${x.text}`)));
-  stuck += cands.length - ready.length;
+  const ready: Cand[] = [];
+  for (const c of cands) {
+    if (c.quotes.every((x) => have.has(`${c.venue}\0${x.ms}\0${x.text}`))) ready.push(c);
+    else if (c.quotes.some((x) => !slots.has(`${c.venue}\0${x.ms}`))) by.noRow++;
+    else if (c.misread) by.shape++; // 본문이 다른 게 수정 때문이 아니라 머리를 못 읽어서일 수 있다
+    else by.textDiffers++;
+  }
   let n = 0;
   for (const c of ready.slice(0, Math.max(0, budget))) {
     if (dryRun || (await replaceWithCleaned(c.id, c.cleaned, c.message, c.venue))) n++;
   }
-  return { recleaned: n, ready: ready.length - n, stuck };
+  return { recleaned: n, ready: ready.length - n, stuck: by.shape + by.noRow + by.textDiffers, by };
 }
 
 export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzIngestReport> {
@@ -556,6 +586,7 @@ export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzI
     recleaned: 0,
     envelopesReady: 0,
     envelopesStuck: 0,
+    envelopesStuckBy: { shape: 0, noRow: 0, textDiffers: 0 },
     byVenue: {},
     ...(dryRun ? { unsupported } : {}),
   };
@@ -603,6 +634,7 @@ export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzI
     report.recleaned = env.recleaned;
     report.envelopesReady = env.ready;
     report.envelopesStuck = env.stuck;
+    report.envelopesStuckBy = env.by;
   }
   return report;
 }

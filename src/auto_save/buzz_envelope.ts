@@ -55,8 +55,13 @@ const CONTEXT_OPEN = /^<context>\r?\n/;
 const BUZZ_SCOPE = /^Scope: (?:thread|channel|dm)\r?\n/;
 const BUZZ_CHANNEL = /(?:^|\n)Channel: .+ \(#[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\)\r?(?=\n|$)/;
 const CONTEXT_CLOSE = "\n</context>";
-/** 이력 속 인용 한 건 — buzz-acp가 `[n] 이름 (pubkey) (시각): 본문` 으로 붙인다 (본문은 자르지 않음). */
-const QUOTE_ENTRY = /^\[(\d+)\] .*? \(([0-9a-f]{64})\) \((\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))\): ?/;
+/**
+ * 이력 속 인용 한 건 — buzz-acp가 `[n] 이름 (pubkey) (시각): 본문` 으로 붙인다 (본문은 자르지 않음).
+ * 이름이 없으면 `[n] pubkey (시각): 본문` (관측: hermes 2건, 09-26·09-30). 이름 없는 쪽을 먼저 본다 —
+ * 반대 순서면 이름 칸의 `.*?`가 본문 속 머리 모양까지 건너가 엉뚱한 pubkey·시각을 집는다.
+ */
+const QUOTE_ENTRY =
+  /^\[(\d+)\] (?:([0-9a-f]{64})|.*? \(([0-9a-f]{64})\)) \((\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d))\): ?/;
 
 /**
  * Nostr 이벤트 꼬리표 줄 (hex 태그 배열 / 파싱 요약) — 사람 말이 아님.
@@ -177,7 +182,7 @@ export function buzzQuotedMessages(message: string): BuzzQuote[] | null {
     for (const line of body.split(/\r?\n/)) {
       const e = QUOTE_ENTRY.exec(line);
       if (e && Number(e[1]) === out.length + 1) {
-        out.push({ pubkey: e[2], time: e[3], content: line.slice(e[0].length) });
+        out.push({ pubkey: e[2] ?? e[3], time: e[4], content: line.slice(e[0].length) });
       } else if (out.length > 0) {
         out[out.length - 1].content += "\n" + line;
       } else {
