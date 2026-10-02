@@ -26,6 +26,8 @@
  * 삭제(kind 5 / 9005)는 행을 지우지 않고 숨긴다(is_active=false).
  * 원본 행이 쌓이면 설명서 없는 봉투(<context>부터)의 이력(인용)을 걷어낸다 — 인용 글이 전부
  * 원본 행(같은 초·같은 본문)으로 있을 때만. 실행당 새 글을 넣고 남은 예산만큼.
+ * 그 전에, 저장 순간 정리가 빠진 설명서 봉투(<base>)를 같은 규칙으로 고친다(자가 치유) —
+ * 업그레이드 전 코드로 떠 있는 기억 서버가 먼저 받아 적은 경우.
  * 모든 CLI 호출이 첫 쓰기 전에 끝난다 — 출력 모양이 예상과 다르면 아무것도 쓰지 않고
  * 에러로 끝난다. 버즈가 바뀐 것이니 감시 쪽이 알아채고 그때 맞춘다.
  *
@@ -40,6 +42,7 @@ import { execFile } from "node:child_process";
 import { db } from "../db.js";
 import { insertRawMemory } from "../hot_path.js";
 import { buzzQuotedMessages, cleanBuzzEnvelope, looksLikeBuzzTurn, venueFromBuzzMessage } from "./buzz_envelope.js";
+import { buzzTurnVenue } from "./venue.js";
 import { getDefaultUserId } from "../users.js";
 
 const KIND_CHAT = 9;
@@ -75,7 +78,7 @@ export interface BuzzIngestOptions {
   dryRun?: boolean;
   /** 한 번에 넣을 새 글 최대 건수 (오래된 것부터). 봉투 정리도 남은 몫 안에서 한다. */
   max?: number;
-  /** 설명서 없는 봉투 정리 단계를 끈다. */
+  /** 봉투 단계 둘(설명서 봉투 자가 치유, 설명서 없는 봉투 이력 걷기)을 끈다. */
   noReclean?: boolean;
 }
 
@@ -86,6 +89,14 @@ export interface BuzzIngestReport {
   edited: number;
   hidden: number;
   byVenue: Record<string, number>;
+  /** 저장 순간 정리가 빠진 설명서 봉투(<base>)를 고친 수 — 옛 코드 서버가 먼저 받아 적은 것 */
+  healed: number;
+  /** 고친 행을 받아 적은 기기별 수 — 0이 아니면 그 기기에 업그레이드 전 기억 서버가 아직 떠 있다 */
+  healedByDevice: Record<string, number>;
+  /** 고칠 수 있지만 이번 예산을 넘었거나 잠금에 걸려 다음 실행으로 미룬 수 */
+  healReady: number;
+  /** 정리기가 거절한 설명서 봉투 수 (형식이 바뀐 신호) */
+  healRejected: number;
   /** 이력을 걷어낸 설명서 없는 봉투 수 */
   recleaned: number;
   /** 정리할 수 있지만 이번 예산을 넘어 다음 실행으로 미룬 봉투 수 */
@@ -366,12 +377,85 @@ async function hideDeleted(targets: string[], dryRun: boolean): Promise<number> 
 const norm = (s: string) => s.replace(/\s+/g, " ").trim();
 
 /**
+ * 봉투 행을 정리본으로 바꾼다 (원문은 raw_message, 빈 자리 칸은 채움, 봉투째 붙었던 태그는 비우고
+ * 태깅·임베딩 다시 — manage_knowledge update가 본문을 바꿀 때와 같다).
+ * 그 사이 행이 바뀌었으면(이미 정리됨 등) 손대지 않는다. 콜드패스 워커가 그 행을 잡고 있으면
+ * 2초만 기다리고, 넘으면 false — 다음 실행에 한다.
+ */
+async function replaceWithCleaned(id: number, cleaned: string, original: string, venue: string | null): Promise<boolean> {
+  const client = await db.getClient();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL lock_timeout = '2s'");
+    const r = await client.query(
+      `UPDATE memory
+          SET message = $2, raw_message = $3, venue = coalesce(venue, $4),
+              p_tag_id = NULL, d_tag = '{}', tag_processed = FALSE, embedding = NULL, cold_error = NULL
+        WHERE id = $1 AND raw_message IS NULL AND message = $3`,
+      [id, cleaned, original, venue]
+    );
+    await client.query("COMMIT");
+    client.release();
+    return (r.rowCount ?? 0) > 0;
+  } catch (err) {
+    // 끊긴 연결(ROLLBACK도 실패)은 풀에 돌려주지 않고 버린다
+    let broken: Error | undefined;
+    await client.query("ROLLBACK").catch((e) => (broken = e as Error));
+    client.release(broken);
+    if ((err as { code?: string }).code !== "55P03") throw err; // 잠금 대기 초과 → 다음 실행에
+    return false;
+  }
+}
+
+/**
+ * 자가 치유: 설명서 봉투(<base>)는 저장 순간에 정리되는데, 업그레이드 전 코드로 오래 떠 있는
+ * 기억 서버가 먼저 받아 적으면 정리 없이(자리 칸도 빈 채) 남는다. 여러 서버가 같은 기록을
+ * 선착순으로 줍기 때문이다. 저장 순간과 같은 규칙(cleanBuzzEnvelope 기본값, 자리는 buzzTurnVenue)으로
+ * 고친다. 정리기가 거절하는 봉투(형식이 바뀜)는 그대로 둔다 — 감시가 그걸 보고 알린다.
+ */
+async function healBaseEnvelopes(
+  userId: number,
+  budget: number,
+  dryRun: boolean
+): Promise<{ healed: number; byDevice: Record<string, number>; ready: number; rejected: number }> {
+  const rows = (await db.query(
+    `SELECT id, message, device_name FROM memory
+      WHERE user_id = $1 AND role = 'user' AND raw_message IS NULL AND message ~ '^\\s*<base>'
+        AND agent_platform <> 'buzz' AND is_active AND NOT is_pinned
+      ORDER BY created_at, id`,
+    [userId]
+  )).rows;
+  const byDevice: Record<string, number> = {};
+  let healed = 0;
+  let ready = 0;
+  let rejected = 0;
+  for (const r of rows) {
+    const cleaned = cleanBuzzEnvelope(r.message);
+    if (cleaned === null) {
+      rejected++; // 형식이 바뀐 봉투 — 감시가 알린다
+      continue;
+    }
+    if (healed >= budget) {
+      ready++;
+      continue;
+    }
+    if (dryRun || (await replaceWithCleaned(Number(r.id), cleaned, r.message, buzzTurnVenue(cleaned)))) {
+      healed++;
+      const d = r.device_name ?? "unknown";
+      byDevice[d] = (byDevice[d] ?? 0) + 1;
+    } else {
+      ready++;
+    }
+  }
+  return { healed, byDevice, ready, rejected };
+}
+
+/**
  * 설명서 없는 봉투 정리. 봉투의 이력(인용)이 에이전트 버즈 답글의 유일한 사본일 수 있어서 저장
  * 순간엔 정리하지 않고, 인용 글이 전부 같은 방·같은 초·같은 본문의 버즈 원본 행으로 있을 때만
  * message=정리본, raw_message=원문으로 바꾸고 태깅·임베딩을 다시 하게 한다. 나중에 고친 글을
  * 인용한 봉투(인용엔 고치기 전 문장)나 CLI 신원이 못 보는 방의 봉투는 그대로 둔다.
  * 원본 행이 숨겨진 글(버즈에서 지움)도 확인된 것으로 친다 — 버즈의 최신 상태를 따른다.
- * 콜드패스 워커가 그 행을 잡고 있으면 2초만 기다리고, 넘으면 다음 실행에 한다.
  */
 async function recleanEnvelopes(
   userId: number,
@@ -417,28 +501,7 @@ async function recleanEnvelopes(
   stuck += cands.length - ready.length;
   let n = 0;
   for (const c of ready.slice(0, Math.max(0, budget))) {
-    if (dryRun) {
-      n++;
-      continue;
-    }
-    const client = await db.getClient();
-    try {
-      await client.query("BEGIN");
-      await client.query("SET LOCAL lock_timeout = '2s'");
-      const r = await client.query(
-        `UPDATE memory
-            SET message = $2, raw_message = $3, tag_processed = FALSE, embedding = NULL, cold_error = NULL
-          WHERE id = $1 AND raw_message IS NULL AND message = $3`,
-        [c.id, c.cleaned, c.message]
-      );
-      await client.query("COMMIT");
-      n += r.rowCount ?? 0;
-    } catch (err) {
-      await client.query("ROLLBACK").catch(() => {});
-      if ((err as { code?: string }).code !== "55P03") throw err; // 잠금 대기 초과 → 다음 실행에
-    } finally {
-      client.release();
-    }
+    if (dryRun || (await replaceWithCleaned(c.id, c.cleaned, c.message, c.venue))) n++;
   }
   return { recleaned: n, ready: ready.length - n, stuck };
 }
@@ -486,6 +549,10 @@ export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzI
     inserted: 0,
     edited: 0,
     hidden: 0,
+    healed: 0,
+    healedByDevice: {},
+    healReady: 0,
+    healRejected: 0,
     recleaned: 0,
     envelopesReady: 0,
     envelopesStuck: 0,
@@ -523,10 +590,16 @@ export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzI
   }
   report.edited = await applyEdits(latestEdits(edits), dryRun);
   report.hidden = await hideDeleted([...deleteTargets], dryRun);
-  // 5) 새 글을 넣고 남은 예산만큼 봉투 이력 걷어내기 (DB만). 실제 실행은 새 원본 행이 들어간 뒤라
-  //    방금 인용도 확인된다; --dry-run은 이번 새 글을 안 넣으므로 그만큼 적게 센다.
+  // 5) 새 글을 넣고 남은 예산만큼 봉투 단계 (DB만): 먼저 정리가 빠진 설명서 봉투 자가 치유, 그다음
+  //    설명서 없는 봉투 이력 걷어내기. 실제 실행은 새 원본 행이 들어간 뒤라 방금 인용도 확인된다;
+  //    --dry-run은 이번 새 글을 안 넣으므로 그만큼 적게 센다.
   if (!opts.noReclean && userId > 0) {
-    const env = await recleanEnvelopes(userId, max - batch.length, dryRun);
+    const heal = await healBaseEnvelopes(userId, max - batch.length, dryRun);
+    report.healed = heal.healed;
+    report.healedByDevice = heal.byDevice;
+    report.healReady = heal.ready;
+    report.healRejected = heal.rejected;
+    const env = await recleanEnvelopes(userId, max - batch.length - heal.healed, dryRun);
     report.recleaned = env.recleaned;
     report.envelopesReady = env.ready;
     report.envelopesStuck = env.stuck;

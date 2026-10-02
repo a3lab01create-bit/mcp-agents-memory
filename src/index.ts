@@ -239,7 +239,7 @@ Usage:
                                     into memory, one row per message, via the official \`buzz\` CLI. Oldest first, at most
                                     N per run (default 20). With the remaining budget it also strips the quoted history
                                     from captured Buzz turns once every quoted message exists as a row (original kept in
-                                    raw_message; --no-reclean skips this). Needs BUZZ_RELAY_URL, BUZZ_PRIVATE_KEY and BUZZ_INGEST_OWNER
+                                    raw_message), and fixes Buzz envelopes an older server stored uncleaned; --no-reclean skips both. Needs BUZZ_RELAY_URL, BUZZ_PRIVATE_KEY and BUZZ_INGEST_OWNER
                                     (the memory owner's pubkeys, comma-separated) in the environment of this command only —
                                     not in the shared .env; optional BUZZ_CLI.
   mcp-agents-memory help            Show this message.

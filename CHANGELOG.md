@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.9.22 — 2026-10-02
+
+### Self-heal Buzz envelopes stored by an older server (Buzz only)
+
+Every MCP server on a machine watches the shared transcript roots (Grok,
+Antigravity, Codex, Gemini, …) and the first one to see a line stores it
+(deduplicated by `external_uuid`). After an upgrade, a long-lived session can
+keep an older server running, so it sometimes wins the race and stores a
+`<base>` Buzz envelope uncleaned and without a venue.
+
+- `buzz-ingest` now repairs those rows first (before the base-less step, from
+  the same per-run budget): a `user` row of the memory owner that still starts
+  with `<base>` (leading whitespace allowed) and has no `raw_message` is cleaned
+  with the same rule as capture time (`cleanBuzzEnvelope` default), the
+  original goes to `raw_message`, an empty `venue` is filled the way capture
+  would have (`buzzTurnVenue`), and the row is re-tagged and re-embedded.
+- An envelope the cleaner rejects (an unknown shape, i.e. Buzz changed) is left
+  as it is, so a watcher that looks for uncleaned `<base>` rows now only hears
+  about real format changes.
+- Both envelope steps fill an empty `venue` and clear the project tag and
+  d_tags computed from the old text when they rewrite a row (as
+  `manage_knowledge update` does).
+- The run report adds `healed`, `healedByDevice` (a non-zero count means a
+  pre-upgrade memory server is still running on that device — restart it),
+  `healReady` (deferred by budget or a row lock) and `healRejected` (rows the
+  cleaner refuses: the format-change signal). `--no-reclean` turns off both
+  envelope steps.
+
 ## 0.9.21 — 2026-10-01
 
 ### Base-less Buzz envelopes cleaned once their quotes exist as rows (Buzz only)
