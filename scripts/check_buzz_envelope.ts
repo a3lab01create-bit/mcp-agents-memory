@@ -224,6 +224,25 @@ check("인용 읽기: 정리기가 걷어낼 이력 속 글만, 여러 줄 본�
   assert.deepEqual(buzzQuotedMessages([CONTEXT, turnQuote].join("\n")), [], "이번 턴 안의 인용 모양은 안 읽음");
 });
 
+check("인용 읽기: 이름 없는 머리(`[n] pubkey (시각): 본문`)도, 이름 있는 머리와 섞여도", () => {
+  const nameless = QUOTES.replace(`[1] Owner (${HEX})`, `[1] ${HEX}`);
+  assert.deepEqual(buzzQuotedMessages([CONTEXT, nameless, EVENT].join("\n")), [
+    { pubkey: HEX, time: "2026-09-30T11:24:02+00:00", content: "첫 줄\n둘째 줄 [2] 아님" },
+    { pubkey: QHEX, time: "2026-09-30T11:25:00+00:00", content: "답글" },
+  ]);
+  const one = (head: string) =>
+    buzzQuotedMessages([CONTEXT, '<thread-context included="1">', `${head} (2026-09-30T11:24:02Z): x`, "</thread-context>", EVENT].join("\n"));
+  assert.equal(one(`[1] ${HEX})`), null, "닫는 괄호만");
+  assert.equal(one(`[1] O (${HEX}`), null, "여는 괄호만");
+  assert.equal(one(`[1] ${HEX.slice(1)}`), null, "63자리");
+  // 본문에 이름 있는 머리 모양이 들어 있어도 이름 없는 머리 자신의 pubkey·시각을 집는다
+  const inner = `see Bob (${QHEX}) (2026-09-01T00:00:00Z): tail`;
+  assert.deepEqual(
+    buzzQuotedMessages([CONTEXT, '<thread-context included="1">', `[1] ${HEX} (2026-09-30T11:24:02Z): ${inner}`, "</thread-context>", EVENT].join("\n")),
+    [{ pubkey: HEX, time: "2026-09-30T11:24:02Z", content: inner }]
+  );
+});
+
 check("인용 읽기: 모양을 모르면 null (→ 정리 안 함)", () => {
   assert.equal(buzzQuotedMessages([CONTEXT, HISTORY, EVENT].join("\n")), null, "번호 줄이 아닌 이력");
   assert.equal(buzzQuotedMessages([CONTEXT, '<thread-context included="1">', `[1] O (${HEX}) (2026-09-30T11:24:02Z): x`, EVENT].join("\n")), null, "이력이 안 닫힘");

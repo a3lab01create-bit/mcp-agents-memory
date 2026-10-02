@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.9.23 — 2026-10-02
+
+### Why a Buzz envelope stays uncleaned, by reason (Buzz only)
+
+`envelopesStuck` mixed envelopes that must stay as they are with envelopes the
+parser could not read, so a stuck count of 25 said nothing about whether
+anything needed fixing.
+
+- The run report adds `envelopesStuckBy` (one reason per envelope; the sum is
+  `envelopesStuck`, which is unchanged so existing watchers keep working):
+  - `shape` — the cleaner, the quote reader, the room or a quote time could not
+    be read, or a quote whose text differs carries a line starting with the next
+    entry number (`[k] `), i.e. a later header the reader may have missed. A
+    rise here means the Buzz format changed and the code needs a fix.
+  - `noRow` — a quoted message has no `buzz:` row in the same room and second,
+    e.g. a DM the CLI identity is not a member of. The envelope is the only copy,
+    so it stays.
+  - `textDiffers` — every quoted message has a row there, but some text differs,
+    usually because the message was edited after it was quoted. It stays, as
+    0.9.21 documented.
+- `buzzQuotedMessages()` also reads a quote header without a display name,
+  `[n] <pubkey> (<time>): text` (seen twice from Hermes), alone or mixed with
+  named headers. It is tried before the named form, so a header-like phrase in
+  the quoted text cannot supply the pubkey or time. A malformed first header
+  still returns null; a malformed later one stays as text of the previous quote
+  (and is counted under `shape` above).
+
+On the production memory this turns 25 stuck into 2 cleanable + 23 stuck
+(`shape` 2 / `noRow` 9 / `textDiffers` 12). The 2 left under `shape` are
+envelopes whose quoted message itself discusses envelope tags, which the
+cleaner's boundary guard refuses on purpose.
+
 ## 0.9.22 — 2026-10-02
 
 ### Self-heal Buzz envelopes stored by an older server (Buzz only)
