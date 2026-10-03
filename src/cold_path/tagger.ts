@@ -14,6 +14,7 @@ import { db } from "../db.js";
 import { callRole, callSpec, ROLE_REGISTRY, type ModelSpec } from "../model_registry.js";
 import { judgeProjectTag, shouldApplyJevJudgment } from "./jev_judge.js";
 import { getPrompt } from "../prompts/index.js";
+import { isRejectedNewTagName } from "./dtag_promoter.js";
 
 // local 프로바이더 사용 시 실패하면 grok으로 fallback (LOCAL_GROK_FALLBACK=false 로 끄기 가능)
 const GROK_FALLBACK_SPEC: ModelSpec = { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' };
@@ -249,7 +250,10 @@ export async function tagMessage(input: TagInput): Promise<TagResult> {
   if (parsed.p_tag && typeof parsed.p_tag === 'string') {
     if (parsed.p_tag.startsWith('NEW:')) {
       const newName = parsed.p_tag.slice(4).trim();
-      if (newName) {
+      if (newName && await isRejectedNewTagName(newName)) {
+        // 사람이 새 태그 제안에서 반려한 이름은 태거도 만들지 않는다 (0.9.25 — 반려는 영구)
+        console.error(`⚠️ [Tagger] "${newName}"은(는) 사람이 반려한 태그 이름이라 만들지 않음. p_tag NULL.`);
+      } else if (newName) {
         p_tag_id = await getOrCreateProjectTag(newName);
         newly_created_p_tag_name = newName;
       }
