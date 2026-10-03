@@ -34,6 +34,7 @@ const PREVIEW_COMPACT = 100;            // pinned·whispers·inject (캡 민감 
 const PREVIEW_RECENT = 300;             // full-mode 현재기기 Recent (캡 없는 툴 응답 → 두껍게)
 const ACTIVE_PTAG_LIMIT = 5;            // 활성 프로젝트 태그 top N
 const PENDING_ALIAS_SUGGESTION_LIMIT = 2; // brief에 노출할 대기 별칭 제안 top N (Stage 2 confirm 게이트)
+const PENDING_NEW_TAG_LIMIT = 2;        // brief에 노출할 새 프로젝트 태그 제안 top N (generic 추천만 빼고: project·unsure·추천 없음)
 const PINNED_LIMIT = 10;                // 고정 메모리 top N (full brief)
 const INJECT_PINNED_LIMIT = 5;          // inject 모드 인라인 고정 메모리 최신 N개
 // full brief(memory_startup tool) 최대 길이. 클라가 안 자르는 툴 응답이므로 넉넉히 —
@@ -60,6 +61,8 @@ export interface BriefData {
   pinned_memories: BriefMessage[];
   /** 사용자 확인 대기 별칭 제안 (Stage 2 confirm 게이트, 최신 top N) */
   pending_alias_suggestions: Array<{ id: number; source: string; target: string; relation: string; confidence: number }>;
+  /** 사용자 확인 대기 새 프로젝트 태그 제안 (generic 추천 제외 — project 먼저, top N) */
+  pending_new_tags: Array<{ id: number; name: string; uses: number; recommendation: string | null }>;
   /** currentPlatform 메시지 (또는 currentPlatform 없을 땐 cross-platform 통합). */
   recent_messages_current: BriefMessage[];
   /** 타 platform 메시지 (currentPlatform 있을 때만 채워짐, 없으면 빈 배열). */
@@ -189,11 +192,34 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
     [userId, PENDING_ALIAS_SUGGESTION_LIMIT]
   );
 
+  // 새 프로젝트 태그 제안 (0.9.25). 마이그레이션 030 전의 DB에서도 브리핑이 깨지지 않게 실패는 빈 목록.
+  let newTags: any[] = [];
+  try {
+    const r = await db.query(
+      `SELECT id, name, uses, recommendation
+         FROM project_tag_new_suggestions
+        WHERE user_id = $1 AND status = 'pending'
+          AND recommendation IS DISTINCT FROM 'generic'
+        ORDER BY (recommendation = 'project') DESC NULLS LAST, uses DESC
+        LIMIT $2`,
+      [userId, PENDING_NEW_TAG_LIMIT]
+    );
+    newTags = r.rows;
+  } catch {
+    newTags = [];
+  }
+
   return {
     user_name: user.user_name,
     core_profile: user.core_profile,
     sub_profile: user.sub_profile,
     pinned_memories: pinnedMsgs.rows.map(rowToMsg),
+    pending_new_tags: newTags.map((r: any) => ({
+      id: Number(r.id),
+      name: String(r.name),
+      uses: Number(r.uses),
+      recommendation: r.recommendation ?? null,
+    })),
     pending_alias_suggestions: aliasSugg.rows.map((r: any) => ({
       id: Number(r.id),
       source: String(r.source),
@@ -280,10 +306,13 @@ function formatBriefFull(brief: BriefData): string {
     }
     gLines.push('');
   }
-  if (brief.pending_alias_suggestions.length > 0) {
+  if (brief.pending_alias_suggestions.length > 0 || brief.pending_new_tags.length > 0) {
     gLines.push('## Project Tag Suggestions (사용자 확인 필요)');
     for (const s of brief.pending_alias_suggestions) {
       gLines.push(`- [${s.id}] \`${s.source}\` → \`${s.target}\` 같은 프로젝트로 보임 (${s.relation}, conf ${s.confidence}). 맞으면 \`manage_project_tags({action:"confirm_alias",suggestion_id:${s.id}})\`, 아니면 \`reject_alias\`.`);
+    }
+    for (const t of brief.pending_new_tags) {
+      gLines.push(`- [new ${t.id}] \`${t.name}\` 새 프로젝트 태그 후보 (${t.uses}회, 추천 ${t.recommendation ?? '없음'}). 맞으면 \`manage_project_tags({action:"confirm_new_tag",suggestion_id:${t.id}})\`, 아니면 \`reject_new_tag\`.`);
     }
     gLines.push('');
   }

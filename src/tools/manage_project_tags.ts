@@ -9,6 +9,10 @@
  * confirm_alias and set_alias deliberately reuse applyAliasSuggestion() so the
  * write-side cycle guard, supersede behavior, and tagger cache invalidation
  * stay centralized in project_alias_promoter.ts.
+ *
+ * New project tag suggestions (0.9.25, dtag_promoter.ts): the d_tag promoter no
+ * longer creates project tags itself; it leaves a suggestion with a
+ * recommendation (project / generic / unsure) and a person decides here.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -17,6 +21,12 @@ import { db } from "../db.js";
 import { getDefaultUserId } from "../users.js";
 import { applyAliasSuggestion } from "../cold_path/project_alias_promoter.js";
 import { invalidateCandidateCache } from "../cold_path/tagger.js";
+import {
+  confirmNewTagSuggestion,
+  rejectNewTagSuggestion,
+  type NewTagDecision,
+} from "../cold_path/dtag_promoter.js";
+import { parseRecommendation, planApplyRecommendations } from "../cold_path/dtag_suggest_gate.js";
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
@@ -197,6 +207,84 @@ async function rejectAlias(userId: number, suggestionId: number, reason: string 
   });
 }
 
+async function listNewTags(userId: number, status: string, limit: number) {
+  const result = await db.query(
+    `SELECT id, name, uses, recommendation, rationale, created_at, last_seen_at,
+            decided_by, decision_reason, decided_at
+       FROM project_tag_new_suggestions
+      WHERE user_id = $1
+        AND status = $2
+      ORDER BY created_at DESC
+      LIMIT $3`,
+    [userId, status, limit]
+  );
+  const suggestions = result.rows.map((row: any) => ({
+    suggestion_id: Number(row.id),
+    name: String(row.name),
+    uses: Number(row.uses),
+    recommendation: row.recommendation ?? null,
+    rationale: String(row.rationale ?? ""),
+    created_at: row.created_at,
+    last_seen_at: row.last_seen_at,
+    decided_by: row.decided_by ?? null,
+    decision_reason: row.decision_reason ?? null,
+    decided_at: row.decided_at ?? null,
+  }));
+  return ok({ action: "list_new_tags", status, limit, count: suggestions.length, suggestions });
+}
+
+function decisionResult(action: string, result: NewTagDecision) {
+  if (result.error) return toolError(result.error, { action, ...result });
+  return ok({ action, ...result });
+}
+
+/**
+ * "추천대로" — 사람에게 보여 준 번호만 처리한다: project=승인, generic=반려, unsure·추천 없음=그대로.
+ * 번호를 받는 이유: 보여 준 뒤에 새로 생긴 제안까지 사람이 본 적 없이 처리하지 않게.
+ */
+async function applyRecommendations(userId: number, ids: number[], reason: string | undefined) {
+  const rows = await db.query(
+    `SELECT id, name, status, recommendation
+       FROM project_tag_new_suggestions
+      WHERE user_id = $1
+        AND id = ANY($2::bigint[])`,
+    [userId, ids]
+  );
+  const names = new Map<number, string>(rows.rows.map((r: any) => [Number(r.id), String(r.name)]));
+  const plan = planApplyRecommendations(
+    ids,
+    rows.rows.map((r: any) => ({
+      id: Number(r.id),
+      status: String(r.status),
+      recommendation: parseRecommendation(r.recommendation),
+    }))
+  );
+  const why = reason ? `apply_recommendations: ${reason}` : "apply_recommendations";
+  const confirmed: NewTagDecision[] = [];
+  const rejected: NewTagDecision[] = [];
+  const failed: NewTagDecision[] = [];
+  // 한 번호가 실패해도 나머지는 계속하고, 어느 번호가 실패했는지 남긴다
+  const decide = async (id: number, fn: typeof confirmNewTagSuggestion, done: NewTagDecision[]) => {
+    try {
+      const r = await fn(userId, id, { decidedBy: "user", reason: why });
+      (r.error ? failed : done).push(r);
+    } catch (err) {
+      failed.push({ suggestion_id: id, name: names.get(id) ?? "", status: "error", error: errorDetail(err) });
+    }
+  };
+  for (const id of plan.confirm) await decide(id, confirmNewTagSuggestion, confirmed);
+  for (const id of plan.reject) await decide(id, rejectNewTagSuggestion, rejected);
+  const label = (id: number) => ({ suggestion_id: id, name: names.get(id) ?? null });
+  return ok({
+    action: "apply_recommendations",
+    confirmed,
+    rejected,
+    kept_pending: plan.keep.map(label),
+    skipped_not_pending: plan.skipped.map(label),
+    failed,
+  });
+}
+
 async function setAlias(
   userId: number,
   sourceTagName: string | undefined,
@@ -334,14 +422,20 @@ export function registerManageProjectTags(server: McpServer): void {
   server.registerTool(
     "manage_project_tags",
     {
-      description: `Project tag alias suggestion management tool (Stage 2 / DEVLOG §19).
+      description: `Project tag suggestion management tool (Stage 2 / DEVLOG §19).
 
-Actions:
+Alias suggestions (two existing tags look like the same project):
   - list_suggestions: list alias suggestions by status for the default user.
   - confirm_alias: confirm a pending suggestion through applyAliasSuggestion().
   - reject_alias: reject a pending suggestion.
   - set_alias: manually set source_tag as an alias of target_tag through a pending suggestion + applyAliasSuggestion().
-  - unset_alias: clear alias_of for one project tag.`,
+  - unset_alias: clear alias_of for one project tag.
+
+New project tag suggestions (a frequent d_tag that is not a project tag yet; ids are separate from alias ids):
+  - list_new_tags: list them by status (pending / confirmed / rejected / superseded). Each has a recommendation (project / generic / unsure) and uses = how often that d_tag was used in the window.
+  - confirm_new_tag: create the project tag and retro-tag untagged memories carrying that exact d_tag.
+  - reject_new_tag: reject it; a rejected name is never suggested again.
+  - apply_recommendations: when the user accepts the recommendations ("추천대로"), pass the suggestion_ids that were shown to them. project → confirmed, generic → rejected, unsure / no recommendation → left pending for the user to decide.`,
       inputSchema: {
         action: z.enum([
           "list_suggestions",
@@ -349,10 +443,15 @@ Actions:
           "reject_alias",
           "set_alias",
           "unset_alias",
+          "list_new_tags",
+          "confirm_new_tag",
+          "reject_new_tag",
+          "apply_recommendations",
         ]).describe("작업 종류"),
-        status: statusSchema.optional().describe("list_suggestions status filter (default pending)"),
-        limit: z.number().int().min(1).max(MAX_LIMIT).optional().describe(`list_suggestions limit (default ${DEFAULT_LIMIT})`),
-        suggestion_id: z.number().int().positive().optional().describe("confirm_alias/reject_alias 대상 suggestion id"),
+        status: statusSchema.optional().describe("list_suggestions / list_new_tags status filter (default pending)"),
+        limit: z.number().int().min(1).max(MAX_LIMIT).optional().describe(`list_suggestions / list_new_tags limit (default ${DEFAULT_LIMIT})`),
+        suggestion_id: z.number().int().positive().optional().describe("confirm_alias/reject_alias/confirm_new_tag/reject_new_tag 대상 suggestion id"),
+        suggestion_ids: z.array(z.number().int().positive()).min(1).max(MAX_LIMIT).optional().describe("apply_recommendations: 사용자에게 보여 준 새 태그 제안 id 목록"),
         reason: z.string().optional().describe("confirm/reject/set decision reason"),
         source_tag: z.string().optional().describe("set_alias source project_tags.name"),
         target_tag: z.string().optional().describe("set_alias target project_tags.name"),
@@ -391,6 +490,25 @@ Actions:
 
         if (args.action === "unset_alias") {
           return unsetAlias(userId, args.tag);
+        }
+
+        if (args.action === "list_new_tags") {
+          return listNewTags(userId, args.status ?? "pending", args.limit ?? DEFAULT_LIMIT);
+        }
+
+        if (args.action === "confirm_new_tag" || args.action === "reject_new_tag") {
+          if (args.suggestion_id == null) {
+            return toolError(`suggestion_id is required for ${args.action}`);
+          }
+          const decide = args.action === "confirm_new_tag" ? confirmNewTagSuggestion : rejectNewTagSuggestion;
+          return decisionResult(args.action, await decide(userId, args.suggestion_id, { decidedBy: "user", reason: args.reason }));
+        }
+
+        if (args.action === "apply_recommendations") {
+          if (!args.suggestion_ids?.length) {
+            return toolError("suggestion_ids is required for apply_recommendations");
+          }
+          return applyRecommendations(userId, args.suggestion_ids, args.reason);
         }
 
         return toolError("unsupported action", { action: args.action });
