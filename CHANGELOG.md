@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.9.24 — 2026-10-03
+
+### A project-tag alias the user rejected is not proposed again
+
+The alias promoter judges only the top candidate pairs each run (default 12). A
+pair the user rejected kept its score, so it came back as a new pending
+suggestion (#332 rejected, the same pair returned 3 days later as #407) and
+took a slot from new candidates every run.
+
+- A direction (source → target) the user rejected (`decided_by = 'user'`) is
+  never proposed again. There is no expiry; to change the decision, set the
+  alias by hand (`manage_project_tags set_alias`), which does not go through
+  this rule.
+- The pair gets one more judgment after the rejection, and only a
+  reverse-direction result can reach pending (a reversed proposal was the right
+  fix once: pacefy → pacefy-e2503 rejected, then pacefy-e2503 → pacefy
+  confirmed). Once a row exists for the pair after the latest rejection, or both
+  directions were rejected by the user, the pair is dropped before candidates
+  are ranked, so it no longer takes one of the slots.
+- When the judge repeats a rejected direction, nothing goes to the pending queue;
+  a closed row (`rejected` by `system`, `signals.repeat_of_suggestion_id`)
+  records that the chance was used. This check reads the table again just before
+  writing, so a rejection made while the run was judging also counts.
+- Each run first closes pending suggestions that repeat a user-rejected
+  direction (for example ones an older server created before this release),
+  except rows the user is creating with `set_alias`.
+- Rejections are compared on canonical tag ids: a rejection carries over to the
+  tags each side is later merged into (after `youtube` was aliased into
+  `youtube-channel-analyzer`, the rejected `youtube → librarian-project` also
+  blocks `youtube-channel-analyzer → librarian-project`).
+- The alias guards (self-alias, cycle) now record their rejection as
+  `decided_by = 'system'` even when a user called `confirm_alias`/`set_alias`,
+  so a guard rejection is not mistaken for the user's decision. System
+  rejections do not block.
+- "Re-propose when there is new evidence" was considered and dropped: the
+  explicit-statement detection (keyword + tag-name substring) is loose enough
+  that talking about the tags counts as evidence (8 rejected pairs would have
+  reopened within 30 days, even counting only the owner's own words).
+- The run log line adds `blockedBeforeJudge`, `blockedAfterJudge` and `swept`.
+- `npm run check:alias` tests the rule (`src/cold_path/alias_reject_gate.ts`).
+
 ## 0.9.23 — 2026-10-02
 
 ### Why a Buzz envelope stays uncleaned, by reason (Buzz only)
