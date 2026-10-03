@@ -209,7 +209,7 @@ async function rejectAlias(userId: number, suggestionId: number, reason: string 
 
 async function listNewTags(userId: number, status: string, limit: number) {
   const result = await db.query(
-    `SELECT id, name, members, uses, recommendation, rationale, created_at, last_seen_at,
+    `SELECT id, name, uses, recommendation, rationale, created_at, last_seen_at,
             decided_by, decision_reason, decided_at
        FROM project_tag_new_suggestions
       WHERE user_id = $1
@@ -221,7 +221,6 @@ async function listNewTags(userId: number, status: string, limit: number) {
   const suggestions = result.rows.map((row: any) => ({
     suggestion_id: Number(row.id),
     name: String(row.name),
-    members: row.members ?? [],
     uses: Number(row.uses),
     recommendation: row.recommendation ?? null,
     rationale: String(row.rationale ?? ""),
@@ -433,8 +432,8 @@ Alias suggestions (two existing tags look like the same project):
   - unset_alias: clear alias_of for one project tag.
 
 New project tag suggestions (a frequent d_tag that is not a project tag yet; ids are separate from alias ids):
-  - list_new_tags: list them by status (pending / confirmed / rejected / superseded). Each has a recommendation: project / generic / unsure.
-  - confirm_new_tag: create the project tag and retro-tag untagged memories carrying its member d_tags.
+  - list_new_tags: list them by status (pending / confirmed / rejected / superseded). Each has a recommendation (project / generic / unsure) and uses = how often that d_tag was used in the window.
+  - confirm_new_tag: create the project tag and retro-tag untagged memories carrying that exact d_tag.
   - reject_new_tag: reject it; a rejected name is never suggested again.
   - apply_recommendations: when the user accepts the recommendations ("추천대로"), pass the suggestion_ids that were shown to them. project → confirmed, generic → rejected, unsure / no recommendation → left pending for the user to decide.`,
       inputSchema: {

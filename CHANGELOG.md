@@ -13,45 +13,42 @@ created again a minute after it was deleted.
 
 - A frequent d_tag that is not a project tag yet no longer becomes one. It is
   stored as a suggestion (`project_tag_new_suggestions`, migration 030) with a
-  recommendation from the same model: `project`, `generic` or `unsure`. The
-  model is told never to call a proper name `generic`. On 70 real tag names
-  (local Qwen3-14B) it rated all five known projects `project`, product and
-  service names (`cafe24`, `smartstore`, `buzz`) `unsure`, and no real project
+  recommendation from the model: `project`, `generic` or `unsure`. The model is
+  told never to call a proper name `generic`. On 70 real tag names (local
+  Qwen3-14B) it rated all five known projects `project`, product and service
+  names (`cafe24`, `smartstore`, `buzz`) `unsure`, and no real project
   `generic`.
-- Nothing is tagged until a person confirms. Confirming creates the project tag
-  and tags the untagged memories that carry that exact d_tag.
-- The promoter tags memories only by the d_tag with the same name as the
-  project tag, both after a confirm and for tags that already exist. Until
-  0.9.24 it also tagged memories carrying any d_tag the clusterer had grouped
-  with it, and those groups were often wrong. Cluster members now only add up the
-  usage count.
-- A cluster's name must be one of the input d_tags; made-up names are dropped
-  and their members counted on their own. A d_tag that already is a project tag
-  stays its own cluster and is never folded into another one. Each d_tag is
-  counted in one cluster only.
-- A rejected name is never suggested again, by name. It is left out of
-  clustering entirely, so rejecting `cafe24-api` does not hide `cafe24` when
-  the clusterer groups them, and the promoter never tags memories with a
-  rejected name even if that tag exists. The tagger also stops creating a
-  rejected name through `NEW:<name>`; the memory gets no project tag instead.
-  Names that were confirmed, or that became tags some other way while pending
-  (`superseded`), are not suggested again either.
-- When the clusterer call fails, that run makes no new suggestions (it still
-  tags memories for existing tags). A suggestion stored without a
-  recommendation is classified again on a later run.
-- The classifier asks for JSON in the prompt and sends `responseFormat: 'json'`,
-  so it also works with the default xAI clusterer, not only with a local model.
+- The promoter creates no project tag and tags nothing for a new name until a
+  person confirms. Confirming creates the tag and tags the untagged memories
+  that carry that exact d_tag.
+- The clustering step is gone. The promoter looks at each frequent d_tag on its
+  own: the threshold and the count it shows are that d_tag's own uses in the
+  window. Clustering summed similar d_tags and also tagged memories carrying any
+  of them; the groups were often wrong, and the summed count did not match what
+  a confirm would tag. Tags that already exist are now applied only to
+  memories carrying the same-named d_tag.
+- If the model call fails or returns something unexpected, the name is not
+  stored that run and is tried again on the next one (`deferred` in the log).
+  The classifier asks for JSON in the prompt and sends `responseFormat: 'json'`,
+  so it works with the default xAI provider as well as a local model.
+- A name the person rejected is never suggested again, and the promoter does not
+  tag memories with it even if such a tag exists. Rejection blocks only that
+  exact name. Names that were confirmed, or that became tags some other way
+  while pending (`superseded`), are not suggested again either.
+- The tagger no longer creates a tag through `NEW:<name>` when that name is
+  waiting for the person or was rejected; the memory gets no project tag
+  instead. Other `NEW:` names are still created as before.
 - `manage_project_tags` gains `list_new_tags`, `confirm_new_tag`,
   `reject_new_tag` and `apply_recommendations`. The last one takes the
   suggestion ids the user was shown and confirms `project`, rejects `generic`,
-  and leaves `unsure` or unrated ones pending. Suggestions created after the
-  user looked are not touched. If one id fails, the others still go through and
-  the result lists the failed ids.
+  and leaves `unsure` pending. Suggestions created after the user looked are not
+  touched. If one id fails, the others still go through and the result lists
+  the failed ids.
 - The startup brief lists up to two pending suggestions that are not rated
   `generic` (`project` first) under "Project Tag Suggestions". If migration 030
   has not run yet, the brief leaves them out instead of failing.
-- The run log line is now `suggested / refreshed / blocked / superseded /
-  retrotagged`.
+- The run log line is now `suggested / refreshed / blocked / deferred /
+  superseded / retrotagged`.
 - `npm run check:dtag` tests the rules (`src/cold_path/dtag_suggest_gate.ts`).
 
 Run `mcp-agents-memory migrate` before starting this version. Until then the

@@ -11,9 +11,8 @@ const MIGRATION_NAME = "030_project_tag_new_suggestions";
  *
  * 별칭 제안 표(025)는 source/target이 project_tags FK라 아직 없는 태그를 담을 수 없어서 따로 둔다.
  * (user_id, name)은 상태와 무관하게 한 행 — 반려된 이름은 이 행이 남아 있는 한 다시 제안되지 않는다
- * (2026-10-03 형 결정: 반려는 영구). 반려는 이름 기준이다: 클러스터 멤버까지 막으면 `cafe24-api`(멤버
- * cafe24)를 반려했을 때 `cafe24`도 영영 못 올라온다. 대신 클러스터러가 대표 이름을 바꿔 고른 변형은
- * 다시 물을 수 있다 — 진짜 프로젝트를 영영 못 올리는 것보다 한 번 더 묻는 쪽이 싸다.
+ * (2026-10-03 형 결정: 반려는 영구). 반려는 정확히 그 이름만 막는다(`cafe24-api`를 반려해도 `cafe24`는
+ * 따로 물을 수 있다). uses = 기간 안 그 d_tag 자기 횟수.
  */
 async function migrate() {
   console.log(`💾 Running Migration: ${MIGRATION_NAME}...`);
@@ -45,7 +44,6 @@ async function migrate() {
           id               BIGSERIAL PRIMARY KEY,
           user_id          BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
           name             TEXT NOT NULL,
-          members          TEXT[] NOT NULL DEFAULT '{}',
           uses             INTEGER NOT NULL DEFAULT 0,
           status           TEXT NOT NULL DEFAULT 'pending' CHECK (status IN
                              ('pending','confirmed','rejected','superseded')),
