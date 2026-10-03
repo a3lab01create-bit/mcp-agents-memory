@@ -11,6 +11,14 @@ import { callSpec, ROLE_REGISTRY } from "../model_registry.js";
 import { getDefaultUserId } from "../users.js";
 import { invalidateCandidateCache } from "./tagger.js";
 import { getPrompt } from "../prompts/index.js";
+import {
+  groupPairHistory,
+  pairKey,
+  repeatsToSweep,
+  skipBeforeJudge,
+  userRejectedDirection,
+  type PairHistoryRow,
+} from "./alias_reject_gate.js";
 
 type AliasRelation =
   | "rename"
@@ -76,6 +84,12 @@ export interface ProjectAliasPromoterSummary {
   autoApplied: number;
   skipped: number;
   errors: number;
+  /** 사람이 반려한 쌍이라 판정 전에 뺀 후보 수 (alias_reject_gate) */
+  blockedBeforeJudge: number;
+  /** 판정 결과가 사람이 반려한 방향 그대로라 올리지 않은 수 */
+  blockedAfterJudge: number;
+  /** 대기 중이던 반려 반복 제안을 닫은 수 (배포 전 옛 코드가 올린 것 등) */
+  swept: number;
 }
 
 export interface ApplyAliasResult {
@@ -277,10 +291,6 @@ function nameSimilarity(a: string, b: string): number {
   const tokenScore = jaccard(tokenSet(a), tokenSet(b));
   const dice = bigramDice(a, b);
   return Math.max(tokenScore, dice);
-}
-
-function pairKey(a: number, b: number): string {
-  return a < b ? `${a}:${b}` : `${b}:${a}`;
 }
 
 function uniqueSortedNumbers(values: Iterable<number>): number[] {
@@ -707,7 +717,8 @@ async function addVectorCandidates(
 async function buildCandidatePairs(
   userId: number,
   tags: TagInfo[],
-  limit: number
+  limit: number,
+  exclude: (pair: CandidatePair) => boolean = () => false
 ): Promise<CandidatePair[]> {
   const tagsById = new Map(tags.map((tag) => [tag.id, tag]));
   const pairs = new Map<string, CandidatePair>();
@@ -726,7 +737,9 @@ async function buildCandidatePairs(
     }
   }
 
+  // 자르기 전에 뺀다 — 뺄 쌍이 상위 자리를 차지하지 않게
   return Array.from(pairs.values())
+    .filter((pair) => !exclude(pair))
     .sort((a, b) => {
       const aExplicit = a.sources.has("explicit_user_statement") ? 1 : 0;
       const bExplicit = b.sources.has("explicit_user_statement") ? 1 : 0;
@@ -910,17 +923,13 @@ async function computeAutoApplyEligible(
   return true;
 }
 
-async function upsertSuggestion(
-  userId: number,
-  sourceId: number,
-  targetId: number,
+function aliasSignals(
   pair: CandidatePair,
   judgment: AliasJudgment,
-  autoApplyEligible: boolean
-): Promise<number> {
-  const spec = ROLE_REGISTRY.project_alias_judge;
-  const candidateSources = Array.from(pair.sources);
-  const signals = {
+  sourceId: number,
+  targetId: number
+): Record<string, unknown> {
+  return {
     ...pair.signals,
     llm: {
       relation: judgment.relation,
@@ -931,6 +940,19 @@ async function upsertSuggestion(
       direction_reversed_from_candidate: sourceId !== pair.sourceId || targetId !== pair.targetId,
     },
   };
+}
+
+async function upsertSuggestion(
+  userId: number,
+  sourceId: number,
+  targetId: number,
+  pair: CandidatePair,
+  judgment: AliasJudgment,
+  autoApplyEligible: boolean
+): Promise<number> {
+  const spec = ROLE_REGISTRY.project_alias_judge;
+  const candidateSources = Array.from(pair.sources);
+  const signals = aliasSignals(pair, judgment, sourceId, targetId);
 
   const result = await db.query(
     `INSERT INTO project_tag_alias_suggestions (
@@ -995,6 +1017,122 @@ async function upsertSuggestion(
   return Number(result.rows[0].id);
 }
 
+/** 제안 이력 (정본 id 기준, 쌍별) — 사람이 반려한 쌍을 다시 올리지 않기 위해 (alias_reject_gate). */
+async function loadPairHistory(userId: number, onlyPair?: [number, number]): Promise<Map<string, PairHistoryRow[]>> {
+  const result = await db.query(
+    `SELECT id, source_root, target_root, status, decided_by, decided, created_at, manual
+       FROM (SELECT id,
+                    canonical_project_tag_id(source_tag_id) AS source_root,
+                    canonical_project_tag_id(target_tag_id) AS target_root,
+                    status,
+                    decided_by,
+                    COALESCE(decided_at, updated_at, created_at) AS decided,
+                    created_at,
+                    'manual_set_alias' = ANY(candidate_sources) AS manual
+               FROM project_tag_alias_suggestions
+              WHERE user_id = $1) h
+      WHERE $2::bigint IS NULL
+         OR (LEAST(source_root, target_root) = LEAST($2::bigint, $3::bigint)
+             AND GREATEST(source_root, target_root) = GREATEST($2::bigint, $3::bigint))`,
+    [userId, onlyPair?.[0] ?? null, onlyPair?.[1] ?? null]
+  );
+  return groupPairHistory(
+    result.rows
+      .filter((row: any) => row.source_root !== null && row.target_root !== null)
+      .map((row: any) => ({
+        id: Number(row.id),
+        sourceId: Number(row.source_root),
+        targetId: Number(row.target_root),
+        status: String(row.status),
+        decidedBy: row.decided_by === null ? null : String(row.decided_by),
+        decidedAt: toDate(row.decided),
+        createdAt: toDate(row.created_at),
+        manual: row.manual === true,
+      }))
+  );
+}
+
+/**
+ * 대기 중인데 사람이 반려한 방향을 되풀이하는 제안을 닫는다. 규칙 배포 전에 옛 코드가 올렸을 수 있다.
+ * (대기 행은 사람 반려가 아니라서, 이번 실행의 판정 전 거르기는 그 쌍을 이미 기회를 쓴 것으로 본다 —
+ * 대부분은 반려 뒤에 생긴 행이기 때문이다.)
+ * 사람이 set_alias로 직접 건 행은 건드리지 않는다.
+ */
+async function sweepRepeatedRejections(
+  history: Map<string, PairHistoryRow[]>
+): Promise<{ swept: number; errors: number }> {
+  let swept = 0;
+  let errors = 0;
+  for (const rows of history.values()) {
+    for (const { pendingId, rejectedId } of repeatsToSweep(rows)) {
+      try {
+        const result = await db.query(
+          `UPDATE project_tag_alias_suggestions
+              SET status = 'rejected',
+                  decided_by = 'system',
+                  decision_reason = $2,
+                  signals = signals || jsonb_build_object('repeat_of_suggestion_id', $3::bigint),
+                  decided_at = NOW(),
+                  updated_at = NOW()
+            WHERE id = $1
+              AND status = 'pending'
+              AND NOT ('manual_set_alias' = ANY(candidate_sources))`,
+          [pendingId, `repeat of suggestion #${rejectedId} rejected by the user`, rejectedId]
+        );
+        swept += result.rowCount ?? 0;
+      } catch (err) {
+        errors++;
+        console.error(`[ProjectAliasPromoter] sweep of suggestion ${pendingId} failed:`, err);
+      }
+    }
+  }
+  return { swept, errors };
+}
+
+/**
+ * 판정이 사람이 반려한 방향 그대로일 때: 대기열에 올리지 않고 닫힌 행으로만 남긴다. 이 행이 "반려 뒤
+ * 한 번 기회"를 쓴 표시가 돼서 다음 실행부터는 판정 전에 빠진다.
+ */
+async function recordRepeatOfRejected(
+  userId: number,
+  sourceId: number,
+  targetId: number,
+  pair: CandidatePair,
+  judgment: AliasJudgment,
+  rejectedId: number
+): Promise<void> {
+  const spec = ROLE_REGISTRY.project_alias_judge;
+  await db.query(
+    `INSERT INTO project_tag_alias_suggestions (
+       user_id, source_tag_id, target_tag_id, relation, status, confidence,
+       candidate_sources, evidence_memory_ids, conflict_memory_ids, signals,
+       model_provider, model_name, rationale, auto_apply_eligible,
+       decided_by, decision_reason, decided_at
+     )
+     VALUES (
+       $1, $2, $3, $4, 'rejected', $5,
+       $6::text[], $7::bigint[], $8::bigint[], $9::jsonb,
+       $10, $11, $12, FALSE,
+       'system', $13, NOW()
+     )`,
+    [
+      userId,
+      sourceId,
+      targetId,
+      judgment.relation,
+      Number(judgment.confidence.toFixed(4)),
+      Array.from(pair.sources),
+      judgment.evidence_memory_ids,
+      judgment.conflict_memory_ids,
+      JSON.stringify({ ...aliasSignals(pair, judgment, sourceId, targetId), repeat_of_suggestion_id: rejectedId }),
+      spec.provider,
+      spec.model_name,
+      truncate(judgment.rationale, 4000),
+      `repeat of suggestion #${rejectedId} rejected by the user`,
+    ]
+  );
+}
+
 function qualifiesForPending(judgment: AliasJudgment, minConfidence: number): boolean {
   return (
     QUALIFYING_RELATIONS.has(judgment.relation) &&
@@ -1018,13 +1156,25 @@ export async function runProjectAliasPromoter(
     autoApplied: 0,
     skipped: 0,
     errors: 0,
+    blockedBeforeJudge: 0,
+    blockedAfterJudge: 0,
+    swept: 0,
   };
+
+  const history = await loadPairHistory(userId);
+  const sweep = await sweepRepeatedRejections(history);
+  summary.swept = sweep.swept;
+  summary.errors += sweep.errors;
 
   const tags = await listCanonicalTags(userId);
   if (tags.length < 2) return summary;
 
   const tagsById = new Map(tags.map((tag) => [tag.id, tag]));
-  const pairs = await buildCandidatePairs(userId, tags, candidateLimit);
+  const pairs = await buildCandidatePairs(userId, tags, candidateLimit, (pair) => {
+    const skip = skipBeforeJudge(history.get(pairKey(pair.sourceId, pair.targetId)));
+    if (skip) summary.blockedBeforeJudge++;
+    return skip;
+  });
   summary.candidates = pairs.length;
   if (pairs.length === 0) return summary;
 
@@ -1052,6 +1202,19 @@ export async function runProjectAliasPromoter(
 
       if (sourceId === targetId) {
         summary.skipped++;
+        continue;
+      }
+
+      // 실행 시작 때 이력에 더해 지금 다시 읽는다 — 판정하는 사이(로컬 LLM, 수 분)에 사람이 반려했을 수 있다.
+      // 시작 때 이력도 본다: 그사이 한쪽 태그가 다른 태그로 합쳐지면 다시 읽은 쪽에선 이 쌍으로 안 잡힌다.
+      const key = pairKey(sourceId, targetId);
+      const live = await loadPairHistory(userId, [sourceId, targetId]);
+      const rejectedId =
+        userRejectedDirection(history.get(key), sourceId, targetId) ??
+        userRejectedDirection(live.get(key), sourceId, targetId);
+      if (rejectedId !== null) {
+        await recordRepeatOfRejected(userId, sourceId, targetId, pair, judgment, rejectedId);
+        summary.blockedAfterJudge++;
         continue;
       }
 
@@ -1124,9 +1287,9 @@ export async function maybeRunProjectAliasPromoter(): Promise<void> {
     );
 
     const summary = await runProjectAliasPromoter({ userId });
-    if (summary.candidates > 0 || summary.inserted > 0 || summary.errors > 0) {
+    if (summary.candidates > 0 || summary.inserted > 0 || summary.errors > 0 || summary.swept > 0 || summary.blockedBeforeJudge > 0) {
       console.error(
-        `🔁 [ProjectAliasPromoter] done — candidates=${summary.candidates}, judged=${summary.judged}, inserted=${summary.inserted}, autoApplied=${summary.autoApplied}, skipped=${summary.skipped}, errors=${summary.errors}`
+        `🔁 [ProjectAliasPromoter] done — candidates=${summary.candidates}, judged=${summary.judged}, inserted=${summary.inserted}, autoApplied=${summary.autoApplied}, skipped=${summary.skipped}, errors=${summary.errors}, blockedBeforeJudge=${summary.blockedBeforeJudge}, blockedAfterJudge=${summary.blockedAfterJudge}, swept=${summary.swept}`
       );
     }
   } catch (err) {
@@ -1243,14 +1406,15 @@ export async function applyAliasSuggestion(
 
     if (!Number.isInteger(targetRoot) || targetRoot === sourceId) {
       const msg = "alias would point source to itself";
-      await markSuggestionTerminal(client, suggestionId, "rejected", decidedBy, msg);
+      // 안전장치가 거절한 것 — 사람의 판단이 아니므로 system (사람 반려만 재제안을 영구히 막는다)
+      await markSuggestionTerminal(client, suggestionId, "rejected", "system", msg);
       await client.query("COMMIT");
       return { suggestionId, applied: false, status: "rejected", reason: msg };
     }
 
     if (await targetChainContainsSource(client, sourceId, targetId)) {
       const msg = "alias would create a project_tag alias cycle";
-      await markSuggestionTerminal(client, suggestionId, "rejected", decidedBy, msg);
+      await markSuggestionTerminal(client, suggestionId, "rejected", "system", msg);
       await client.query("COMMIT");
       return { suggestionId, applied: false, status: "rejected", reason: msg };
     }
