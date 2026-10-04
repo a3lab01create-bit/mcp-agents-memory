@@ -39,7 +39,7 @@ mixed generic words and version names (`dev-environment`, `opus-4.7`,
     and `NEW:<name>` creates nothing.
   - The d_tag promoter makes no new suggestions. Every run it retro-tags
     untagged memories whose d_tag equals a registry name or an alias of one,
-    regardless of how often the name is used.
+    regardless of how often the name is used. (0.9.28: registry names only.)
   - The startup brief's active projects list shows only registry projects that
     are not paused.
   - `confirm_new_tag` and `apply_recommendations` add the confirmed name to the
