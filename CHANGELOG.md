@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.9.26 — 2026-10-04
+
+### Rejected names no longer take up the promoter's candidate slots
+
+The promoter looks at the 50 most frequent d_tags, and it removed rejected
+names only after taking those 50. A rejected name kept its slot while it stayed
+frequent, so each rejection left one fewer slot for a new name. After the
+first round of rejections all 50 slots were taken: 42 existing project tags and
+8 rejected names, with no room for anything new.
+
+- Rejected names are now removed before the top 50 are taken. Existing project
+  tags stay in, because they are still used to tag memories carrying the
+  same-named d_tag.
+- `blocked` in the run log now counts only names that were confirmed or
+  superseded and whose tag is gone, or names rejected during the run. Rejected
+  names are no longer counted on every run.
+
 ## 0.9.25 — 2026-10-04
 
 ### The d_tag promoter suggests new project tags instead of creating them
