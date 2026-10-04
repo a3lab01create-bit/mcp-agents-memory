@@ -5,9 +5,9 @@
  * 결과적으로 새 프로젝트 초기엔 d_tag만 박히고 p_tag=null 인 row가 쌓임.
  *
  * 흐름 (0.9.25):
- *   1. 최근 N일 d_tag 빈도 집계 (exact count, 상위 50개)
+ *   1. 최근 N일 d_tag 빈도 집계 (exact count). 사람이 반려한 이름은 빼고 상위 50개 (0.9.26 — 반려한
+ *      이름이 자리를 차지하면 반려할 때마다 새 이름이 들어올 자리가 한 칸씩 줄었다)
  *   2. 자기 횟수 ≥ DTAG_PROMOTE_MIN_COUNT 인 d_tag마다
- *      - 사람이 반려한 이름 → 건너뜀 (영구)
  *      - 이미 project_tags에 있는 이름 → 그 이름의 d_tag를 가진 미태깅 row 소급 UPDATE
  *      - 새 이름 → project_tags에 넣지 않고 project_tag_new_suggestions에 제안만 남김.
  *        LLM(clusterer role)에게 "프로젝트 이름인가, 일반어인가"를 물어 추천을 같이 적는다.
@@ -52,7 +52,7 @@ export interface PromotionSummary {
   suggested: SuggestionPreview[];
   /** 이미 대기 중인 제안의 횟수 갱신 */
   refreshed: number;
-  /** 끝난 이름(반려·승인·대체)이라 건너뜀 */
+  /** 끝난 이름(승인·대체 뒤 태그가 사라진 것, 또는 집계 뒤 바로 반려된 것)이라 건너뜀. 반려된 이름은 집계에서 미리 빠진다 */
   blocked: number;
   /** 분류가 실패해 다음 실행으로 미룬 새 이름 */
   deferred: number;
@@ -196,17 +196,23 @@ export async function runDtagPromotion(opts: { dryRun?: boolean } = {}): Promise
 
   if (!dryRun) summary.superseded = await supersedeExisting(userId);
 
-  // 1. 최근 N일 d_tag 빈도 집계 (tag_processed=TRUE인 row만)
+  // 1. 최근 N일 d_tag 빈도 집계 (tag_processed=TRUE인 row만). 반려된 이름은 상위 50개를 자르기 전에 뺀다 —
+  //    그대로 두면 아무 일도 안 하면서 자리만 차지해, 반려가 쌓일수록 새 이름이 못 올라온다
+  //    (10-04 실측: 50자리 = 기존 태그 42 + 반려 8, 새 이름 자리 0). 기존 태그는 소급에 쓰여서 남긴다.
   const freqResult = await db.query(
-    `SELECT unnest(d_tag) AS tag, COUNT(*)::int AS cnt
-       FROM memory
-      WHERE user_id = $1
-        AND tag_processed = TRUE
-        AND is_active = TRUE
-        AND created_at >= NOW() - ($2 || ' days')::INTERVAL
-      GROUP BY tag
-     HAVING COUNT(*) >= 2
-      ORDER BY cnt DESC
+    `SELECT f.tag, f.cnt
+       FROM (SELECT unnest(d_tag) AS tag, COUNT(*)::int AS cnt
+               FROM memory
+              WHERE user_id = $1
+                AND tag_processed = TRUE
+                AND is_active = TRUE
+                AND created_at >= NOW() - ($2 || ' days')::INTERVAL
+              GROUP BY tag
+             HAVING COUNT(*) >= 2) f
+      WHERE NOT EXISTS (
+              SELECT 1 FROM project_tag_new_suggestions s
+               WHERE s.user_id = $1 AND s.status = 'rejected' AND s.name = lower(btrim(f.tag)))
+      ORDER BY f.cnt DESC
       LIMIT 50`,
     [userId, String(windowDays)]
   );
@@ -228,7 +234,7 @@ export async function runDtagPromotion(opts: { dryRun?: boolean } = {}): Promise
 
   for (const { tag, cnt } of candidates) {
     const row = prior.get(tag);
-    // 반려된 이름은 태그가 다른 길로 생겼어도 소급하지 않는다
+    // 반려된 이름은 태그가 다른 길로 생겼어도 소급하지 않는다 (위 쿼리에서 이미 빠지지만, 그 사이 반려된 것까지 막는다)
     if (row?.status === 'rejected') {
       summary.blocked++;
       continue;
