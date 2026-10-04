@@ -522,10 +522,31 @@ codex/gemini에 이어 **Grok Build·Antigravity** passive capture 추가 → �
 
 | # | 결정 | 결과 |
 |---|---|---|
-| a | 명부: 진짜 프로젝트 표시(쿠우가 ✅/❓/❌ 미리 표시한 표) | ⏳ 대기 |
+| a | 명부 | 초안 아래 표 — 형 최종 확인 대기 |
 | b | 버즈·슬랙 채널 → 프로젝트 힌트 지도 | ✅ 분명한 둘만: `MarketDev`→marketadmin, `Analyze_YouTube`→youtube-channel-analyzer. 일반 채널은 힌트 없음 |
 | c | d_tag 빈도 승격기 | ✅ 은퇴 — 새 프로젝트는 L3 단서(작업 폴더·채널)로 발견 |
 | d | 옛 무태그 행 되살리기 범위 | ✅ 최근 30일부터(≈3,800행), 결과 보고 확대 결정 |
+
+**명부 초안 (a, 2026-10-04 형과 정리).** 기존 태그 중 "진짜"를 고르는 대신 **지금의 진짜 프로젝트**를 정했다 — 확인해 보니 ✅로 보였던 태그(track-1-ship·notion-integration 등)도 태거가 20개 안에 밀어 넣은 탓에 내용이 섞여 있었다.
+
+| 명부 이름 | 한 줄 설명 | 상태 | 합칠 옛 태그(내용이 깨끗한 것만) |
+|---|---|---|---|
+| mcp-agents-memory | 기억 시스템(메모리 DB·태거·라이브러리언) | 진행 | project-v5.0 |
+| marketadmin | 마켓 관리자(스마트스토어·카페24 연동) | 진행 | smartstore, cafe24 |
+| pacefy | 러닝 앱(안드로이드·iOS, GPS) | 진행 | android, ios |
+| centragens | 센트라젠, 키토부스터·메타밸런스 브랜드·마케팅 | 진행 | keto-booster |
+| bodygajim | 몸가짐 유튜브 채널 제작 | 진행 | bodygajim-youtube |
+| youtube-channel-analyzer | 유튜브 채널 분석기(YCA) | 진행 | |
+| buzz | 버즈 협업공간(에이전트 팀 운영) | 진행 | |
+| market-intel | 광고·시장 조사 | 진행 | advertising |
+| cosmetic-brand | 화장품 브랜드 기획 | ⏸ 멈춤 | |
+| gonggu | 공구 분석(인플루언서 발굴·Subo 포함, 분석 로직 예정) | ⏸ 멈춤 | |
+| personal-preferences (분류) | 형에 대한 기억(호칭·말투·개인 사정) | — | |
+| people-profiles (분류) | 사람·에이전트 프로필 | — | |
+
+- 형도 모르는 04-29 가져오기 이름 6개(track-1-ship·project-track-1·notion-integration·gempro-design-project·outsourcing-production·project-claude-code-v0.4)와 섞인 태그(librarian-project·filming-project·fresh-neon-db 등)는 **topic으로 내리고 합치지 않는다** — 합치면 옛 글이 통째로 새 프로젝트로 들어가 명부가 처음부터 오염된다. 최근 30일 글은 L2가 명부 설명으로 다시 붙인다.
+- 멈춘(⏸) 프로젝트도 명부에 둔다 — 다시 얘기할 때 태거가 붙일 수 있게. 브리핑 "활성 프로젝트"에서만 뺀다.
+- 분류 2개는 프로젝트는 아니지만 태거 후보에 둔다(mem0 기본 분류의 personal details·preferences와 같은 자리).
 
 ---
 
