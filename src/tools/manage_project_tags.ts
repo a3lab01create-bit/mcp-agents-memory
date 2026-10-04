@@ -285,6 +285,84 @@ async function applyRecommendations(userId: number, ids: number[], reason: strin
   });
 }
 
+/**
+ * 프로젝트 명부(DEVLOG §24 L1). 명부에 한 줄이라도 있으면 태거는 명부에서만 고른다.
+ * 설명은 필수 — 태거가 언제 이 이름을 붙일지 보는 안내문이다.
+ */
+async function listRegistry() {
+  const result = await db.query(
+    `SELECT pt.name, pt.kind, pt.paused, pt.description,
+            (SELECT string_agg(a.name, ',' ORDER BY a.name) FROM project_tags a WHERE a.alias_of = pt.id) AS aliases,
+            (SELECT count(*) FROM memory m
+              WHERE m.p_tag_id IS NOT NULL AND m.created_at >= NOW() - INTERVAL '30 days'
+                AND canonical_project_tag_id(m.p_tag_id) = pt.id)::int AS uses_30d
+       FROM project_tags pt
+      WHERE pt.kind IS NOT NULL
+      ORDER BY pt.kind, pt.paused, pt.name`
+  );
+  return ok({
+    action: "list_registry",
+    registry_mode: result.rows.length > 0,
+    count: result.rows.length,
+    entries: result.rows.map((r: any) => ({
+      name: String(r.name),
+      kind: String(r.kind),
+      paused: r.paused === true,
+      description: r.description ?? null,
+      aliases: r.aliases ? String(r.aliases).split(",") : [],
+      uses_30d: Number(r.uses_30d),
+    })),
+  });
+}
+
+async function registerProject(
+  tagName: string | undefined,
+  description: string | undefined,
+  kind: "project" | "category" | undefined,
+  paused: boolean | undefined
+) {
+  const name = normalizeTagName(tagName);
+  if (!name) return toolError("tag is required for register_project");
+  const desc = description?.trim();
+  if (!desc) return toolError("description is required for register_project (one line: what belongs here)");
+  const existing = await lookupProjectTagByName(name);
+  if (existing?.aliasOf != null) {
+    return toolError("tag is an alias of another tag; register the canonical tag instead", { tag: name });
+  }
+  const result = await db.query(
+    `INSERT INTO project_tags (name, kind, description, paused)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (name) DO UPDATE
+       SET kind = EXCLUDED.kind, description = EXCLUDED.description, paused = EXCLUDED.paused, updated_at = NOW()
+     RETURNING id, (xmax = 0) AS created`,
+    [name, kind ?? "project", desc, paused === true]
+  );
+  invalidateCandidateCache();
+  return ok({
+    action: "register_project",
+    tag: name,
+    kind: kind ?? "project",
+    paused: paused === true,
+    description: desc,
+    project_tag_id: Number(result.rows[0].id),
+    created: result.rows[0].created === true,
+  });
+}
+
+async function unregisterProject(tagName: string | undefined) {
+  const name = normalizeTagName(tagName);
+  if (!name) return toolError("tag is required for unregister_project");
+  const result = await db.query(
+    `UPDATE project_tags SET kind = NULL, paused = FALSE, updated_at = NOW()
+      WHERE name = $1 AND kind IS NOT NULL
+     RETURNING id`,
+    [name]
+  );
+  if (result.rows.length === 0) return toolError("tag is not in the registry", { tag: name });
+  invalidateCandidateCache();
+  return ok({ action: "unregister_project", tag: name, removed: true });
+}
+
 async function setAlias(
   userId: number,
   sourceTagName: string | undefined,
@@ -431,7 +509,12 @@ Alias suggestions (two existing tags look like the same project):
   - set_alias: manually set source_tag as an alias of target_tag through a pending suggestion + applyAliasSuggestion().
   - unset_alias: clear alias_of for one project tag.
 
-New project tag suggestions (a frequent d_tag that is not a project tag yet; ids are separate from alias ids):
+Project registry (the short, human-chosen list the tagger picks from — DEVLOG §24). When the registry has at least one entry, the tagger only assigns registry tags (or their aliases) and never invents names:
+  - list_registry: show registry entries (kind, paused, description, aliases, 30-day uses).
+  - register_project: add or update an entry. tag + description (one line: what belongs here) required; kind = project (default) or category (not a project but a standing bucket, e.g. personal facts); paused = true keeps it as a tagger candidate but hides it from "active projects".
+  - unregister_project: take a tag off the registry (the tag and its old memories stay).
+
+New project tag suggestions (a frequent d_tag that is not a project tag yet; ids are separate from alias ids; not created while the registry is in use):
   - list_new_tags: list them by status (pending / confirmed / rejected / superseded). Each has a recommendation (project / generic / unsure) and uses = how often that d_tag was used in the window.
   - confirm_new_tag: create the project tag and retro-tag untagged memories carrying that exact d_tag.
   - reject_new_tag: reject it; a rejected name is never suggested again.
@@ -447,6 +530,9 @@ New project tag suggestions (a frequent d_tag that is not a project tag yet; ids
           "confirm_new_tag",
           "reject_new_tag",
           "apply_recommendations",
+          "list_registry",
+          "register_project",
+          "unregister_project",
         ]).describe("작업 종류"),
         status: statusSchema.optional().describe("list_suggestions / list_new_tags status filter (default pending)"),
         limit: z.number().int().min(1).max(MAX_LIMIT).optional().describe(`list_suggestions / list_new_tags limit (default ${DEFAULT_LIMIT})`),
@@ -455,7 +541,10 @@ New project tag suggestions (a frequent d_tag that is not a project tag yet; ids
         reason: z.string().optional().describe("confirm/reject/set decision reason"),
         source_tag: z.string().optional().describe("set_alias source project_tags.name"),
         target_tag: z.string().optional().describe("set_alias target project_tags.name"),
-        tag: z.string().optional().describe("unset_alias 대상 project_tags.name"),
+        tag: z.string().optional().describe("unset_alias / register_project / unregister_project 대상 project_tags.name"),
+        description: z.string().optional().describe("register_project: 한 줄 설명(무엇이 여기 속하나) — 태거 안내문"),
+        kind: z.enum(["project", "category"]).optional().describe("register_project: project(기본) 또는 category"),
+        paused: z.boolean().optional().describe("register_project: 멈춘 프로젝트면 true"),
       },
     },
     async (args) => {
@@ -490,6 +579,18 @@ New project tag suggestions (a frequent d_tag that is not a project tag yet; ids
 
         if (args.action === "unset_alias") {
           return unsetAlias(userId, args.tag);
+        }
+
+        if (args.action === "list_registry") {
+          return listRegistry();
+        }
+
+        if (args.action === "register_project") {
+          return registerProject(args.tag, args.description, args.kind, args.paused);
+        }
+
+        if (args.action === "unregister_project") {
+          return unregisterProject(args.tag);
         }
 
         if (args.action === "list_new_tags") {

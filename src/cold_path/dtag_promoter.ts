@@ -15,6 +15,9 @@
  *        사람이 manage_project_tags로 승인하면 그때 태그를 만들고 소급 태깅한다.
  *        한 번 끝난(반려·승인·대체) 이름은 다시 제안하지 않는다.
  *
+ * 명부 모드(0.9.27, DEVLOG §24 L1 — 형 결정 c "빈도 승격기 은퇴"): 명부에 한 줄이라도 있으면 새 이름을 제안하지
+ * 않고, 명부 이름(또는 그 별칭)과 같은 d_tag만 소급한다. 명부 밖 옛 태그(verification 등)로는 더 이상 소급하지 않는다.
+ *
  * 0.9.24까지는 LLM이 비슷한 d_tag를 클러스터로 묶어 합산하고 멤버 d_tag까지 소급했다. 묶음이 헛짚는 일이
  * 많았고(지어낸 이름 66건, 소급 0행) 사람은 이름만 보고 승인하므로, 클러스터링을 빼고 이름 하나씩 본다.
  *
@@ -60,6 +63,18 @@ export interface PromotionSummary {
   superseded: number;
   /** 기존 태그로 소급 업데이트된 row 수 합계 */
   retrotagged: number;
+  /** 명부 모드였는지 (새 제안 없음, 명부 이름만 소급) */
+  registry: boolean;
+}
+
+/** 명부 모드인가: kind가 있는 태그가 하나라도 있으면. kind 칼럼이 없으면(마이그레이션 031 전) false. */
+export async function isRegistryMode(): Promise<boolean> {
+  try {
+    const r = await db.query(`SELECT EXISTS (SELECT 1 FROM project_tags WHERE kind IS NOT NULL) AS on`);
+    return r.rows[0]?.on === true;
+  } catch {
+    return false;
+  }
 }
 
 // 2026-10-03 오프라인 실측(로컬 Qwen3-14B, 실제 이름 70개): 알려진 프로젝트 5개 모두 project,
@@ -192,7 +207,8 @@ export async function runDtagPromotion(opts: { dryRun?: boolean } = {}): Promise
   const minCount = envInt('DTAG_PROMOTE_MIN_COUNT', 10);
   const windowDays = envInt('DTAG_PROMOTE_WINDOW_DAYS', 30);
   const userId = await getDefaultUserId();
-  const summary: PromotionSummary = { suggested: [], refreshed: 0, blocked: 0, deferred: 0, superseded: 0, retrotagged: 0 };
+  const registry = await isRegistryMode();
+  const summary: PromotionSummary = { suggested: [], refreshed: 0, blocked: 0, deferred: 0, superseded: 0, retrotagged: 0, registry };
 
   if (!dryRun) summary.superseded = await supersedeExisting(userId);
 
@@ -227,6 +243,12 @@ export async function runDtagPromotion(opts: { dryRun?: boolean } = {}): Promise
   const existing = new Map<string, number>((await db.query(
     `SELECT name, id FROM project_tags WHERE name = ANY($1::text[])`, [names]
   )).rows.map((r: any) => [String(r.name), Number(r.id)]));
+  // 명부 모드: 별칭 사슬을 따라간 정본이 명부에 있는 이름만 소급 대상
+  const inRegistry = new Set<string>(registry ? (await db.query(
+    `SELECT pt.name FROM project_tags pt
+       JOIN project_tags c ON c.id = canonical_project_tag_id(pt.id)
+      WHERE pt.name = ANY($1::text[]) AND c.kind IS NOT NULL`, [names]
+  )).rows.map((r: any) => String(r.name)) : []);
   const prior = new Map<string, { id: number; status: string }>((await db.query(
     `SELECT name, id, status FROM project_tag_new_suggestions WHERE user_id = $1 AND name = ANY($2::text[])`,
     [userId, names]
@@ -242,6 +264,7 @@ export async function runDtagPromotion(opts: { dryRun?: boolean } = {}): Promise
 
     // 3a. 이미 있는 태그 → 같은 이름의 d_tag만 소급 (0.9.24까지는 클러스터 멤버까지 붙였다)
     const pTagId = existing.get(tag);
+    if (registry && !inRegistry.has(tag)) continue;  // 명부 밖 이름: 소급도 제안도 안 함
     if (pTagId != null) {
       if (dryRun) continue;
       const n = await retrotag(db, userId, pTagId, tag);
@@ -340,6 +363,21 @@ export async function confirmNewTagSuggestion(
     const pTagId = created
       ? Number(inserted.rows[0].id)
       : Number((await client.query(`SELECT id FROM project_tags WHERE name = $1`, [name])).rows[0].id);
+    // 명부 모드면 승인한 이름을 명부(project)에 올린다 — 안 그러면 태거 후보에 안 들어가 바로 묻힌다.
+    // 명부가 비어 있으면 건드리지 않는다(승인 하나로 명부 모드가 켜지면 후보가 1개로 줄어든다).
+    // kind 칼럼이 없으면(마이그레이션 031 전) 건너뛴다.
+    await client.query("SAVEPOINT registry_kind");
+    try {
+      await client.query(
+        `UPDATE project_tags SET kind = 'project', updated_at = NOW()
+          WHERE id = $1 AND kind IS NULL
+            AND EXISTS (SELECT 1 FROM project_tags WHERE kind IS NOT NULL)`,
+        [pTagId]
+      );
+      await client.query("RELEASE SAVEPOINT registry_kind");
+    } catch {
+      await client.query("ROLLBACK TO SAVEPOINT registry_kind");
+    }
     const n = await retrotag(client, userId, pTagId, name);
 
     await client.query(

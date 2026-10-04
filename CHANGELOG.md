@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.9.27 — 2026-10-04
+
+### Project registry: the tagger picks from a short, human-chosen list
+
+The tagger only ever saw the 20 oldest project tags (`TAGGER_CANDIDATE_STRATEGY`
+defaults to `oldest` with a limit of 20). All 20 came from the first import on
+04-29, so projects created after that (`marketadmin`, `pacefy`, `buzz`,
+`youtube-channel-analyzer`, …) were never offered as choices, and the list
+mixed generic words and version names (`dev-environment`, `opus-4.7`,
+`project-v0.5.3`). Design: DEVLOG §24.
+
+- `project_tags` gets `kind` (`project` or `category`; NULL = not in the
+  registry) and `paused` (migration 031).
+- Registry mode turns on as soon as one tag has a `kind`:
+  - The tagger is offered every registry tag with its description, and it
+    accepts only a registry tag or an alias of one. Any other name, including
+    old tags that still exist, leaves `p_tag` NULL. `NEW:<name>` creates
+    nothing.
+  - The d_tag promoter makes no new suggestions. It only retro-tags memories
+    whose d_tag equals a registry name or an alias of one.
+  - The startup brief's active projects list shows only registry projects that
+    are not paused.
+  - `confirm_new_tag` adds the confirmed name to the registry. When the registry
+    is empty it does not, because one confirm would otherwise turn registry mode
+    on with a single candidate.
+- With an empty registry, or before migration 031 has run, everything works
+  as before. Turning the registry off is a data change, not a release:
+  unregister the entries and the old behavior returns within the 5-minute
+  candidate cache.
+- `manage_project_tags` gains `list_registry`, `register_project` (tag,
+  one-line description required, kind, paused) and `unregister_project`.
+- `npm run check:registry` tests the acceptance rules
+  (`src/cold_path/project_registry.ts`).
+
+Run `mcp-agents-memory migrate` before starting this version.
+
 ## 0.9.26 — 2026-10-04
 
 ### Rejected names no longer take up the promoter's candidate slots
