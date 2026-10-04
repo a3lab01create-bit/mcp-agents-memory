@@ -15,6 +15,7 @@ import { callRole, callSpec, ROLE_REGISTRY, type ModelSpec } from "../model_regi
 import { judgeProjectTag, shouldApplyJevJudgment } from "./jev_judge.js";
 import { getPrompt } from "../prompts/index.js";
 import { isBlockedNewTagName } from "./dtag_promoter.js";
+import { REGISTRY_MEMBER_SQL, isUndefinedColumn, parsePTagAnswer, registryCandidateLines, registryVerdict } from "./project_registry.js";
 
 // local 프로바이더 사용 시 실패하면 grok으로 fallback (LOCAL_GROK_FALLBACK=false 로 끄기 가능)
 const GROK_FALLBACK_SPEC: ModelSpec = { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' };
@@ -37,8 +38,13 @@ export interface TagResult {
 type CandidateStrategy = "oldest" | "frequent";
 type ProjectTagCandidate = { id: number; name: string; description: string | null };
 
+/** registry=true면 명부 모드(DEVLOG §24 L1): 후보는 명부 전체, 명부 밖 이름·새 이름은 받지 않는다. */
+type CandidateList = { rows: ProjectTagCandidate[]; registry: boolean };
+
 // 후보 cache: 5분 TTL. 전략 또는 limit 변경은 별도 cache key로 분리한다.
-let _candidateCache: { key: string; rows: ProjectTagCandidate[]; expires: number } | null = null;
+let _candidateCache: { key: string; list: CandidateList; expires: number } | null = null;
+// 명부가 이보다 크면 잘린다 — 명부는 사람이 고르는 짧은 목록이라 넘을 일이 없어야 한다(mem0 권고 3~5, 우리 12).
+const REGISTRY_CANDIDATE_LIMIT = 60;
 const CANDIDATE_CACHE_TTL_MS = 5 * 60 * 1000;
 
 /**
@@ -65,13 +71,39 @@ export function candidateSelectionConfig(): { strategy: CandidateStrategy; limit
  * 활성 memory 사용 빈도순으로 canonical tag를 고른다. alias tag 사용도
  * canonical_project_tag_id()로 대표 tag에 합산한다.
  */
-async function listProjectTagCandidates(): Promise<ProjectTagCandidate[]> {
+async function listProjectTagCandidates(): Promise<CandidateList> {
   const { strategy, limit } = candidateSelectionConfig();
   const cacheKey = `${strategy}:${limit}`;
   const now = Date.now();
   if (_candidateCache && _candidateCache.key === cacheKey && _candidateCache.expires > now) {
-    return _candidateCache.rows;
+    return _candidateCache.list;
   }
+
+  // 명부 모드: kind가 있는 정본 태그 전부. 명부가 비었거나 kind 칼럼이 없으면(마이그레이션 031 전) 기존 방식.
+  try {
+    const reg = await db.query(
+      `SELECT id, name, description
+         FROM project_tags
+        WHERE ${REGISTRY_MEMBER_SQL}
+        ORDER BY name
+        LIMIT $1`,
+      [REGISTRY_CANDIDATE_LIMIT]
+    );
+    if (reg.rows.length >= REGISTRY_CANDIDATE_LIMIT) {
+      console.error(`⚠️ [Tagger] 명부가 ${REGISTRY_CANDIDATE_LIMIT}개 이상 — 이름순으로 잘림. 명부를 줄이세요.`);
+    }
+    if (reg.rows.length > 0) {
+      const list: CandidateList = {
+        registry: true,
+        rows: reg.rows.map((row: any) => ({ id: Number(row.id), name: row.name, description: row.description })),
+      };
+      _candidateCache = { key: cacheKey, list, expires: now + CANDIDATE_CACHE_TTL_MS };
+      return list;
+    }
+  } catch (err) {
+    if (!isUndefinedColumn(err)) throw err;  // kind 칼럼 없음(031 전)일 때만 기존 방식으로
+  }
+
   const r = strategy === "frequent"
     ? await db.query(
         `SELECT pt.id, pt.name, pt.description
@@ -100,8 +132,9 @@ async function listProjectTagCandidates(): Promise<ProjectTagCandidate[]> {
     name: row.name,
     description: row.description,
   }));
-  _candidateCache = { key: cacheKey, rows, expires: now + CANDIDATE_CACHE_TTL_MS };
-  return rows;
+  const list: CandidateList = { rows, registry: false };
+  _candidateCache = { key: cacheKey, list, expires: now + CANDIDATE_CACHE_TTL_MS };
+  return list;
 }
 
 /** Cache invalidate — 새 p_tag 생성 시 호출해서 즉시 후보 list 갱신. */
@@ -141,7 +174,11 @@ ROLE: input includes role='user' or role='assistant'. For role='assistant',
   tag the topic; do not treat the reply as a fact about the user.`;
 const SYSTEM_PROMPT = getPrompt("tagger", GENERIC_TAGGER_PROMPT);
 
-function buildUserPrompt(input: TagInput, candidates: Array<{ name: string; description: string | null }>): string {
+function buildUserPrompt(input: TagInput, candidates: Array<{ name: string; description: string | null }>, registry = false): string {
+  // 명부 모드: 짧은 명부라 설명까지 준다(태거 안내문). 시스템 프롬프트가 NEW:를 허용해도 여기서 막는다.
+  if (registry) {
+    return `registry (the ONLY allowed p_tag values — pick exactly one name, or null if none clearly fits; never invent a name, never use NEW:):\n${registryCandidateLines(candidates)}\nrole=${input.role}\nmessage: ${input.message}`;
+  }
   // Slim user prompt — description (보통 길고 가변) 제거, 이름만 (~50% 토큰 절감)
   const candList = candidates.length > 0
     ? candidates.map((c) => c.name).join(", ")
@@ -181,11 +218,53 @@ async function getOrCreateProjectTag(name: string): Promise<number> {
 }
 
 /**
+ * 명부 모드 출력 형식: p_tag는 명부 이름 또는 null만 (로컬 llama.cpp 문법으로 강제 — 새 이름·설명 따라 쓰기 원천 차단).
+ * grok 대체 경로는 jsonSchema를 안 쓰므로 resolveRegistryAnswer의 판정이 여전히 최종 관문이다.
+ */
+function registrySchema(candidates: ProjectTagCandidate[]): Record<string, unknown> {
+  return {
+    type: 'object',
+    properties: {
+      p_tag: { anyOf: [{ type: 'string', enum: candidates.map((c) => c.name) }, { type: 'null' }] },
+      d_tag: { type: 'array', items: { type: 'string' }, maxItems: 5 },
+    },
+    required: ['p_tag', 'd_tag'],
+    additionalProperties: false,
+  };
+}
+
+/**
+ * 명부 모드의 p_tag 답 → 명부 정본 id 또는 null. 별칭 이름은 별칭 사슬을 따라간 정본이 명부에 있으면 받는다.
+ */
+async function resolveRegistryAnswer(raw: unknown, candidates: ProjectTagCandidate[]): Promise<number | null> {
+  const answer = parsePTagAnswer(raw);
+  let canonicalId: number | null = null;
+  if (answer.type === "name") {
+    const chain = await db.query(
+      `WITH RECURSIVE chain AS (
+         SELECT id, alias_of, 0 AS depth FROM project_tags WHERE name = $1
+         UNION ALL
+         SELECT pt.id, pt.alias_of, c.depth + 1 FROM project_tags pt JOIN chain c ON pt.id = c.alias_of
+          WHERE c.depth < 20
+       )
+       SELECT id FROM chain WHERE alias_of IS NULL LIMIT 1`,
+      [answer.slug]
+    );
+    canonicalId = chain.rows.length > 0 ? Number(chain.rows[0].id) : null;
+  }
+  const verdict = registryVerdict(answer, canonicalId, new Set(candidates.map((c) => c.id)));
+  if (verdict.accept == null && verdict.reason !== "no_answer") {
+    console.error(`⚠️ [Tagger] 명부 모드: "${String(raw)}" 받지 않음 (${verdict.reason}). p_tag NULL.`);
+  }
+  return verdict.accept;
+}
+
+/**
  * Cold Path Tagger 본체. message → {p_tag_id, d_tag}.
  */
 export async function tagMessage(input: TagInput): Promise<TagResult> {
-  const candidates = await listProjectTagCandidates();
-  const userPrompt = buildUserPrompt(input, candidates);
+  const { rows: candidates, registry } = await listProjectTagCandidates();
+  const userPrompt = buildUserPrompt(input, candidates, registry);
 
   const isLocal = ROLE_REGISTRY.tagger.provider === 'local';
   let raw: string;
@@ -196,7 +275,7 @@ export async function tagMessage(input: TagInput): Promise<TagResult> {
         system: SYSTEM_PROMPT,
         user: userPrompt,
         responseFormat: 'json',
-        jsonSchema: TAGGER_SCHEMA,
+        jsonSchema: registry ? registrySchema(candidates) : TAGGER_SCHEMA,
         enableThinking: false,
         // thinking off — 태거는 단순 매핑 작업. thinking 켜면 reasoning이 모든 토큰 소비해 content 비어버림.
         // jsonSchema → llama.cpp grammar로 <think> bleed 차단 (Qwen3 bug #20345).
@@ -247,7 +326,10 @@ export async function tagMessage(input: TagInput): Promise<TagResult> {
   let p_tag_id: number | null = null;
   let newly_created_p_tag_name: string | undefined;
 
-  if (parsed.p_tag && typeof parsed.p_tag === 'string') {
+  if (registry) {
+    // 명부 모드: 명부 이름(또는 그 별칭)만 받는다. 새 이름은 만들지 않는다.
+    p_tag_id = await resolveRegistryAnswer(parsed.p_tag, candidates);
+  } else if (parsed.p_tag && typeof parsed.p_tag === 'string') {
     if (parsed.p_tag.startsWith('NEW:')) {
       const newName = parsed.p_tag.slice(4).trim();
       if (newName && await isBlockedNewTagName(newName)) {

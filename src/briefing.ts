@@ -111,7 +111,9 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
   );
 
   // 최근 활성 p_tags top N
-  const ptags = await db.query(
+  // 명부 모드(0.9.27, DEVLOG §24)면 진행 중인 명부 프로젝트만 — 명부 밖 옛 태그·분류·멈춘 프로젝트는 빼고.
+  // kind 칼럼이 없으면(마이그레이션 031 전) 예전 쿼리로. 세션 시작마다 도는 길이라 실패하면 안 된다.
+  const activeSql = (registryFilter: string) =>
     `SELECT cpt.name,
             COUNT(*)::int AS cnt,
             MAX(m.created_at) AS last_used
@@ -120,11 +122,25 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
       WHERE m.user_id = $1
         AND m.is_active = TRUE
         AND m.created_at >= NOW() - ($2 || ' days')::INTERVAL
+        ${registryFilter}
       GROUP BY cpt.name
       ORDER BY MAX(m.created_at) DESC
-      LIMIT $3`,
-    [userId, String(shortTermDays), ACTIVE_PTAG_LIMIT]
-  );
+      LIMIT $3`;
+  const activeParams = [userId, String(shortTermDays), ACTIVE_PTAG_LIMIT];
+  let ptags;
+  try {
+    ptags = await db.query(
+      activeSql(`AND (NOT EXISTS (SELECT 1 FROM project_tags r WHERE r.kind IS NOT NULL AND r.alias_of IS NULL)
+                      OR (cpt.kind = 'project' AND NOT cpt.paused))`),
+      activeParams
+    );
+  } catch (err) {
+    // 읽기 전용이라 실패해도 예전 쿼리로 — 단 칼럼 없음(031 전)이 아니면 남겨서 조용히 굳지 않게
+    if ((err as { code?: string })?.code !== "42703") {
+      console.error("⚠️ [Brief] 명부 필터 쿼리 실패, 필터 없이 표시:", (err as Error)?.message ?? err);
+    }
+    ptags = await db.query(activeSql(""), activeParams);
+  }
 
   // 최근 메시지 — currentPlatform 분기
   let recentCurrent: BriefMessage[] = [];

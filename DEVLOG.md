@@ -471,6 +471,85 @@ codex/gemini에 이어 **Grok Build·Antigravity** passive capture 추가 → �
 
 ---
 
+## §24. 프로젝트 명부(registry) — 프로젝트 태그 재설계 🔵 L1 SHIPPED (v0.9.27, 2026-10-04) · L2~L4 설계
+
+0.9.25(승격기는 제안만) · 0.9.26(반려 이름이 후보창 점유 안 함)은 증상 처방이다. 실측과 외부 조사로 본 근본 원인은 셋이다.
+
+### 실측 (2026-10-04, 운영 DB)
+
+| # | 사실 | 수치 |
+|---|---|---|
+| 1 | **태거 후보 = 가장 오래된 태그 20개 고정** (`TAGGER_CANDIDATE_STRATEGY` 기본 `oldest`, `limit 20`) | 20개 전부 04-29 첫 가져오기분. 그 뒤 생긴 프로젝트(marketadmin·pacefy·keto-booster·buzz·youtube-channel-analyzer…)는 태거가 **선택지로 본 적이 없다** |
+| 2 | 그 20개에 일반어·버전명이 섞임 | dev-environment·data-security-privacy·personal-preferences·opus-4.7·project-v0.5.3·project-unknown-3 |
+| 3 | 진짜 프로젝트인데 태그가 거의 없음 | pacefy 20행 · youtube-channel-analyzer 14 · buzz 10 · keto-booster 3 (전 기간) |
+| 4 | 채널 ≠ 프로젝트 | 버즈 `MarketDev`(봉투에 `Project slug: marketadmin`) 30일 글: mcp-agents-memory 30% · 무태그 27% · **marketadmin 10%** · verification 9% |
+| 5 | 무태그 | 30일 글 36%(3,767/10,446). 절반이 일반 채널(general·dm·welcome) — 원래 프로젝트 없는 대화일 수 있음 |
+| 6 | d_tag 빈도 후보는 일반어 | 0.9.26 dryRun 새 후보 5개 전부 generic(cleanup·status-update·data-validation·data-verification·fix). 승격기 130건 중 66건 합성어 |
+
+### 외부 조사 요지 (출처는 이 섹션 PR 설명)
+
+- mem0·Supermemory·Zep: 프로젝트급 라벨은 **개발자가 정한 짧은 목록**에서만 고르고, 안 맞으면 "기타/미분류". 모델이 지어내지 않는다. mem0는 "3~5개" 권고.
+- Supermemory(container/bucket)·Cognee(node_set)·LangGraph(namespace): **프로젝트 층과 주제 층을 분리.** 어디도 프로젝트를 주제어 빈도에서 캐지 않는다.
+- Letta: 기존 태그 목록을 프롬프트에 넣어 재사용 유도. PoolParty: 이미 있는 말·제외 목록을 **먼저 빼고** 순위. AO3: 서로 다른 3명·3작품(퍼짐) 기준. Flickr 연구: 최빈 태그는 너무 일반적, 좋은 후보는 중간 빈도.
+- Stack Overflow: 영구 금지는 되살아나는 소수에만, 동의어는 자동 재매핑, 0회 태그 자동 삭제, 설명(wiki) 있는 태그는 삭제 면제. 반려 목록을 따로 두는 AI 메모리 제품은 조사 범위에 없음.
+
+### 원칙
+
+- **원본은 그대로, 파생값은 바꿀 수 있다** (2026-09-02 형 원칙). message·d_tag는 원본에 가깝고 p_tag는 파생값이다 → p_tag만 다시 붙이는 작업은 허용, d_tag를 새로 뽑는 재태깅(`worker.ts`의 `d_tag = $n`)은 금지.
+- 태거 동기 경로(`manage_knowledge` → `syncTagger` → `tagMessage`, GitNexus HIGH): 추가 조회는 인덱스 1회, 모델 호출 추가 금지.
+- zero-config: 명부가 비어 있으면(공개 사용자) 지금 동작 그대로.
+
+### 설계 — 4층, 출시 순서
+
+**L1 명부 (가장 큰 효과) — 0.9.27 구현.** `project_tags`에 `kind`(`project` / `category` / NULL=명부 밖)와 `paused`를 둔다. 별칭 행은 명부가 아니다. `description`(이미 있는 칼럼)은 명부에 올릴 때 한 줄 필수 — 태거 안내문.
+- 태거 후보 = 명부 **전부**(project + category, 설명 포함). 로컬 모델은 출력 형식으로 명부 이름·null만 허용. 명부가 비면 지금처럼 oldest 20.
+- 일반어 태그는 명부에 안 올리면 끝(kind NULL). **삭제하지 않는다** → T3(verification 423행 등) 문제가 삭제 없이 풀림. 명부 밖 태그는 태거 후보·브리핑 "활성 프로젝트"·승격기 소급에서 빠진다.
+- 기존 행의 p_tag는 L2 전까지 그대로. 예전으로 돌리기는 데이터만(명부 비우기, 5분 캐시).
+
+**L2 다시 붙이기 — p_tag만.** 새 저우선 작업: d_tag·message는 건드리지 않고 p_tag만 명부 기준으로 재판정.
+- 대상: (a) 정본이 명부 밖인 태그가 붙은 행, (b) 최근 N일 무태그 행. 고정(pinned) 행은 무태그일 때만.
+- 미리보기(dryRun)·백업·재개 가능·밤 시간·속도 제한. 로컬 Qwen ≈6초/행 → 1,000행 ≈1.7시간, 라이브 태깅과 llama 슬롯 2개를 나눠 쓴다.
+
+**L3 새 프로젝트 발견 — 프로젝트 모양 단서.**
+- 캡처 시 `workspace`(작업 폴더 이름; claude-code·codex·gemini·grok 캡처가 cwd를 이미 앎)와 버즈 채널 프로젝트 슬러그를 칼럼에 남긴다. **앞으로만** 채움(옛 행은 없음). 태거에는 정답이 아니라 힌트로 준다(실측 4: 채널≠프로젝트).
+- 새 프로젝트 후보 = 명부에 없는 workspace·채널 프로젝트가 **여러 세션·여러 날**(예: 3세션·2일 이상) 쓰였을 때. 같은 주 1회 DM 흐름.
+- 태거 `NEW:<이름>`은 콜드패스에선 만들지 않고(p_tag NULL), `manage_knowledge` 동기 경로에선 **그 자리의 에이전트에게 묻는다**(응답에 "새 프로젝트 X로 보임 — 등록할까?"). 주 1회 DM으로 미루면 그 행은 무태그로 남고 승인해도 이름이 d_tag에 없어 소급이 안 된다(버즈 쿠우 실측 242행 중 1행).
+- d_tag 빈도 승격기: 은퇴 또는 저우선 발견용으로 축소.
+
+**L4 질문 다듬기.** DM 한 번 최대 10개·매번 전부 결정. 반려 3종: 영원히 아님(일반어) / X와 같음(별칭) / 지금은 아님(8주 뒤 재검토). 분류 프롬프트에 "이 이름이 글의 *유일한* 라벨일 수 있나?" 테스트(Stack Overflow meta-tag 기준).
+
+### 형 결정 (2026-10-04)
+
+| # | 결정 | 결과 |
+|---|---|---|
+| a | 명부 | ✅ 아래 표로 확정 (2026-10-04) |
+| b | 버즈·슬랙 채널 → 프로젝트 힌트 지도 | ✅ 분명한 둘만: `MarketDev`→marketadmin, `Analyze_YouTube`→youtube-channel-analyzer. 일반 채널은 힌트 없음 |
+| c | d_tag 빈도 승격기 | ✅ 은퇴 — 새 프로젝트는 L3 단서(작업 폴더·채널)로 발견 |
+| d | 옛 무태그 행 되살리기 범위 | ✅ 최근 30일부터(≈3,800행), 결과 보고 확대 결정 |
+
+**명부 (a, 2026-10-04 형 확정).** 기존 태그 중 "진짜"를 고르는 대신 **지금의 진짜 프로젝트**를 정했다 — 확인해 보니 ✅로 보였던 태그(track-1-ship·notion-integration 등)도 태거가 20개 안에 밀어 넣은 탓에 내용이 섞여 있었다.
+
+| 명부 이름 | 한 줄 설명 | 상태 | 합칠 옛 태그(내용이 깨끗한 것만) |
+|---|---|---|---|
+| mcp-agents-memory | 기억 시스템(메모리 DB·태거·라이브러리언) | 진행 | project-v5.0 |
+| marketadmin | 마켓 관리자(스마트스토어·카페24 연동) | 진행 | smartstore, cafe24 |
+| pacefy | 러닝 앱(안드로이드·iOS, GPS) | 진행 | android, ios |
+| centragens | 센트라젠, 키토부스터·메타밸런스 브랜드·마케팅 | 진행 | keto-booster |
+| bodygajim | 몸가짐 유튜브 채널 제작 | 진행 | bodygajim-youtube |
+| youtube-channel-analyzer | 유튜브 채널 분석기(YCA) | 진행 | |
+| buzz | 버즈 협업공간(에이전트 팀 운영) | 진행 | |
+| market-intel | 광고·시장 조사 | 진행 | advertising |
+| cosmetic-brand | 화장품 브랜드 기획 | ⏸ 멈춤 | |
+| gonggu | 공구 분석(인플루언서 발굴·Subo 포함, 분석 로직 예정) | ⏸ 멈춤 | |
+| personal-preferences (분류) | 형에 대한 기억(호칭·말투·개인 사정) | — | |
+| people-profiles (분류) | 사람·에이전트 프로필 | — | |
+
+- 형도 모르는 04-29 가져오기 이름 6개(track-1-ship·project-track-1·notion-integration·gempro-design-project·outsourcing-production·project-claude-code-v0.4)와 섞인 태그(librarian-project·filming-project·fresh-neon-db 등)는 **topic으로 내리고 합치지 않는다** — 합치면 옛 글이 통째로 새 프로젝트로 들어가 명부가 처음부터 오염된다. 최근 30일 글은 L2가 명부 설명으로 다시 붙인다.
+- 멈춘(⏸) 프로젝트도 명부에 둔다 — 다시 얘기할 때 태거가 붙일 수 있게. 브리핑 "활성 프로젝트"에서만 뺀다.
+- 분류 2개는 프로젝트는 아니지만 태거 후보에 둔다(mem0 기본 분류의 personal details·preferences와 같은 자리).
+
+---
+
 ## 반복 검출 패턴 (memory cross-ref)
 
 - `feedback_root_cause_not_eyeball_fix.md` — narrow-first reflex

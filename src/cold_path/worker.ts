@@ -258,7 +258,7 @@ async function maybeRunPromotion(): Promise<void> {
   try {
     const result = await runDtagPromotion();
     if (result.suggested.length > 0 || result.retrotagged > 0 || result.superseded > 0 || result.deferred > 0) {
-      console.error(`🏷️ [DTagPromoter] suggested=${result.suggested.length}, refreshed=${result.refreshed}, blocked=${result.blocked}, deferred=${result.deferred}, superseded=${result.superseded}, retrotagged=${result.retrotagged} rows`);
+      console.error(`🏷️ [DTagPromoter] ${result.registry ? 'registry ' : ''}suggested=${result.suggested.length}, refreshed=${result.refreshed}, blocked=${result.blocked}, deferred=${result.deferred}, superseded=${result.superseded}, retrotagged=${result.retrotagged} rows`);
     }
   } catch (err) {
     console.error("⚠️ [DTagPromoter] promotion error (non-blocking):", err);

@@ -15,6 +15,9 @@
  *        사람이 manage_project_tags로 승인하면 그때 태그를 만들고 소급 태깅한다.
  *        한 번 끝난(반려·승인·대체) 이름은 다시 제안하지 않는다.
  *
+ * 명부 모드(0.9.27, DEVLOG §24 L1 — 형 결정 c "빈도 승격기 은퇴"): 명부에 한 줄이라도 있으면 새 이름을 제안하지
+ * 않고, 명부 이름(또는 그 별칭)과 같은 d_tag만 소급한다. 명부 밖 옛 태그(verification 등)로는 더 이상 소급하지 않는다.
+ *
  * 0.9.24까지는 LLM이 비슷한 d_tag를 클러스터로 묶어 합산하고 멤버 d_tag까지 소급했다. 묶음이 헛짚는 일이
  * 많았고(지어낸 이름 66건, 소급 0행) 사람은 이름만 보고 승인하므로, 클러스터링을 빼고 이름 하나씩 본다.
  *
@@ -31,6 +34,7 @@ import { getDefaultUserId } from "../users.js";
 import { callRole, ROLE_REGISTRY } from "../model_registry.js";
 import { invalidateCandidateCache } from "./tagger.js";
 import { normalizeTag, parseRecommendation, type Recommendation } from "./dtag_suggest_gate.js";
+import { REGISTRY_MEMBER_SQL, isUndefinedColumn } from "./project_registry.js";
 
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -60,6 +64,43 @@ export interface PromotionSummary {
   superseded: number;
   /** 기존 태그로 소급 업데이트된 row 수 합계 */
   retrotagged: number;
+  /** 명부 모드였는지 (새 제안 없음, 명부 이름만 소급) */
+  registry: boolean;
+}
+
+/** 명부 모드인가: 명부 항목이 하나라도 있으면. kind 칼럼이 없으면(마이그레이션 031 전) false, 다른 오류는 던진다. */
+export async function isRegistryMode(): Promise<boolean> {
+  try {
+    const r = await db.query(`SELECT EXISTS (SELECT 1 FROM project_tags WHERE ${REGISTRY_MEMBER_SQL}) AS on`);
+    return r.rows[0]?.on === true;
+  } catch (err) {
+    if (!isUndefinedColumn(err)) throw err;
+    return false;
+  }
+}
+
+/**
+ * 명부 모드의 소급: 명부 이름과 그 별칭마다, 같은 이름의 d_tag를 가진 미태깅 행에 붙인다.
+ * 빈도 상위 50·임계값을 거치지 않는다 — 사람이 이미 고른 이름이고, 명부 이름은 대개 일반어보다 드물어
+ * 빈도 창 안에 못 들어온다(0.9.26이 반려 이름에서 본 것과 같은 자리 부족).
+ */
+async function retrotagRegistry(userId: number, dryRun: boolean): Promise<number> {
+  const names = await db.query(
+    `SELECT pt.id, pt.name
+       FROM project_tags pt
+       JOIN project_tags c ON c.id = canonical_project_tag_id(pt.id)
+      WHERE c.kind IS NOT NULL AND c.alias_of IS NULL`
+  );
+  if (dryRun) return 0;
+  let total = 0;
+  for (const r of names.rows) {
+    const n = await retrotag(db, userId, Number(r.id), String(r.name));
+    if (n > 0) {
+      total += n;
+      console.error(`🏷️ [DTagPromoter] retrotagged ${n} rows with "${r.name}" (registry)`);
+    }
+  }
+  return total;
 }
 
 // 2026-10-03 오프라인 실측(로컬 Qwen3-14B, 실제 이름 70개): 알려진 프로젝트 5개 모두 project,
@@ -192,9 +233,16 @@ export async function runDtagPromotion(opts: { dryRun?: boolean } = {}): Promise
   const minCount = envInt('DTAG_PROMOTE_MIN_COUNT', 10);
   const windowDays = envInt('DTAG_PROMOTE_WINDOW_DAYS', 30);
   const userId = await getDefaultUserId();
-  const summary: PromotionSummary = { suggested: [], refreshed: 0, blocked: 0, deferred: 0, superseded: 0, retrotagged: 0 };
+  const registry = await isRegistryMode();
+  const summary: PromotionSummary = { suggested: [], refreshed: 0, blocked: 0, deferred: 0, superseded: 0, retrotagged: 0, registry };
 
   if (!dryRun) summary.superseded = await supersedeExisting(userId);
+
+  // 명부 모드(형 결정 c: 빈도 승격기 은퇴): 새 제안 없이 명부 이름만 소급하고 끝
+  if (registry) {
+    summary.retrotagged = await retrotagRegistry(userId, dryRun);
+    return summary;
+  }
 
   // 1. 최근 N일 d_tag 빈도 집계 (tag_processed=TRUE인 row만). 반려된 이름은 상위 50개를 자르기 전에 뺀다 —
   //    그대로 두면 아무 일도 안 하면서 자리만 차지해, 반려가 쌓일수록 새 이름이 못 올라온다
@@ -340,6 +388,22 @@ export async function confirmNewTagSuggestion(
     const pTagId = created
       ? Number(inserted.rows[0].id)
       : Number((await client.query(`SELECT id FROM project_tags WHERE name = $1`, [name])).rows[0].id);
+    // 명부 모드면 승인한 이름을 명부(project)에 올린다 — 안 그러면 태거 후보에 안 들어가 바로 묻힌다.
+    // 명부가 비어 있으면 건드리지 않는다(승인 하나로 명부 모드가 켜지면 후보가 1개로 줄어든다).
+    // kind 칼럼이 없으면(마이그레이션 031 전) 건너뛴다.
+    await client.query("SAVEPOINT registry_kind");
+    try {
+      await client.query(
+        `UPDATE project_tags SET kind = 'project', updated_at = NOW()
+          WHERE id = $1 AND kind IS NULL AND alias_of IS NULL
+            AND EXISTS (SELECT 1 FROM project_tags WHERE ${REGISTRY_MEMBER_SQL})`,
+        [pTagId]
+      );
+      await client.query("RELEASE SAVEPOINT registry_kind");
+    } catch (err) {
+      await client.query("ROLLBACK TO SAVEPOINT registry_kind");
+      if (!isUndefinedColumn(err)) throw err;  // 칼럼 없음만 건너뛰고 나머지(잠금 등)는 승인 자체를 실패시킨다
+    }
     const n = await retrotag(client, userId, pTagId, name);
 
     await client.query(

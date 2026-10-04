@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.9.27 — 2026-10-04
+
+### Project registry: the tagger picks from a short, human-chosen list
+
+The tagger only ever saw the 20 oldest project tags (`TAGGER_CANDIDATE_STRATEGY`
+defaults to `oldest` with a limit of 20). All 20 came from the first import on
+04-29, so projects created after that (`marketadmin`, `pacefy`, `buzz`,
+`youtube-channel-analyzer`, …) were never offered as choices, and the list
+mixed generic words and version names (`dev-environment`, `opus-4.7`,
+`project-v0.5.3`). Design: DEVLOG §24.
+
+- `project_tags` gets `kind` (`project` or `category`; NULL = not in the
+  registry) and `paused` (migration 031). A tag that is an alias is never a
+  registry member.
+- Registry mode turns on as soon as one registry member exists:
+  - The tagger is offered every registry tag with its description. On a local
+    model the output schema only allows a registry name or null. Any answer
+    is still checked: only a registry tag or an alias of one is accepted.
+    Anything else, including old tags that still exist, leaves `p_tag` NULL,
+    and `NEW:<name>` creates nothing.
+  - The d_tag promoter makes no new suggestions. Every run it retro-tags
+    untagged memories whose d_tag equals a registry name or an alias of one,
+    regardless of how often the name is used.
+  - The startup brief's active projects list shows only registry projects that
+    are not paused.
+  - `confirm_new_tag` and `apply_recommendations` add the confirmed name to the
+    registry, without a description. When the registry is empty they do not,
+    because one confirm would otherwise turn registry mode on with a single
+    candidate.
+- The old behavior applies only when the registry is empty or the `kind`
+  column does not exist (before migration 031). Other database errors are
+  thrown, so the caller retries; a temporary error no longer switches modes.
+  Turning the registry off is a data change, not a release: unregister the
+  entries and the old behavior returns within the 5-minute candidate cache.
+- `manage_project_tags` gains:
+  - `list_registry`. An entry that has become an alias is flagged.
+  - `register_project`: tag and a one-line description (≤200 characters) are
+    required; kind and paused are optional. When an entry is updated, a kind or
+    paused value that is not given stays as it was. Alias tags are refused.
+    Registering closes a pending new-tag suggestion with the same name.
+  - `unregister_project`.
+- `set_alias` and `confirm_alias` refuse a registry entry as the source, which
+  would drop it from the registry without notice.
+- `npm run check:registry` tests the rules (`src/cold_path/project_registry.ts`).
+
+Run `mcp-agents-memory migrate` before starting this version.
+
 ## 0.9.26 — 2026-10-04
 
 ### Rejected names no longer take up the promoter's candidate slots
