@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.9.28 — 2026-10-04
+
+### Registry retro-tagging uses registry names only, not their aliases
+
+In 0.9.27 the promoter retro-tagged untagged memories whose d_tag matched a
+registry name *or any alias of one*. An alias means "this old tag was merged
+into that project", not "every mention of this word belongs to that project".
+A memory the tagger deliberately left untagged, for example work on an
+Android proxy phone, got `pacefy` ten minutes later because its d_tag was
+`android`.
+
+- Registry retro-tagging now matches registry names only.
+- Aliases are still used to resolve the tagger's answer and to show old tagged
+  memories under their project.
+- Rows already retro-tagged through an alias are left as they are. All 14 from
+  the first 0.9.27 run were checked by hand and are correct.
+
 ## 0.9.27 — 2026-10-04
 
 ### Project registry: the tagger picks from a short, human-chosen list

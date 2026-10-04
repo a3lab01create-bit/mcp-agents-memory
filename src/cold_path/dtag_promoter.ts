@@ -16,7 +16,7 @@
  *        한 번 끝난(반려·승인·대체) 이름은 다시 제안하지 않는다.
  *
  * 명부 모드(0.9.27, DEVLOG §24 L1 — 형 결정 c "빈도 승격기 은퇴"): 명부에 한 줄이라도 있으면 새 이름을 제안하지
- * 않고, 명부 이름(또는 그 별칭)과 같은 d_tag만 소급한다. 명부 밖 옛 태그(verification 등)로는 더 이상 소급하지 않는다.
+ * 않고, 명부 이름과 같은 d_tag만 소급한다(0.9.28부터 별칭 이름 제외). 명부 밖 옛 태그(verification 등)로는 더 이상 소급하지 않는다.
  *
  * 0.9.24까지는 LLM이 비슷한 d_tag를 클러스터로 묶어 합산하고 멤버 d_tag까지 소급했다. 묶음이 헛짚는 일이
  * 많았고(지어낸 이름 66건, 소급 0행) 사람은 이름만 보고 승인하므로, 클러스터링을 빼고 이름 하나씩 본다.
@@ -80,16 +80,16 @@ export async function isRegistryMode(): Promise<boolean> {
 }
 
 /**
- * 명부 모드의 소급: 명부 이름과 그 별칭마다, 같은 이름의 d_tag를 가진 미태깅 행에 붙인다.
+ * 명부 모드의 소급: 명부 이름마다, 같은 이름의 d_tag를 가진 미태깅 행에 붙인다.
  * 빈도 상위 50·임계값을 거치지 않는다 — 사람이 이미 고른 이름이고, 명부 이름은 대개 일반어보다 드물어
  * 빈도 창 안에 못 들어온다(0.9.26이 반려 이름에서 본 것과 같은 자리 부족).
+ * 별칭 이름(android·ios·youtube…)으로는 소급하지 않는다(0.9.28): 별칭은 "옛 태그를 합친다"는 뜻이지
+ * "그 단어가 나오면 그 프로젝트"가 아니다. 태거가 일부러 비워 둔 글(S20 안드로이드 프록시 등)에 별칭 단어
+ * 하나로 프로젝트가 찍히면 안 된다. 별칭은 태거 답 해석과 옛 행의 읽기 투영에만 쓴다.
  */
 async function retrotagRegistry(userId: number, dryRun: boolean): Promise<number> {
   const names = await db.query(
-    `SELECT pt.id, pt.name
-       FROM project_tags pt
-       JOIN project_tags c ON c.id = canonical_project_tag_id(pt.id)
-      WHERE c.kind IS NOT NULL AND c.alias_of IS NULL`
+    `SELECT id, name FROM project_tags WHERE ${REGISTRY_MEMBER_SQL}`
   );
   if (dryRun) return 0;
   let total = 0;
