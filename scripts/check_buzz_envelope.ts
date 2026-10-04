@@ -4,7 +4,7 @@
  *   npm run check:envelope        # esbuild로 묶어서 실행
  */
 import assert from "node:assert/strict";
-import { buzzEmbeddingText, buzzQuotedMessages, cleanBuzzEnvelope, venueFromBuzzContext, venueFromBuzzMessage } from "../src/auto_save/buzz_envelope.ts";
+import { buzzDisplayText, buzzEmbeddingText, buzzQuotedMessages, cleanBuzzEnvelope, venueFromBuzzContext, venueFromBuzzMessage } from "../src/auto_save/buzz_envelope.ts";
 import { buzzTurnVenue, classifySessionVenue, lastBuzzVenueInFile } from "../src/auto_save/venue.ts";
 import fs from "node:fs";
 import os from "node:os";
@@ -251,18 +251,33 @@ check("인용 읽기: 모양을 모르면 null (→ 정리 안 함)", () => {
   assert.equal(buzzQuotedMessages([CONTEXT, QUOTES.replace("(2026-09-30T11:24:02+00:00)", "(어제)"), EVENT].join("\n")), null, "시각 모양이 다름");
 });
 
-check("임베딩 입력: 정리된 버즈 턴은 방 정보·이벤트 머리글 빼고 사람 말만", () => {
+check("임베딩 입력: 방 정보·이벤트 머리글·래퍼 태그·반복 라벨을 걷고 사람 말만", () => {
   const cleaned = clean(BASE, PREAMBLE, CONTEXT, HISTORY, EVENT)!;
   const out = buzzEmbeddingText(cleaned);
   assert.ok(!out.includes("<context>") && !out.includes("Project slug") && !out.includes("Event ID:"));
-  assert.ok(out.includes("Content: NEW-MESSAGE-SENTINEL please check the deploy") && out.includes("From: Owner"));
+  // 래퍼 태그 한 줄과 반복 라벨은 빠지고, 값은 남는다
+  assert.ok(!out.includes("<buzz-event"), "래퍼 여는 태그");
+  assert.ok(!out.includes("</buzz-event"), "래퍼 닫는 태그");
+  assert.ok(!out.includes("Content: ") && !out.includes("From: "), "반복 라벨");
+  assert.ok(out.includes("NEW-MESSAGE-SENTINEL please check the deploy"), "본문은 남는다");
+  assert.ok(out.includes("Owner"), "보낸 사람 값은 남는다");
+  assert.ok(!out.includes("HISTORY-SENTINEL"), "이력은 임베딩에 안 들어간다");
   assert.equal(buzzEmbeddingText(out), out, "두 번 적용해도 같음");
 });
 
-check("임베딩 입력: 버즈 턴 모양이 아니면 그대로", () => {
+check("임베딩 입력: 이력이 끼어 있어도 그 뒤 턴을 찾는다 / 턴이 없으면 그대로", () => {
   assert.equal(buzzEmbeddingText("평범한 메시지"), "평범한 메시지");
+  // 정리기가 거절한 봉투(이력 그대로 남은 행)도 이력을 건너뛰고 이번 턴만 임베딩한다.
+  // 전에는 원문을 그대로 돌려줘서 이력까지 벡터에 들어갔다 (실측 미정리 31행 전부 ratio 1.000).
   const withHistory = [CONTEXT, HISTORY, EVENT].join("\n");
-  assert.equal(buzzEmbeddingText(withHistory), withHistory, "context 뒤에 이전 대화 블록이 끼면 손대지 않음");
+  const out = buzzEmbeddingText(withHistory);
+  assert.notEqual(out, withHistory, "이제는 손댄다");
+  assert.ok(!out.includes("HISTORY-SENTINEL"), "이력은 빠진다");
+  assert.ok(!out.includes("<context>"), "방 정보도 빠진다");
+  assert.ok(out.includes("NEW-MESSAGE-SENTINEL please check the deploy"), "이번 턴은 남는다");
+  // 이력 뒤에 턴 블록이 없으면 경계를 모르는 것 → 손대지 않는다
+  const historyNoTurn = [CONTEXT, HISTORY].join("\n");
+  assert.equal(buzzEmbeddingText(historyNoTurn), historyNoTurn, "이력 뒤에 턴 블록이 없음");
   const contextOnly = CONTEXT + "\n그냥 글";
   assert.equal(buzzEmbeddingText(contextOnly), contextOnly, "context 뒤가 이번 턴 블록이 아님");
 });
@@ -273,6 +288,7 @@ check("임베딩 입력: 사람이 쓴 비슷한 줄은 남기고, 병적인 줄
   const out = buzzEmbeddingText(turn);
   assert.ok(!out.includes("Event ID:") && !out.includes("Kind: 9") && !out.includes("2026-09-16T") && !out.includes("Tags:"));
   assert.ok(out.includes("Time: 3pm Thursday") && out.includes("Kind: urgent"));
+  assert.ok(out.includes("회의 잡자") && !out.includes("Content: 회의 잡자"), "라벨만 떼고 값은 남긴다");
   const t0 = performance.now();
   buzzEmbeddingText(CONTEXT + "\n<buzz-event>\nFrom: x" + " (npub:".repeat(150000) + "\u2028");
   const ms = performance.now() - t0;
@@ -326,6 +342,30 @@ check("venue: 큰 기록 파일을 뒤에서 거꾸로 읽어 직전 턴 채널 
     assert.equal(lastBuzzVenueInFile(f, size, userText), "buzz:DevRoom", "청크 여러 개 건너 첫 턴까지");
     assert.equal(lastBuzzVenueInFile(f, 10, userText), null, "범위 안에 턴 없음");
   } finally { fs.unlinkSync(f); }
+});
+
+check("반환 본문: <context> 블록만 접고 나머지는 글자 그대로 (행 수정 0)", () => {
+  const cleaned = clean(BASE, PREAMBLE, CONTEXT, HISTORY, EVENT)!;
+  const out = buzzDisplayText(cleaned);
+  assert.ok(!out.includes("<context>") && !out.includes("Project slug"), "방 정보는 접는다");
+  // 임베딩용과 달리 전문을 보존한다 — 래퍼·라벨·이벤트 머리글 전부 그대로
+  assert.ok(out.startsWith('<buzz-event type="@mention">'), "래퍼로 시작");
+  assert.ok(out.includes(`Event ID: ${HEX}`), "이벤트 머리글 보존");
+  assert.ok(out.includes("Content: NEW-MESSAGE-SENTINEL please check the deploy"), "라벨째 보존");
+  assert.ok(cleaned.endsWith(out), "접은 뒤는 원문의 꼬리와 글자 그대로 같다");
+  assert.equal(buzzDisplayText(out), out, "두 번 적용해도 같음");
+});
+
+check("반환 본문: 이력은 남기고(유일 사본일 수 있다) 버즈 턴 아니면 손대지 않음", () => {
+  const withHistory = [CONTEXT, HISTORY, EVENT].join("\n");
+  const out = buzzDisplayText(withHistory);
+  assert.ok(out.includes("HISTORY-SENTINEL"), "이력은 반환에 남긴다 — 임베딩과 반대");
+  assert.ok(!out.includes("<context>"), "방 정보는 접는다");
+  assert.equal(buzzDisplayText("평범한 메시지"), "평범한 메시지");
+  const contextOnly = CONTEXT + "\n그냥 글";
+  assert.equal(buzzDisplayText(contextOnly), contextOnly, "사람이 <context> 로 시작하는 글을 쓴 경우");
+  const historyNoTurn = [CONTEXT, HISTORY].join("\n");
+  assert.equal(buzzDisplayText(historyNoTurn), historyNoTurn, "이력 뒤에 턴 블록이 없음");
 });
 
 console.log("all checks passed");

@@ -203,6 +203,35 @@ const EVENT_HEADER =
   /^(?:Event ID: [0-9a-f]{64}|Kind: \d+|Time: \d{4}-\d{2}-\d{2}T\S+|--- Event \d+ \(.*\) ---|Note: A new message arrived while you were working\..*)\s*$/;
 
 /**
+ * 봉투 래퍼 줄 — 한 줄이 통째로 여닫는 태그인 것 (`<buzz-event type="…">`, `</buzz-events>` 등).
+ * briefing.ts 가 preview 에서 같은 모양을 걷어낸다(거기선 표시용, 여기선 임베딩용).
+ */
+const WRAPPER_LINE = /^<\/?[a-z-]+(\s[^>]*)?>\s*$/;
+
+/**
+ * 봉투가 매 턴 똑같이 붙이는 라벨. 값은 남기고 라벨만 뗀다 — 반복되는 라벨 낱말이
+ * 짧은 글의 벡터를 지배해서 봉투 글끼리 뭉치게 만든다 (실측: 임베딩 입력 200자 미만
+ * 426행에서 래퍼·라벨이 입력 字의 53.3%).
+ */
+const EVENT_LABEL = /^(?:Channel|From|Content): /;
+
+/**
+ * `</context>` 뒤에서 이번 턴 블록을 찾는다. 바로 오면 그대로, 이력
+ * (<thread-context>/<conversation-context>)이 끼어 있으면 그 닫는 태그 뒤부터.
+ * 둘 다 아니면 null → 호출자는 원문을 쓴다.
+ */
+function turnAfterContext(tail: string): string | null {
+  if (TURN_OPEN.test(tail)) return tail;
+  const history = HISTORY_OPEN.exec(tail);
+  if (!history) return null;
+  const closeTag = `</${history[1]}>`;
+  const close = tail.indexOf(closeTag, history[0].length);
+  if (close < 0) return null;
+  const rest = tail.slice(close + closeTag.length);
+  return TURN_OPEN.test(rest) ? rest : null;
+}
+
+/**
  * 임베딩 입력용 텍스트. 정리된 버즈 턴(<context> 바로 뒤에 이번 턴 블록)이면 방 정보와
  * 이벤트 머리글(ID·종류·시각·npub/hex)을 빼고 사람 말만 남긴다. 저장 본문(message)은
  * 그대로다 — 방 정보는 태깅엔 도움이 되지만(프로젝트 slug) 임베딩에선 모든 행에 같은
@@ -214,18 +243,47 @@ export function buzzEmbeddingText(message: string): string {
     if (!message.startsWith("<context>\n")) return message;
     const close = message.indexOf(CONTEXT_CLOSE);
     if (close < 0) return message;
-    const turn = message.slice(close + CONTEXT_CLOSE.length);
-    if (!TURN_OPEN.test(turn)) return message;
+    const turn = turnAfterContext(message.slice(close + CONTEXT_CLOSE.length));
+    if (turn === null) return message;
     const text = turn
       .split("\n")
-      .filter((line) => !EVENT_HEADER.test(line) && !isNostrMetaLine(line))
+      .filter(
+        (line) => !EVENT_HEADER.test(line) && !isNostrMetaLine(line) && !WRAPPER_LINE.test(line.trim())
+      )
       .map((line) =>
         // `$` 없이: 끝까지 되짚는 역추적을 막는다 (긴 줄에서 제곱 시간)
-        line.replace(/^From: (.*?) \(npub:.*/, "From: $1").replace(/^Channel: (\S+) \(#[0-9a-f-]+\)/, "Channel: $1")
+        line
+          .replace(/^From: (.*?) \(npub:.*/, "From: $1")
+          .replace(/^Channel: (\S+) \(#[0-9a-f-]+\)/, "Channel: $1")
+          .replace(EVENT_LABEL, "")
       )
       .join("\n")
       .trim();
     return text || message;
+  } catch {
+    return message;
+  }
+}
+
+/**
+ * 검색 결과 반환용 본문. 정리된 버즈 턴이면 매 턴 같은 <context> 블록(방 메타데이터·답장
+ * 지시문)을 떼고 그 뒤를 그대로 돌려준다 — 자리는 결과의 venue 칸이, 프로젝트는 p_tag 칸이
+ * 대신한다 (briefing.ts:rowToMsg 가 같은 이유로 preview 에서 떼고 있다). 줄바꿈은 보존한다:
+ * briefing 은 한 줄로 접지만 검색은 전문이 필요하다.
+ *
+ * 저장 본문(message)·raw_message·태깅은 건드리지 않는다 — 읽기 시점 변환이라 행 수정이 0이고,
+ * 태거가 방 정보를 보고 프로젝트를 따라가는 근거와 충돌하지 않는다.
+ * 실측: 대조군 두 쿼리의 top10 반환 字에서 <context> 몫이 48.0% / 59.2%.
+ */
+export function buzzDisplayText(message: string): string {
+  try {
+    if (!message.startsWith("<context>\n")) return message;
+    const close = message.indexOf(CONTEXT_CLOSE);
+    if (close < 0) return message;
+    const tail = message.slice(close + CONTEXT_CLOSE.length).replace(/^\r?\n+/, "");
+    // 버즈 턴 모양이 아니면(사람이 <context> 로 시작하는 글을 쓴 경우 등) 손대지 않는다
+    if (turnAfterContext(tail) === null) return message;
+    return tail || message;
   } catch {
     return message;
   }

@@ -19,6 +19,7 @@ import { getDefaultUserId } from "../users.js";
 import { embedMessage, vectorToHalfvecSql } from "../cold_path/embedder.js";
 import os from "node:os";
 import { hasMemoryColumn } from "../memory_columns.js";
+import { buzzDisplayText } from "../auto_save/buzz_envelope.js";
 
 const DEFAULT_LIMIT = 10;
 const DEFAULT_FALLBACK_THRESHOLD = 0.3;
@@ -225,7 +226,7 @@ date_range 인식 형식:
           rows = r.rows.map((row: any) => ({
             id: Number(row.id),
             role: row.role,
-            message: row.message,
+            message: buzzDisplayText(row.message),
             agent_platform: row.agent_platform,
             agent_model: row.agent_model,
             device_name: row.device_name ?? null,
@@ -294,7 +295,7 @@ date_range 인식 형식:
             rows = r.rows.map((row: any) => ({
               id: Number(row.id),
               role: row.role,
-              message: row.message,
+              message: buzzDisplayText(row.message),
               agent_platform: row.agent_platform,
               agent_model: row.agent_model,
               device_name: row.device_name ?? null,
@@ -324,7 +325,7 @@ date_range 인식 형식:
         rows = r.rows.map((row: any) => ({
           id: Number(row.id),
           role: row.role,
-          message: row.message,
+          message: buzzDisplayText(row.message),
           agent_platform: row.agent_platform,
           agent_model: row.agent_model,
           device_name: row.device_name ?? null,
