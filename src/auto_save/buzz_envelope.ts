@@ -70,8 +70,10 @@ const QUOTE_ENTRY =
 function isNostrMetaLine(line: string): boolean {
   return (
     (/^Tags: \[\[".*\]\]\s*$/.test(line) && /[0-9a-f]{64}/.test(line)) ||
-    // `mentions=[이름 (hex)]` 과 `mentions=[hex]`(이름 없는 구버전) 둘 다 — 후자를 빼면 hex 가 벡터에 남는다(관측 59건)
-    /^Parsed: (?:root=[0-9a-f]{64}|mentions=\[(?:.*\()?[0-9a-f]{64})/.test(line)
+    // `Parsed:` 꼬리표의 키는 순서·종류가 섞인다 — 관측: `root=`, `mentions=[이름 (hex)]`,
+    // `mentions=[hex]`(이름 없는 구버전), `parent=…, root=…`(스레드 답글, 관측 4건 / 3행).
+    // 그래서 특정 키로 앵커하지 말고 **첫 키가 hex 값을 갖는 꼬리표**인지로 본다.
+    /^Parsed: (?:[a-z_]+=(?:\[(?:.*\()?)?[0-9a-f]{64})/.test(line)
   );
 }
 

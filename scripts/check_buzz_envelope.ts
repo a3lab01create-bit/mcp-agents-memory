@@ -413,6 +413,12 @@ check("임베딩 입력: 이름 없는 Parsed 꼬리표와 설명서(<base>) 봉
   // 사람이 쓴 비슷한 줄은 보존 (hex 가 없으면 꼬리표가 아니다)
   const humanish = bare.replace(`Parsed: mentions=[${HEX}]`, "Parsed: mentions=[나랑 형]");
   assert.ok(buzzEmbeddingText(humanish).includes("나랑 형"), "hex 없는 비슷한 줄은 남긴다");
+  // 키 종류·순서가 섞인 변종도 (관측: 스레드 답글의 `parent=…, root=…`, 4건 / 3행)
+  for (const tail of [`parent=${HEX}, root=${HEX}`, `root=${HEX}`, `mentions=[Owner (${HEX})]`, `e=${HEX}`]) {
+    const v = bare.replace(`Parsed: mentions=[${HEX}]`, `Parsed: ${tail}`);
+    assert.ok(!buzzEmbeddingText(v).includes(HEX), `Parsed 변종 '${tail.slice(0, 14)}…' 제거`);
+    assert.ok(buzzEmbeddingText(v).includes("BARE-PARSED-SENTINEL"), "사람 말은 남는다");
+  }
 
   // 설명서(<base>) 봉투 (관측 2행) — 전에는 가드에 걸려 설명서째 임베딩됐다
   const withBase = [BASE, PREAMBLE, CONTEXT, EVENT].join("\n");
