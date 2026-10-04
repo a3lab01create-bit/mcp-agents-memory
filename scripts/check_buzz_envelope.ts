@@ -400,4 +400,28 @@ check("임베딩 입력: <context> 없이 턴 블록부터 시작하는 봉투�
   assert.equal(buzzEmbeddingText("<unknown-block>\nZ\n</unknown-block>"), "<unknown-block>\nZ\n</unknown-block>");
 });
 
+check("임베딩 입력: 이름 없는 Parsed 꼬리표와 설명서(<base>) 봉투도 걷는다", () => {
+  // Parsed: mentions=[hex]  — 이름·괄호 없는 구버전 (관측 59건). 전에는 hex 가 벡터에 남았다.
+  const bare = [CONTEXT, '<buzz-event type="@mention">', "Content: BARE-PARSED-SENTINEL",
+    `Parsed: mentions=[${HEX}]`, "</buzz-event>"].join("\n");
+  const out = buzzEmbeddingText(bare);
+  assert.ok(out.includes("BARE-PARSED-SENTINEL"), "사람 말은 남는다");
+  assert.ok(!out.includes(HEX), "이름 없는 mentions 의 hex 도 제거");
+  // 이름 있는 변종도 계속 걷힌다 (회귀 방지)
+  const named = bare.replace(`mentions=[${HEX}]`, `mentions=[Owner (${HEX})]`);
+  assert.ok(!buzzEmbeddingText(named).includes(HEX), "이름 있는 변종 회귀 없음");
+  // 사람이 쓴 비슷한 줄은 보존 (hex 가 없으면 꼬리표가 아니다)
+  const humanish = bare.replace(`Parsed: mentions=[${HEX}]`, "Parsed: mentions=[나랑 형]");
+  assert.ok(buzzEmbeddingText(humanish).includes("나랑 형"), "hex 없는 비슷한 줄은 남긴다");
+
+  // 설명서(<base>) 봉투 (관측 2행) — 전에는 가드에 걸려 설명서째 임베딩됐다
+  const withBase = [BASE, PREAMBLE, CONTEXT, EVENT].join("\n");
+  const b = buzzEmbeddingText(withBase);
+  assert.ok(!b.includes("MANUAL-SENTINEL"), "설명서 본문 제거");
+  assert.ok(!b.includes("AGENT-CONFIG") && !b.includes("CORE"), "설정 블록 제거");
+  assert.ok(!b.includes("<context>") && !b.includes("Project slug"), "방 정보 제거");
+  assert.ok(b.includes("NEW-MESSAGE-SENTINEL please check the deploy"), "이번 턴은 남는다");
+  assert.equal(buzzEmbeddingText(b), b, "두 번 적용해도 같음");
+});
+
 console.log("all checks passed");
