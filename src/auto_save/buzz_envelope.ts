@@ -216,6 +216,14 @@ const WRAPPER_LINE = /^<\/?[a-z-]+(\s[^>]*)?>\s*$/;
 const EVENT_LABEL = /^(?:Channel|From|Content): /;
 
 /**
+ * 라벨을 뗀 뒤 값만 남는 식별자 줄 — 사람 말이 아니다.
+ * 구버전 봉투는 `Channel: <uuid>`(이름 없음)·`From: npub1… (hex: …)` 모양이라 아래 이름 치환이
+ * 안 걸리고, 라벨만 떼면 uuid·npub·hex 가 그대로 벡터에 들어간다 (관측 218행, 임베딩 입력의 58%).
+ */
+const IDENTIFIER_ONLY =
+  /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|npub1[0-9a-z]{20,}(?:\s*\(hex:\s*[0-9a-f]{64}\))?|[0-9a-f]{64})$/;
+
+/**
  * `</context>` 뒤에서 이번 턴 블록을 찾는다. 바로 오면 그대로, 이력
  * (<thread-context>/<conversation-context>)이 끼어 있으면 그 닫는 태그 뒤부터.
  * 둘 다 아니면 null → 호출자는 원문을 쓴다.
@@ -232,18 +240,35 @@ function turnAfterContext(tail: string): string | null {
 }
 
 /**
+ * 봉투에서 `<context>` 뒤(= 이번 턴·이력이 있는 구간)를 돌려준다.
+ *   <context>…</context> 로 시작  → 그 뒤
+ *   <context> 없이 턴 블록부터 시작 → 받은 그대로 (관측: `<new-message-arrived-…>` 217행)
+ * 봉투가 아니면 null.
+ */
+function envelopeTail(message: string): string | null {
+  if (message.startsWith("<context>\n")) {
+    const close = message.indexOf(CONTEXT_CLOSE);
+    return close < 0 ? null : message.slice(close + CONTEXT_CLOSE.length);
+  }
+  return TURN_OPEN.test(message) ? message : null;
+}
+
+/**
  * 임베딩 입력용 텍스트. 정리된 버즈 턴(<context> 바로 뒤에 이번 턴 블록)이면 방 정보와
  * 이벤트 머리글(ID·종류·시각·npub/hex)을 빼고 사람 말만 남긴다. 저장 본문(message)은
  * 그대로다 — 방 정보는 태깅엔 도움이 되지만(프로젝트 slug) 임베딩에선 모든 행에 같은
  * 성분을 섞어 주제 차이를 흐린다 (검색 시험: 상위10 정확 29→33, nDCG 0.761→0.813).
  * 모양이 다르면(이전 대화 블록이 끼어 있는 등) 받은 그대로 돌려준다.
+ *
+ * <context> 가 아예 없고 이번 턴 블록부터 시작하는 봉투도 있다 — 관측: `<new-message-arrived-…>`
+ * 로 시작하는 217행. 전에는 `startsWith("<context>\n")` 가드에 걸려 **봉투째 임베딩**됐다
+ * (표본 200/200 이 원문 그대로 반환). 그 모양도 턴 블록으로 인정한다.
  */
 export function buzzEmbeddingText(message: string): string {
   try {
-    if (!message.startsWith("<context>\n")) return message;
-    const close = message.indexOf(CONTEXT_CLOSE);
-    if (close < 0) return message;
-    const turn = turnAfterContext(message.slice(close + CONTEXT_CLOSE.length));
+    const tail = envelopeTail(message);
+    if (tail === null) return message;
+    const turn = turnAfterContext(tail);
     if (turn === null) return message;
     const text = turn
       .split("\n")
@@ -257,6 +282,8 @@ export function buzzEmbeddingText(message: string): string {
           .replace(/^Channel: (\S+) \(#[0-9a-f-]+\)/, "Channel: $1")
           .replace(EVENT_LABEL, "")
       )
+      // 라벨을 뗀 뒤 식별자만 남은 줄은 버린다 (구버전 봉투의 uuid·npub·hex)
+      .filter((line) => !IDENTIFIER_ONLY.test(line.trim()))
       .join("\n")
       .trim();
     return text || message;
