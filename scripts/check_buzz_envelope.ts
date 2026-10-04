@@ -368,4 +368,36 @@ check("반환 본문: 이력은 남기고(유일 사본일 수 있다) 버즈 �
   assert.equal(buzzDisplayText(historyNoTurn), historyNoTurn, "이력 뒤에 턴 블록이 없음");
 });
 
+check("임베딩 입력: <context> 없이 턴 블록부터 시작하는 봉투도 걷는다 (관측 217행)", () => {
+  // 실데이터 모양: <new-message-arrived-…> 가 첫 블록이고 <context> 가 아예 없다.
+  const turnFirst = [
+    "<new-message-arrived-while-you-were-working>",
+    "</new-message-arrived-while-you-were-working>",
+    "",
+    '<buzz-event type="@mention">',
+    `Event ID: ${HEX}`,
+    "Kind: 9",
+    // 구버전 봉투 실제 모양: 채널은 이름 없이 uuid, From 은 npub 먼저 (관측 id 93787)
+    "Channel: 8d8bbfa3-929c-5a12-b82b-36792a3cae54",
+    "From: npub10kemeetk5anw5ye72hefa0rn5j0l5vg9lkhy5mxpx8jvmyjvnw2qs4rglt (hex: " + HEX + ")",
+    "Content: TURN-FIRST-SENTINEL colo=LAX 확인했어",
+    `Tags: [["p","${HEX}"]]`,
+    "</buzz-event>",
+  ].join("\n");
+  const out = buzzEmbeddingText(turnFirst);
+  assert.notEqual(out, turnFirst, "전에는 원문을 그대로 돌려줬다 (봉투째 임베딩)");
+  assert.ok(out.includes("TURN-FIRST-SENTINEL colo=LAX 확인했어"), "사람 말은 남는다");
+  assert.ok(!out.includes("Event ID:") && !out.includes("Kind: 9") && !out.includes("Tags:"), "머리글 제거");
+  assert.ok(!out.includes("<buzz-event") && !out.includes("<new-message-arrived"), "래퍼 태그 줄 제거");
+  assert.ok(!out.includes("npub"), "npub 제거");
+  assert.ok(!out.includes("8d8bbfa3-929c"), "이름 없는 채널 uuid 도 제거 — 라벨만 떼면 uuid 가 남는다");
+  assert.ok(!out.includes(HEX), "hex 공개키 제거");
+  assert.ok(!out.includes("Content: ") && !out.includes("From: "), "반복 라벨 제거");
+  assert.equal(buzzEmbeddingText(out), out, "두 번 적용해도 같음");
+  // 반환 본문은 접을 <context> 가 없으므로 손대지 않는다
+  assert.equal(buzzDisplayText(turnFirst), turnFirst, "반환 본문은 <context> 가 없으면 그대로");
+  // 턴 블록도 <context> 도 아니면 손대지 않는다
+  assert.equal(buzzEmbeddingText("<unknown-block>\nZ\n</unknown-block>"), "<unknown-block>\nZ\n</unknown-block>");
+});
+
 console.log("all checks passed");
