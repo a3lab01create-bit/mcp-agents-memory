@@ -70,7 +70,8 @@ const QUOTE_ENTRY =
 function isNostrMetaLine(line: string): boolean {
   return (
     (/^Tags: \[\[".*\]\]\s*$/.test(line) && /[0-9a-f]{64}/.test(line)) ||
-    /^Parsed: (?:root=[0-9a-f]{64}|mentions=\[.*\([0-9a-f]{64}\))/.test(line)
+    // `mentions=[이름 (hex)]` 과 `mentions=[hex]`(이름 없는 구버전) 둘 다 — 후자를 빼면 hex 가 벡터에 남는다(관측 59건)
+    /^Parsed: (?:root=[0-9a-f]{64}|mentions=\[(?:.*\()?[0-9a-f]{64})/.test(line)
   );
 }
 
@@ -246,11 +247,14 @@ function turnAfterContext(tail: string): string | null {
  * 봉투가 아니면 null.
  */
 function envelopeTail(message: string): string | null {
-  if (message.startsWith("<context>\n")) {
-    const close = message.indexOf(CONTEXT_CLOSE);
-    return close < 0 ? null : message.slice(close + CONTEXT_CLOSE.length);
+  // 설명서(<base>) 봉투: 설명서·설정 블록을 건너뛴 자리에서 <context> 를 찾는다 (관측 2행, 둘 다 수만 字)
+  const loc = message.startsWith("<base>") ? locateBuzzContext(message) : null;
+  const text = loc ? loc.rest.slice(loc.pos) : message;
+  if (text.startsWith("<context>\n")) {
+    const close = text.indexOf(CONTEXT_CLOSE);
+    return close < 0 ? null : text.slice(close + CONTEXT_CLOSE.length);
   }
-  return TURN_OPEN.test(message) ? message : null;
+  return TURN_OPEN.test(text) ? text : null;
 }
 
 /**
