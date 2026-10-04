@@ -9,6 +9,21 @@
  * 명부 모드가 아니면 이 판단을 쓰지 않는다(태거의 기존 경로 그대로).
  */
 
+/**
+ * 명부 소속 판정 SQL (한 곳에서만 정의). 별칭 행은 명부가 아니다 — 명부 항목이 별칭이 되면 명부에서 빠진 것으로 본다.
+ * 테이블 별칭 없이 쓰는 조각이라 `FROM project_tags` 바로 뒤 WHERE에 넣는다.
+ */
+export const REGISTRY_MEMBER_SQL = "kind IS NOT NULL AND alias_of IS NULL";
+
+/**
+ * 명부 칼럼이 아직 없다(마이그레이션 031 전) — 이 경우에만 예전 방식으로 돌아간다.
+ * 다른 오류(연결 끊김·잠금 대기 등)는 예전 방식으로 바꾸지 않고 그대로 던진다: 잠깐의 DB 오류로 5분 동안 예전
+ * 방식(새 태그 생성 포함)이 되면 안 된다. 호출자(워커·manage_knowledge·승격기)는 이미 오류를 다시 시도한다.
+ */
+export function isUndefinedColumn(err: unknown): boolean {
+  return (err as { code?: string } | null)?.code === "42703";
+}
+
 export type PTagAnswer =
   | { type: "none" }
   | { type: "new"; name: string }

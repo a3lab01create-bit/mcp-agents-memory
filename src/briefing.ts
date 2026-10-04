@@ -130,11 +130,15 @@ export async function collectBrief(opts: CollectBriefOpts = {}): Promise<BriefDa
   let ptags;
   try {
     ptags = await db.query(
-      activeSql(`AND (NOT EXISTS (SELECT 1 FROM project_tags r WHERE r.kind IS NOT NULL)
+      activeSql(`AND (NOT EXISTS (SELECT 1 FROM project_tags r WHERE r.kind IS NOT NULL AND r.alias_of IS NULL)
                       OR (cpt.kind = 'project' AND NOT cpt.paused))`),
       activeParams
     );
-  } catch {
+  } catch (err) {
+    // 읽기 전용이라 실패해도 예전 쿼리로 — 단 칼럼 없음(031 전)이 아니면 남겨서 조용히 굳지 않게
+    if ((err as { code?: string })?.code !== "42703") {
+      console.error("⚠️ [Brief] 명부 필터 쿼리 실패, 필터 없이 표시:", (err as Error)?.message ?? err);
+    }
     ptags = await db.query(activeSql(""), activeParams);
   }
 

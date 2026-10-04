@@ -27,6 +27,9 @@ import {
   type NewTagDecision,
 } from "../cold_path/dtag_promoter.js";
 import { parseRecommendation, planApplyRecommendations } from "../cold_path/dtag_suggest_gate.js";
+import { REGISTRY_MEMBER_SQL } from "../cold_path/project_registry.js";
+
+const REGISTRY_DESCRIPTION_MAX = 200; // 태거가 매 호출 읽는 안내문이라 짧게
 
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 100;
@@ -103,6 +106,25 @@ async function lookupSuggestionForUser(
   };
 }
 
+/**
+ * 명부 항목을 별칭의 출발점(source)으로 만들면 명부에서 조용히 빠진다(태거 후보는 정본만) — 막는다.
+ * 명부 칼럼이 없으면(031 전) 막을 것도 없다.
+ */
+async function registrySourceError(tagId: number, tagName: string) {
+  try {
+    const r = await db.query(`SELECT kind FROM project_tags WHERE id = $1`, [tagId]);
+    if (r.rows[0]?.kind != null) {
+      return toolError(
+        "source tag is in the project registry; aliasing it would silently drop it from the registry. Unregister it first, or alias the other tag into it.",
+        { source_tag: tagName }
+      );
+    }
+  } catch (err) {
+    if ((err as { code?: string })?.code !== "42703") throw err;
+  }
+  return null;
+}
+
 async function listSuggestions(userId: number, status: string, limit: number) {
   const result = await db.query(
     `SELECT s.id,
@@ -151,6 +173,15 @@ async function confirmAlias(userId: number, suggestionId: number, reason: string
       suggestion_id: suggestionId,
       status: suggestion.status,
     });
+  }
+
+  const src = await db.query(
+    `SELECT s.source_tag_id, pt.name FROM project_tag_alias_suggestions s JOIN project_tags pt ON pt.id = s.source_tag_id WHERE s.id = $1`,
+    [suggestionId]
+  );
+  if (src.rows.length > 0) {
+    const blocked = await registrySourceError(Number(src.rows[0].source_tag_id), String(src.rows[0].name));
+    if (blocked) return blocked;
   }
 
   const result = await applyAliasSuggestion(suggestionId, {
@@ -289,33 +320,39 @@ async function applyRecommendations(userId: number, ids: number[], reason: strin
  * 프로젝트 명부(DEVLOG §24 L1). 명부에 한 줄이라도 있으면 태거는 명부에서만 고른다.
  * 설명은 필수 — 태거가 언제 이 이름을 붙일지 보는 안내문이다.
  */
-async function listRegistry() {
+async function listRegistry(userId: number) {
   const result = await db.query(
-    `SELECT pt.name, pt.kind, pt.paused, pt.description,
+    `SELECT pt.name, pt.kind, pt.paused, pt.description, pt.alias_of,
             (SELECT string_agg(a.name, ',' ORDER BY a.name) FROM project_tags a WHERE a.alias_of = pt.id) AS aliases,
             (SELECT count(*) FROM memory m
-              WHERE m.p_tag_id IS NOT NULL AND m.created_at >= NOW() - INTERVAL '30 days'
+              WHERE m.user_id = $1 AND m.is_active = TRUE AND m.p_tag_id IS NOT NULL
+                AND m.created_at >= NOW() - INTERVAL '30 days'
                 AND canonical_project_tag_id(m.p_tag_id) = pt.id)::int AS uses_30d
        FROM project_tags pt
       WHERE pt.kind IS NOT NULL
-      ORDER BY pt.kind, pt.paused, pt.name`
+      ORDER BY pt.kind, pt.paused, pt.name`,
+    [userId]
   );
+  const entries = result.rows.map((r: any) => ({
+    name: String(r.name),
+    kind: String(r.kind),
+    paused: r.paused === true,
+    description: r.description ?? null,
+    aliases: r.aliases ? String(r.aliases).split(",") : [],
+    uses_30d: Number(r.uses_30d),
+    // 명부 항목이 다른 태그의 별칭이 되면 태거 후보에서 빠진다 — 보이게 표시
+    ...(r.alias_of != null ? { warning: "this entry is now an alias of another tag, so it is NOT offered to the tagger" } : {}),
+  }));
   return ok({
     action: "list_registry",
-    registry_mode: result.rows.length > 0,
-    count: result.rows.length,
-    entries: result.rows.map((r: any) => ({
-      name: String(r.name),
-      kind: String(r.kind),
-      paused: r.paused === true,
-      description: r.description ?? null,
-      aliases: r.aliases ? String(r.aliases).split(",") : [],
-      uses_30d: Number(r.uses_30d),
-    })),
+    registry_mode: entries.some((e: any) => !e.warning),
+    count: entries.length,
+    entries,
   });
 }
 
 async function registerProject(
+  userId: number,
   tagName: string | undefined,
   description: string | undefined,
   kind: "project" | "category" | undefined,
@@ -325,27 +362,44 @@ async function registerProject(
   if (!name) return toolError("tag is required for register_project");
   const desc = description?.trim();
   if (!desc) return toolError("description is required for register_project (one line: what belongs here)");
-  const existing = await lookupProjectTagByName(name);
-  if (existing?.aliasOf != null) {
-    return toolError("tag is an alias of another tag; register the canonical tag instead", { tag: name });
+  if (desc.length > REGISTRY_DESCRIPTION_MAX) {
+    return toolError(`description is too long (max ${REGISTRY_DESCRIPTION_MAX} chars) — the tagger reads it on every call`);
   }
+  // 이미 있는 항목을 고칠 때 안 준 값(kind·paused)은 그대로 둔다 — 설명만 고치다 멈춤이 풀리면 안 된다.
+  // 별칭 행은 명부에 못 올린다(정본을 올릴 것) — DO UPDATE의 WHERE가 막고, 0행이면 오류.
   const result = await db.query(
     `INSERT INTO project_tags (name, kind, description, paused)
-     VALUES ($1, $2, $3, $4)
+     VALUES ($1, COALESCE($2, 'project'), $3, COALESCE($4, FALSE))
      ON CONFLICT (name) DO UPDATE
-       SET kind = EXCLUDED.kind, description = EXCLUDED.description, paused = EXCLUDED.paused, updated_at = NOW()
-     RETURNING id, (xmax = 0) AS created`,
-    [name, kind ?? "project", desc, paused === true]
+       SET kind = COALESCE($2, project_tags.kind, 'project'),
+           description = EXCLUDED.description,
+           paused = COALESCE($4, project_tags.paused),
+           updated_at = NOW()
+       WHERE project_tags.alias_of IS NULL
+     RETURNING id, kind, paused, (xmax = 0) AS created`,
+    [name, kind ?? null, desc, paused ?? null]
+  );
+  if (result.rows.length === 0) {
+    return toolError("tag is an alias of another tag; register the canonical tag instead", { tag: name });
+  }
+  // 같은 이름의 대기 중인 새 태그 제안은 이제 필요 없다
+  await db.query(
+    `UPDATE project_tag_new_suggestions
+        SET status = 'superseded', decided_by = 'user', decision_reason = 'registered as project',
+            decided_at = NOW(), project_tag_id = $2, updated_at = NOW()
+      WHERE user_id = $1 AND name = $3 AND status = 'pending'`,
+    [userId, Number(result.rows[0].id), name]
   );
   invalidateCandidateCache();
+  const row = result.rows[0];
   return ok({
     action: "register_project",
     tag: name,
-    kind: kind ?? "project",
-    paused: paused === true,
+    kind: String(row.kind),
+    paused: row.paused === true,
     description: desc,
-    project_tag_id: Number(result.rows[0].id),
-    created: result.rows[0].created === true,
+    project_tag_id: Number(row.id),
+    created: row.created === true,
   });
 }
 
@@ -390,6 +444,9 @@ async function setAlias(
       target_tag: targetTag.name,
     });
   }
+
+  const blocked = await registrySourceError(sourceTag.id, sourceTag.name);
+  if (blocked) return blocked;
 
   const insertResult = await db.query(
     `INSERT INTO project_tag_alias_suggestions (
@@ -582,11 +639,11 @@ New project tag suggestions (a frequent d_tag that is not a project tag yet; ids
         }
 
         if (args.action === "list_registry") {
-          return listRegistry();
+          return listRegistry(userId);
         }
 
         if (args.action === "register_project") {
-          return registerProject(args.tag, args.description, args.kind, args.paused);
+          return registerProject(userId, args.tag, args.description, args.kind, args.paused);
         }
 
         if (args.action === "unregister_project") {

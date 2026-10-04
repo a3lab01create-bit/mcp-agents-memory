@@ -15,7 +15,7 @@ import { callRole, callSpec, ROLE_REGISTRY, type ModelSpec } from "../model_regi
 import { judgeProjectTag, shouldApplyJevJudgment } from "./jev_judge.js";
 import { getPrompt } from "../prompts/index.js";
 import { isBlockedNewTagName } from "./dtag_promoter.js";
-import { parsePTagAnswer, registryCandidateLines, registryVerdict } from "./project_registry.js";
+import { REGISTRY_MEMBER_SQL, isUndefinedColumn, parsePTagAnswer, registryCandidateLines, registryVerdict } from "./project_registry.js";
 
 // local 프로바이더 사용 시 실패하면 grok으로 fallback (LOCAL_GROK_FALLBACK=false 로 끄기 가능)
 const GROK_FALLBACK_SPEC: ModelSpec = { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' };
@@ -84,12 +84,14 @@ async function listProjectTagCandidates(): Promise<CandidateList> {
     const reg = await db.query(
       `SELECT id, name, description
          FROM project_tags
-        WHERE kind IS NOT NULL
-          AND alias_of IS NULL
+        WHERE ${REGISTRY_MEMBER_SQL}
         ORDER BY name
         LIMIT $1`,
       [REGISTRY_CANDIDATE_LIMIT]
     );
+    if (reg.rows.length >= REGISTRY_CANDIDATE_LIMIT) {
+      console.error(`⚠️ [Tagger] 명부가 ${REGISTRY_CANDIDATE_LIMIT}개 이상 — 이름순으로 잘림. 명부를 줄이세요.`);
+    }
     if (reg.rows.length > 0) {
       const list: CandidateList = {
         registry: true,
@@ -98,8 +100,8 @@ async function listProjectTagCandidates(): Promise<CandidateList> {
       _candidateCache = { key: cacheKey, list, expires: now + CANDIDATE_CACHE_TTL_MS };
       return list;
     }
-  } catch {
-    // kind 칼럼 없음 — 기존 방식으로
+  } catch (err) {
+    if (!isUndefinedColumn(err)) throw err;  // kind 칼럼 없음(031 전)일 때만 기존 방식으로
   }
 
   const r = strategy === "frequent"
@@ -216,6 +218,22 @@ async function getOrCreateProjectTag(name: string): Promise<number> {
 }
 
 /**
+ * 명부 모드 출력 형식: p_tag는 명부 이름 또는 null만 (로컬 llama.cpp 문법으로 강제 — 새 이름·설명 따라 쓰기 원천 차단).
+ * grok 대체 경로는 jsonSchema를 안 쓰므로 resolveRegistryAnswer의 판정이 여전히 최종 관문이다.
+ */
+function registrySchema(candidates: ProjectTagCandidate[]): Record<string, unknown> {
+  return {
+    type: 'object',
+    properties: {
+      p_tag: { anyOf: [{ type: 'string', enum: candidates.map((c) => c.name) }, { type: 'null' }] },
+      d_tag: { type: 'array', items: { type: 'string' }, maxItems: 5 },
+    },
+    required: ['p_tag', 'd_tag'],
+    additionalProperties: false,
+  };
+}
+
+/**
  * 명부 모드의 p_tag 답 → 명부 정본 id 또는 null. 별칭 이름은 별칭 사슬을 따라간 정본이 명부에 있으면 받는다.
  */
 async function resolveRegistryAnswer(raw: unknown, candidates: ProjectTagCandidate[]): Promise<number | null> {
@@ -257,7 +275,7 @@ export async function tagMessage(input: TagInput): Promise<TagResult> {
         system: SYSTEM_PROMPT,
         user: userPrompt,
         responseFormat: 'json',
-        jsonSchema: TAGGER_SCHEMA,
+        jsonSchema: registry ? registrySchema(candidates) : TAGGER_SCHEMA,
         enableThinking: false,
         // thinking off — 태거는 단순 매핑 작업. thinking 켜면 reasoning이 모든 토큰 소비해 content 비어버림.
         // jsonSchema → llama.cpp grammar로 <think> bleed 차단 (Qwen3 bug #20345).

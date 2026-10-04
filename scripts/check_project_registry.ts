@@ -4,7 +4,7 @@
  *   npm run check:registry        # esbuild로 묶어서 실행
  */
 import assert from "node:assert/strict";
-import { parsePTagAnswer, registryCandidateLines, registryVerdict } from "../src/cold_path/project_registry.ts";
+import { isUndefinedColumn, parsePTagAnswer, registryCandidateLines, registryVerdict } from "../src/cold_path/project_registry.ts";
 
 function check(name: string, fn: () => void) {
   fn();
@@ -47,6 +47,14 @@ check("후보 줄: 설명 있으면 '이름: 설명', 없으면 이름만", () =
     registryCandidateLines([{ name: "pacefy", description: " 러닝 앱 " }, { name: "buzz", description: null }, { name: "x", description: "  " }]),
     "- pacefy: 러닝 앱\n- buzz\n- x"
   );
+});
+
+check("예전 방식으로 돌아가는 건 '칸 없음(42703)'일 때만 — 연결 끊김·잠금 대기는 아님", () => {
+  assert.equal(isUndefinedColumn({ code: "42703" }), true);
+  assert.equal(isUndefinedColumn({ code: "55P03" }), false, "잠금 대기");
+  assert.equal(isUndefinedColumn({ code: "57P01" }), false, "서버 재시작");
+  assert.equal(isUndefinedColumn(new Error("Connection terminated")), false);
+  assert.equal(isUndefinedColumn(null), false);
 });
 
 console.log("\n모든 검사 통과");

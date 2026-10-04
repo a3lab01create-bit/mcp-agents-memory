@@ -16,6 +16,9 @@ const MIGRATION_NAME = "031_project_registry";
  * 명부가 비어 있으면(공개 사용자 기본) 지금 동작 그대로.
  * nullable·기본값 없는 칼럼 추가라 기존 행 재작성 없음.
  */
+const LOCK_RETRIES = 24;
+const LOCK_RETRY_WAIT_MS = 5000;
+
 async function migrate() {
   console.log(`💾 Running Migration: ${MIGRATION_NAME}...`);
 
@@ -37,31 +40,37 @@ async function migrate() {
       return;
     }
 
-    const client = await db.getClient();
-    try {
-      await client.query("BEGIN");
-      await client.query("SET LOCAL lock_timeout = '5s'");
+    // project_tags는 콜드패스 배치가 memory.p_tag_id FK로 잡고 있을 수 있다 — 029처럼 5초 잠금 대기 + 재시도
+    for (let attempt = 1; ; attempt++) {
+      const client = await db.getClient();
+      try {
+        await client.query("BEGIN");
+        await client.query("SET LOCAL lock_timeout = '5s'");
 
-      await client.query(`
-        ALTER TABLE project_tags
-          ADD COLUMN IF NOT EXISTS kind TEXT CHECK (kind IN ('project','category')),
-          ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT FALSE;
-      `);
-      await client.query(`
-        CREATE INDEX IF NOT EXISTS project_tags_registry_idx
-          ON project_tags (kind) WHERE kind IS NOT NULL;
-      `);
+        await client.query(`
+          ALTER TABLE project_tags
+            ADD COLUMN IF NOT EXISTS kind TEXT CHECK (kind IN ('project','category')),
+            ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT FALSE;
+        `);
+        await client.query(`
+          CREATE INDEX IF NOT EXISTS project_tags_registry_idx
+            ON project_tags (kind) WHERE kind IS NOT NULL;
+        `);
 
-      await client.query("INSERT INTO migration_history (name) VALUES ($1)", [
-        MIGRATION_NAME,
-      ]);
-      await client.query("COMMIT");
-      console.log(`✅ Migration ${MIGRATION_NAME} completed successfully!`);
-    } catch (txErr) {
-      await client.query("ROLLBACK");
-      throw txErr;
-    } finally {
-      client.release();
+        await client.query("INSERT INTO migration_history (name) VALUES ($1)", [
+          MIGRATION_NAME,
+        ]);
+        await client.query("COMMIT");
+        console.log(`✅ Migration ${MIGRATION_NAME} completed successfully!`);
+        break;
+      } catch (txErr) {
+        await client.query("ROLLBACK");
+        if ((txErr as { code?: string }).code !== "55P03" || attempt >= LOCK_RETRIES) throw txErr;
+        console.log(`⏳ project_tags 잠금 대기 중 (${attempt}/${LOCK_RETRIES}) — ${LOCK_RETRY_WAIT_MS / 1000}초 뒤 재시도`);
+        await new Promise((r) => setTimeout(r, LOCK_RETRY_WAIT_MS));
+      } finally {
+        client.release();
+      }
     }
   } catch (err) {
     console.error(`❌ Migration ${MIGRATION_NAME} FAILED:`, err);
