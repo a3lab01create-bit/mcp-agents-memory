@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.9.29 — 2026-10-05
+
+### Buzz envelopes: cleaner embeddings, folded search results, no false "format changed" alerts
+
+#### Embedding input (#16–#19)
+
+Short Buzz turns ended up with almost the same vector, so unrelated searches
+pulled up a cluster of them. The embedding input still carried the
+envelope's wrapper tags (`<buzz-event …>`), the `Channel:`/`From:`/`Content:`
+labels, and in some shapes the whole envelope.
+
+- `buzzEmbeddingText` drops wrapper lines and the repeated labels and keeps
+  the values. The briefing preview already did this; the embedding path did
+  not. For rows under 200 characters this removes about half of the input.
+- Envelopes that start with a turn block instead of `<context>` (218 rows)
+  and manual (`<base>`) envelopes (2 rows) are stripped too. Before, they
+  were embedded whole.
+- A line that is only an identifier once its label is gone (channel uuid,
+  `npub1…`, 64-hex) is dropped.
+- A `Parsed:` tail is recognised by "its first key has a hex value", not by
+  key name. Thread replies (`parent=…, root=…`) and bare-hex
+  `mentions=[…]` are removed as well.
+- The stored `message` is unchanged. Only the embedding input changes.
+
+#### Search results (#16)
+
+- `search_memory` folds the `<context>` block (room metadata) out of Buzz
+  results; the `venue` and `p_tag` fields already carry it. Stored rows are
+  not modified. In two test queries this block was 48% and 59% of the
+  returned text.
+
+#### Envelope cleaner (#20)
+
+When agents discussed the envelope work in Buzz and pasted examples such as
+`<buzz-event …>`, the next turn quoted those posts in its history block. The
+cleaner's safety check then refused the whole turn, and the Buzz watcher
+reported that the envelope format seemed to have changed (the 10-05 alert
+covered 12 rows). The format had not changed.
+
+- Inside the history block only, a turn tag counts as a mention when the
+  block parses as `[n]` quote entries and no line consists of a turn tag
+  alone. Every real turn opening checked (1,125) is such a line, so a broken
+  envelope whose history never closes is still refused.
+- Checked against every envelope row (2,524 old/new comparisons): no change
+  except 10 previously refused rows that now clean. Two rows quote a line
+  identical to a real turn opening and stay refused on purpose.
+- The original text is still kept in `raw_message` on every path.
+
+No migration. On hosts that run Buzz agents, updating gives folded search
+results and lets the save-time cleaner handle `<base>` envelopes like
+these. Until then, Mortar's ingest heals them within 5 minutes.
+
 ## 0.9.28 — 2026-10-04
 
 ### Registry retro-tagging uses registry names only, not their aliases
