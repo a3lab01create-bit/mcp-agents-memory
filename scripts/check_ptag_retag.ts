@@ -15,6 +15,10 @@ import {
   transitionCounts,
   type LogEntry,
 } from "../src/cold_path/ptag_retag_plan.ts";
+import { getPrompt, promptSource } from "../src/prompts/index.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 function check(name: string, fn: () => void) {
   fn();
@@ -130,6 +134,25 @@ check("입력이 문맥 크기를 넘은 오류만 따로 센다 (서버 고장�
   assert.ok(isContextOverflow("This model's maximum context length is 8192 tokens"));
   assert.ok(!isContextOverflow("connect ECONNREFUSED 127.0.0.1:8080"));
   assert.ok(!isContextOverflow("Tagger returned invalid JSON: {"));
+});
+
+check("안내문 출처: MEMORY_PROMPTS_DIR이면 env, 없으면 generic, 빈 파일은 없는 것", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "retag-prompt-"));
+  const prev = process.env.MEMORY_PROMPTS_DIR;
+  try {
+    fs.writeFileSync(path.join(dir, "zz_check_present.md"), "TUNED\n");
+    fs.writeFileSync(path.join(dir, "zz_check_blank.md"), "  \n");
+    process.env.MEMORY_PROMPTS_DIR = dir;
+    assert.equal(promptSource("zz_check_present"), "env");
+    assert.equal(getPrompt("zz_check_present", "GENERIC"), "TUNED", "getPrompt도 같은 파일을 쓴다");
+    assert.equal(promptSource("zz_check_blank"), "generic");
+    assert.equal(getPrompt("zz_check_blank", "GENERIC"), "GENERIC");
+    assert.equal(promptSource("zz_check_absent"), "generic");
+  } finally {
+    if (prev === undefined) delete process.env.MEMORY_PROMPTS_DIR;
+    else process.env.MEMORY_PROMPTS_DIR = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 console.log("all checks passed");

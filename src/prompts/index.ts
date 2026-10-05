@@ -36,19 +36,36 @@ function tryRead(file: string): string | null {
   }
 }
 
-export function getPrompt(name: string, fallback: string): string {
+function promptCandidates(name: string): Array<{ source: "env" | "local"; file: string }> {
   const envDir = process.env.MEMORY_PROMPTS_DIR?.trim();
-  const candidates = [
-    envDir ? path.join(envDir, `${name}.md`) : null,
-    path.join(PKG_ROOT, "prompts.local", `${name}.md`),
-  ].filter((p): p is string => Boolean(p));
+  const out: Array<{ source: "env" | "local"; file: string }> = [];
+  if (envDir) out.push({ source: "env", file: path.join(envDir, `${name}.md`) });
+  out.push({ source: "local", file: path.join(PKG_ROOT, "prompts.local", `${name}.md`) });
+  return out;
+}
 
-  for (const file of candidates) {
-    const body = tryRead(file);
-    if (body != null && body.trim()) return body.replace(/\s+$/, "");
+function findPrompt(name: string): { source: "env" | "local"; body: string } | null {
+  for (const c of promptCandidates(name)) {
+    const body = tryRead(c.file);
+    if (body != null && body.trim()) return { source: c.source, body: body.replace(/\s+$/, "") };
   }
+  return null;
+}
+
+/**
+ * 이 이름의 안내문이 어디서 오는지 — 운영 작업이 공개용 기본 안내문으로 조용히 돌지 않았는지 보고에 남길 때 쓴다
+ * (예: gitignored prompts.local이 없는 작업 폴더에서 돌린 retag-ptag 시험).
+ */
+export function promptSource(name: string): "env" | "local" | "generic" {
+  return findPrompt(name)?.source ?? "generic";
+}
+
+export function getPrompt(name: string, fallback: string): string {
+  const found = findPrompt(name);
+  if (found) return found.body;
 
   if (process.env.MEMORY_REQUIRE_CORE_PROMPTS) {
+    const candidates = promptCandidates(name).map((c) => c.file);
     throw new Error(
       `[prompts] required core prompt "${name}" not found (looked in: ${candidates.join(
         ", "

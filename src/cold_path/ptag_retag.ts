@@ -19,6 +19,7 @@ import { db } from "../db.js";
 import { tagMessage } from "./tagger.js";
 import { beginJevRun } from "./jev_judge.js";
 import { REGISTRY_MEMBER_SQL } from "./project_registry.js";
+import { promptSource } from "../prompts/index.js";
 import {
   decidedIds,
   formatDuration,
@@ -126,6 +127,8 @@ export interface RetagReport {
   action: "count" | "dry-run" | "run" | "rollback" | "rollback-preview";
   log: string;
   registry: { members: number; since: string };
+  /** 태거 안내문 출처 — 운영 배포라면 local(또는 env)이어야 한다. generic이면 결과가 운영 태깅과 다르다 */
+  taggerPrompt: "env" | "local" | "generic";
   before: string;
   /** stale·untagged는 지금 조건에 맞는 행 수(이미 결정된 행 포함), queued가 이번에 실제로 할 행 수 */
   targets?: { stale: number | null; untagged: number | null; overlap: number; alreadyDecided: number; queued: number; queuedByMode: Record<RetagMode, number> };
@@ -159,7 +162,11 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
   const logFile = opts.log ?? defaultLogPath();
   fs.mkdirSync(path.dirname(logFile), { recursive: true });
   const { latest, malformed } = replayLog(readLog(logFile));
-  const base = { log: logFile, registry, before, malformedLogLines: malformed || undefined };
+  const taggerPrompt = promptSource("tagger");
+  if (taggerPrompt === "generic") {
+    console.error("⚠️ [retag-ptag] 태거 안내문이 공개용 기본값이다 (prompts.local/tagger.md·MEMORY_PROMPTS_DIR 없음) — 운영 태깅과 판정이 다르다. 운영 체크아웃에서 돌리고 있는지 확인할 것.");
+  }
+  const base = { log: logFile, registry, taggerPrompt, before, malformedLogLines: malformed || undefined };
 
   if (opts.rollback) {
     const plan = rollbackPlan(latest);

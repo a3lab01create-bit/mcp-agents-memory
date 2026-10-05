@@ -511,7 +511,8 @@ codex/gemini에 이어 **Grok Build·Antigravity** passive capture 추가 → �
 - 대상: (a) 정본이 명부 밖인 태그가 붙은 행, (b) 최근 N일 무태그 행. 고정(pinned) 행은 무태그일 때만.
 - 미리보기(dryRun)·백업·재개 가능·밤 시간·속도 제한. 로컬 Qwen ≈6초/행 → 1,000행 ≈1.7시간, 라이브 태깅과 llama 슬롯 2개를 나눠 쓴다.
 - **구현: `mcp-agents-memory retag-ptag`** (`src/cold_path/ptag_retag.ts`, 판단부 `ptag_retag_plan.ts`, 검사 `npm run check:retag`). 범위 확정: (a) **전부** — 2026-10-05 형 결정, (b) 최근 30일 — 10-04 결정 d. (b)는 명부가 생긴 시각(명부 항목의 가장 이른 `updated_at`) 전 글만 — 그 뒤 글은 이미 명부로 판정됐다. 결정 기록(JSONL) = 백업·재개·`--rollback`. 대량 작업이라 grok 대체는 기본 꺼짐(실패 행은 기록, 다음 실행 때 재시도).
-- 실측(2026-10-05, 운영 DB, 쓰기 없는 시험 125행): 대상 (a) 11,151 + (b) 3,626 = 14,777행. 한 행 평균 1.0~1.4초(짧은 글이 대부분, 6천 자 넘는 행 38개) — 위 6초 추정보다 빠르다. 1칸 59행/분 · **2칸 89행/분(1.5배) → 전부 ≈3시간**. 판정: (a) 91행 중 64% 무태그 · 36% 명부(pacefy 14·mcp-agents-memory 9·buzz 4·market-intel 3·youtube-channel-analyzer 3), (b) 34행 중 88% 그대로 무태그. 무태그로 가는 행을 읽어 보면 절반은 진짜 프로젝트 밖 대화(인프라·도구), 나머지는 한 문장만으론 애매한 글 — 라이브 태거와 같은 한계(문맥 단서는 L3).
+- 실측(2026-10-05, 운영 DB·운영 태거 안내문, 쓰기 없는 시험 100행 `--sample --concurrency 2`): 대상 (a) 11,151 + (b) 3,626 = 14,777행. 2칸 **52.6행/분**, 한 행 평균 2.3초(p50 1.5 · p95 4.2) → **전부 ≈4.7시간**. 판정: (a) 75행 → 명부 72%(mcp-agents-memory 25 · pacefy 10 · buzz 7 · marketadmin 4 · centragens·youtube-channel-analyzer·market-intel 각 2 · personal-preferences·bodygajim 각 1) · 무태그 28%, (b) 25행 → 무태그 48% · buzz 6 · mcp-agents-memory 6 · marketadmin 1. 같은 40행을 다시 돌리면 1행만 바뀜(2.5%, 태그↔태그). 눈에 띄는 쏠림: 에이전트·기기 잡담(오디오 드라이버·API 키 설정 등)이 mcp-agents-memory로 감 — 라이브 태거도 같음.
+- ⚠️ 정정: 첫 시험 125행(무태그 64% · 89행/분)은 **공개용 기본 안내문**으로 잰 값이라 철회 — gitignored `prompts.local`이 없는 작업 폴더에서 돌렸다. 그래서 `retag-ptag` 보고에 `taggerPrompt`(local/env/generic)를 남기고 generic이면 경고한다.
 
 **L3 새 프로젝트 발견 — 프로젝트 모양 단서.**
 - 캡처 시 `workspace`(작업 폴더 이름; claude-code·codex·gemini·grok 캡처가 cwd를 이미 앎)와 버즈 채널 프로젝트 슬러그를 칼럼에 남긴다. **앞으로만** 채움(옛 행은 없음). 태거에는 정답이 아니라 힌트로 준다(실측 4: 채널≠프로젝트).
