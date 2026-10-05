@@ -242,6 +242,19 @@ Usage:
                                     raw_message), and fixes Buzz envelopes an older server stored uncleaned; --no-reclean skips both. Needs BUZZ_RELAY_URL, BUZZ_PRIVATE_KEY and BUZZ_INGEST_OWNER
                                     (the memory owner's pubkeys, comma-separated) in the environment of this command only —
                                     not in the shared .env; optional BUZZ_CLI.
+  mcp-agents-memory retag-ptag [--count | --dry-run | --rollback] [--only stale|untagged] [--untagged-days N]
+                               [--before ISO] [--max N] [--minutes N] [--concurrency N] [--sample] [--seed S]
+                               [--log PATH] [--allow-fallback]
+                                    (Project registry only) Re-decide ONLY the project tag of already-tagged memories:
+                                    (a) rows whose tag is outside the registry (pinned rows skipped), (b) untagged rows from
+                                    the last N days (default 30) written before the registry existed. Same tagger as the
+                                    cold path; d_tag, message, embedding are never touched. Every decision is appended to a
+                                    JSONL log (default ~/.local/state/mcp-agents-memory/ptag-retag/decisions.jsonl) — the
+                                    backup, the resume point (decided rows are skipped next run) and the source for
+                                    --rollback. --count only counts; --dry-run decides without writing to a separate
+                                    dryrun-*.jsonl next to the log — review that file before the real run (--sample mixes
+                                    both targets instead of newest first). The grok fallback is off unless
+                                    --allow-fallback: failed rows are logged and retried next run; 5 errors in a row stop it.
   mcp-agents-memory help            Show this message.
 
 Configuration is loaded from (first hit wins):
@@ -386,6 +399,18 @@ async function cli() {
     await db.connect();
     const report = await runBuzzIngest(opts);
     console.log(JSON.stringify({ dryRun: opts.dryRun ?? false, ...report }));
+    await db.close();
+    process.exit(0);
+  }
+
+  if (cmd === "retag-ptag") {
+    // 프로젝트 태그만 명부 기준으로 다시 붙이는 일회성 운영 작업 (DEVLOG §24 L2)
+    const { parseRetagArgs } = await import("./cold_path/ptag_retag_plan.js");
+    const { runRetag } = await import("./cold_path/ptag_retag.js");
+    const opts = parseRetagArgs(process.argv.slice(3));
+    await db.connect();
+    const report = await runRetag(opts);
+    console.log(JSON.stringify(report));
     await db.close();
     process.exit(0);
   }
