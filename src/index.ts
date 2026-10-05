@@ -251,8 +251,9 @@ Usage:
                                     cold path; d_tag, message, embedding are never touched. Every decision is appended to a
                                     JSONL log (default ~/.local/state/mcp-agents-memory/ptag-retag/decisions.jsonl) — the
                                     backup, the resume point (decided rows are skipped next run) and the source for
-                                    --rollback. --count only counts; --dry-run decides without writing (separate log file;
-                                    --sample mixes both targets instead of newest first). The grok fallback is off unless
+                                    --rollback. --count only counts; --dry-run decides without writing to a separate
+                                    dryrun-*.jsonl next to the log — review that file before the real run (--sample mixes
+                                    both targets instead of newest first). The grok fallback is off unless
                                     --allow-fallback: failed rows are logged and retried next run; 5 errors in a row stop it.
   mcp-agents-memory help            Show this message.
 

@@ -127,7 +127,8 @@ export interface RetagReport {
   log: string;
   registry: { members: number; since: string };
   before: string;
-  targets?: { stale: number | null; untagged: number | null; overlap: number; alreadyDecided: number; queued: number };
+  /** stale·untagged는 지금 조건에 맞는 행 수(이미 결정된 행 포함), queued가 이번에 실제로 할 행 수 */
+  targets?: { stale: number | null; untagged: number | null; overlap: number; alreadyDecided: number; queued: number; queuedByMode: Record<RetagMode, number> };
   processed?: number;
   updated?: number;
   same?: number;
@@ -195,6 +196,8 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
       queue.push({ id, mode });
     }
   }
+  const queuedByMode: Record<RetagMode, number> = { stale: 0, untagged: 0 };
+  for (const q of queue) queuedByMode[q.mode]++;
   if (opts.sample) queue.sort((a, b) => (sampleKey(a.id, opts.seed) < sampleKey(b.id, opts.seed) ? -1 : 1));
   const targets = {
     stale: opts.stale ? staleIds.length : null,
@@ -202,6 +205,7 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
     overlap,
     alreadyDecided,
     queued: queue.length,
+    queuedByMode,
   };
   if (opts.count) return { action: "count", ...base, targets };
 
@@ -283,6 +287,7 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
           stopReason = "consecutive_errors";
           console.error(`❌ [retag-ptag] 연속 오류 ${MAX_CONSECUTIVE_ERRORS}번 — 멈춤. 마지막 오류: ${msg}`);
         }
+        progress();
         continue;
       }
       consecutiveErrors = 0;
