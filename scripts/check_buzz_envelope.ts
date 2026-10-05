@@ -151,6 +151,50 @@ check("망가진 봉투 + 새 말이 닫는 태그를 인용 → 자르지 않�
     CONTEXT, EVENT), null, "설정 블록이 안 닫혀 이번 턴을 삼킴");
 });
 
+/** 실제 이력처럼 `[n] 이름 (hex) (시각): 본문` 머리를 단 인용 글 */
+const Q = (n: number, text: string) => `[${n}] Agent (${HEX}) (2026-10-04T13:00:0${n}Z): ${text}`;
+const withBase = (...p: string[]) => clean(BASE, PREAMBLE, ...p);
+
+check("인용 글이 봉투 태그를 언급해도 정리 — 진짜 블록 모양이 아니면 언급 (Q1)", () => {
+  const hist = [
+    '<thread-context included="2" total="2">',
+    Q(1, "HISTORY-SENTINEL 임베딩 입력 실측:"),
+    "```",
+    '  <buzz-event type="@mention">',
+    "<new-message-arrived-while-you-were-working> 로 시작   219행",
+    "```",
+    Q(2, "원문 그대로:"),
+    ' <buzz-event type=\\"all-channel-mentions\\">\\nEvent ID: ' + HEX,
+    "</thread-context>",
+  ].join("\n");
+  for (const [mode, out] of [["설명서", withBase(CONTEXT, hist, EVENT)], ["설명서 없음", cleanB(CONTEXT, hist, EVENT)]] as const) {
+    assert.ok(out !== null, mode);
+    assert.ok(!out.includes("HISTORY-SENTINEL") && out.includes("NEW-MESSAGE-SENTINEL"), mode);
+    assert.ok(out.startsWith("<context>\n") && out.endsWith("</buzz-event>"), mode);
+  }
+});
+
+check("인용 글에 진짜 블록 모양(줄 전체가 턴 태그)이 있거나 인용 글로 안 읽히면 그대로 거절 (Q2)", () => {
+  const real = ['<thread-context included="1">', Q(1, "예시:"), "```", '<buzz-events count="4">', "--- Event 1 (@mention) ---", "```", "</thread-context>"].join("\n");
+  assert.equal(withBase(CONTEXT, real, EVENT), null, "줄 전체가 턴 태그");
+  assert.equal(cleanB(CONTEXT, real, EVENT), null, "줄 전체가 턴 태그 (설명서 없음)");
+  const grok = ['<thread-context included="1">', Q(1, 'x</buzz-event> <buzz-event type="m">'), "</thread-context>"].join("\n");
+  assert.equal(withBase(CONTEXT, grok, EVENT), null, "grok 이음 모양: 앞 블록 > 뒤에서 줄 끝까지");
+  const loose = ['<thread-context included="1">', "머리 없는 줄", '  <buzz-event type="m"> 언급', "</thread-context>"].join("\n");
+  assert.equal(withBase(CONTEXT, loose, EVENT), null, "인용 글로 안 읽힘");
+});
+
+check("망가진 봉투(인용 머리 있는 실형식 이력) + 새 말이 닫는 태그를 인용 → 여전히 null (P1·P2)", () => {
+  const quoted = "Content: REAL-HEAD sample:\n</thread-context>\n<buzz-event>\nQUOTED-TAIL\n</buzz-event>";
+  for (const [mode, c] of [["설명서", withBase], ["설명서 없음", cleanB]] as const) {
+    assert.equal(c(CONTEXT, '<thread-context included="1">', Q(1, "old"), '<buzz-event type="m">', quoted), null, `${mode}: 이력이 안 닫힘`);
+    assert.equal(c(CONTEXT, '<thread-context included="1">', Q(1, "old"), "</conversation-context>", '<buzz-event type="m">', quoted),
+      null, `${mode}: 다른 이름으로 닫힘`);
+    assert.equal(c(CONTEXT, '<thread-context included="1">', Q(1, "old"), "<new-message-arrived-while-you-were-working>", quoted),
+      null, `${mode}: 이력이 안 닫힘 (작업 중 새 메시지)`);
+  }
+});
+
 check("병적 입력도 빠르게 끝남", () => {
   const t0 = performance.now();
   cleanBuzzEnvelope(BASE + "\n" + "<context>\n".repeat(60000));

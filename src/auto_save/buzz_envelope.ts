@@ -31,7 +31,9 @@
  * 봉투는 앞에서부터 순서대로 읽는다. 기대한 자리에 기대한 블록이 없거나 이력
  * 경계가 애매하면 null → 호출자는 원본을 그대로 저장한다. 이력 안에 닫는
  * 태그가 인용된 경우엔 null이거나 이력을 조금 더 남길 뿐, 이번 턴은 자르지 않는다.
- * 봉투가 망가져 버릴 구간에 이번 턴 블록이 섞여 보이면 역시 null.
+ * 봉투가 망가져 버릴 구간에 이번 턴 블록이 섞여 보이면 역시 null. 단 이력 구간에서는
+ * 인용 글 본문 속 언급(봉투 얘기를 하며 붙여 넣은 `<buzz-event …>` 등)은 블록으로 보지 않는다
+ * — historyHidesTurn.
  */
 
 /** 설명서와 <context> 사이에 오는, 통째로 버리는 블록. */
@@ -45,6 +47,13 @@ const TURN_OPEN = /^\s*<(?:what-you-were-working-on|buzz-events?|new-message-arr
 
 /** 버리는 구간(설정·이력)에 이번 턴 블록이 보이면 경계를 잘못 잡은 것 — 손대지 않는다. */
 const TURN_IN_DROPPED = /(?:^|>)[ \t]*<(?:what-you-were-working-on|buzz-events?|new-message-arrived-while-you-were-working)[\s>]/m;
+
+/**
+ * 진짜 이번 턴 블록이 여는 모양: 줄 전체가 턴 태그 하나 (줄 맨 앞, 또는 grok-cli처럼 앞 블록의 `>`
+ * 바로 뒤에서 줄 끝까지). 실측: 이력 뒤 이번 턴 1,125건 전부 이 모양. 인용 글 속 언급은 대개
+ * 들여쓰기·뒤에 붙은 글·이스케이프(`\"`, `\n`)가 있어 걸리지 않는다.
+ */
+const TURN_LINE = /(?:^|>[ \t]*)<(?:what-you-were-working-on|buzz-events?|new-message-arrived-while-you-were-working)(?:\s[^>\n]*)?>[ \t]*\r?$/m;
 
 const CONTEXT_OPEN = /^<context>\r?\n/;
 
@@ -129,10 +138,11 @@ export function cleanBuzzEnvelope(message: string, opts: { baseless?: boolean } 
       const closeTag = `</${history[1]}>`;
       const close = tail.indexOf(closeTag, history[0].length);
       if (close < 0) return null;
+      if (historyHidesTurn(tail.slice(0, close), tail.slice(history[0].length, close))) return null;
       turnStart = close + closeTag.length;
     }
 
-    if (TURN_IN_DROPPED.test(rest.slice(0, pos)) || TURN_IN_DROPPED.test(tail.slice(0, turnStart))) return null;
+    if (TURN_IN_DROPPED.test(rest.slice(0, pos))) return null;
 
     const turn = tail.slice(turnStart);
     if (!TURN_OPEN.test(turn)) return null;
@@ -179,23 +189,41 @@ export function buzzQuotedMessages(message: string): BuzzQuote[] | null {
     const closeTag = `</${history[1]}>`;
     const close = tail.indexOf(closeTag, history[0].length);
     if (close < 0) return null;
-    const body = tail.slice(history[0].length, close).replace(/^\r?\n/, "").replace(/\r?\n$/, "");
-    if (!body.trim()) return [];
-    const out: BuzzQuote[] = [];
-    for (const line of body.split(/\r?\n/)) {
-      const e = QUOTE_ENTRY.exec(line);
-      if (e && Number(e[1]) === out.length + 1) {
-        out.push({ pubkey: e[2] ?? e[3], time: e[4], content: line.slice(e[0].length) });
-      } else if (out.length > 0) {
-        out[out.length - 1].content += "\n" + line;
-      } else {
-        return null;
-      }
-    }
-    return out;
+    return parseQuoteBody(tail.slice(history[0].length, close));
   } catch {
     return null;
   }
+}
+
+/** 이력 블록 본문(여닫는 태그 사이)을 `[n] …` 인용 글로 읽는다. 비었으면 [], 모양을 모르면 null. */
+function parseQuoteBody(raw: string): BuzzQuote[] | null {
+  const body = raw.replace(/^\r?\n/, "").replace(/\r?\n$/, "");
+  if (!body.trim()) return [];
+  const out: BuzzQuote[] = [];
+  for (const line of body.split(/\r?\n/)) {
+    const e = QUOTE_ENTRY.exec(line);
+    if (e && Number(e[1]) === out.length + 1) {
+      out.push({ pubkey: e[2] ?? e[3], time: e[4], content: line.slice(e[0].length) });
+    } else if (out.length > 0) {
+      out[out.length - 1].content += "\n" + line;
+    } else {
+      return null;
+    }
+  }
+  return out;
+}
+
+/**
+ * 이력 구간(여는 태그~첫 닫는 태그 앞)에 이번 턴 블록이 숨어 있을 수 있는지.
+ * 턴 태그가 보여도 본문이 `[n]` 인용 글로 다 읽히고 진짜 블록 모양(TURN_LINE)이 아니면
+ * 인용 글 속 언급이다 (관측 10-05: 봉투 정리 작업을 버즈에서 얘기하며 붙여 넣은 예시 때문에
+ * 거절된 12행 중 10행. 나머지 2행은 인용 속에 줄 전체가 턴 태그인 예시가 있어 계속 거절).
+ * 이력이 안 닫혔는데 이번 턴 본문 속 닫는 태그를 경계로 잡은 경우엔 진짜 턴 블록이 이
+ * 구간에 TURN_LINE 모양으로 들어 있으므로 여전히 거절된다.
+ */
+function historyHidesTurn(dropped: string, body: string): boolean {
+  if (!TURN_IN_DROPPED.test(dropped)) return false;
+  return TURN_LINE.test(dropped) || parseQuoteBody(body) === null;
 }
 
 /**
