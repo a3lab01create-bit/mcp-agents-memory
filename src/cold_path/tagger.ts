@@ -15,7 +15,7 @@ import { callRole, callSpec, ROLE_REGISTRY, type ModelSpec } from "../model_regi
 import { judgeProjectTag, shouldApplyJevJudgment } from "./jev_judge.js";
 import { getPrompt } from "../prompts/index.js";
 import { isBlockedNewTagName } from "./dtag_promoter.js";
-import { REGISTRY_MEMBER_SQL, isUndefinedColumn, parsePTagAnswer, registryCandidateLines, registryVerdict } from "./project_registry.js";
+import { REGISTRY_MEMBER_SQL, isUndefinedColumn, parsePTagAnswer, registryCandidateLines, registryHintLine, registryVerdict } from "./project_registry.js";
 
 // local 프로바이더 사용 시 실패하면 grok으로 fallback (LOCAL_GROK_FALLBACK=false 로 끄기 가능)
 const GROK_FALLBACK_SPEC: ModelSpec = { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' };
@@ -27,6 +27,8 @@ export interface TagInput {
   role: 'user' | 'assistant';
   agent_platform: string;
   agent_model: string;
+  /** 글이 온 자리(memory.venue, 예: buzz:MarketDev). 명부 항목에 걸린 채널이면 힌트 한 줄이 붙는다 */
+  venue?: string | null;
 }
 
 export interface TagResult {
@@ -141,6 +143,32 @@ async function listProjectTagCandidates(): Promise<CandidateList> {
 /** Cache invalidate — 새 p_tag 생성 시 호출해서 즉시 후보 list 갱신. */
 export function invalidateCandidateCache(): void {
   _candidateCache = null;
+  _hintCache = null;
+}
+
+type ChannelHint = { id: number; name: string };
+let _hintCache: { map: Map<string, ChannelHint>; expires: number } | null = null;
+
+/**
+ * 채널 → 명부 프로젝트 힌트 (DEVLOG §24 L3). 명부 질의와 따로 읽는다 — hint_venues 칼럼이 없는 DB(마이그레이션 032 전)에서
+ * 명부 질의까지 실패해 예전 방식(oldest 20)으로 떨어지면 안 되기 때문. 칼럼이 없으면 힌트 없음.
+ */
+async function listChannelHints(): Promise<Map<string, ChannelHint>> {
+  const now = Date.now();
+  if (_hintCache && _hintCache.expires > now) return _hintCache.map;
+  const map = new Map<string, ChannelHint>();
+  try {
+    const r = await db.query(
+      `SELECT id, name, hint_venues FROM project_tags WHERE ${REGISTRY_MEMBER_SQL} AND hint_venues IS NOT NULL`
+    );
+    for (const row of r.rows) {
+      for (const v of (row.hint_venues ?? []) as string[]) map.set(v, { id: Number(row.id), name: row.name });
+    }
+  } catch (err) {
+    if (!isUndefinedColumn(err)) throw err;
+  }
+  _hintCache = { map, expires: now + CANDIDATE_CACHE_TTL_MS };
+  return map;
 }
 
 // RESPEC §3 cost fix: slim 적용. 핵심 룰 (explosion / role-awareness)은 keep.
@@ -175,10 +203,17 @@ ROLE: input includes role='user' or role='assistant'. For role='assistant',
   tag the topic; do not treat the reply as a fact about the user.`;
 const SYSTEM_PROMPT = getPrompt("tagger", GENERIC_TAGGER_PROMPT);
 
-function buildUserPrompt(input: TagInput, candidates: Array<{ name: string; description: string | null }>, registry = false): string {
+function buildUserPrompt(
+  input: TagInput,
+  candidates: Array<{ name: string; description: string | null }>,
+  registry = false,
+  hint?: ChannelHint
+): string {
   // 명부 모드: 짧은 명부라 설명까지 준다(태거 안내문). 시스템 프롬프트가 NEW:를 허용해도 여기서 막는다.
+  // 힌트가 걸린 채널의 글에만 힌트 줄이 붙는다 — 다른 글의 안내문은 한 글자도 안 바뀐다.
   if (registry) {
-    return `registry (the ONLY allowed p_tag values — pick exactly one name, or null if none clearly fits; never invent a name, never use NEW:):\n${registryCandidateLines(candidates)}\nrole=${input.role}\nmessage: ${input.message}`;
+    const hintLine = hint && input.venue ? `${registryHintLine(input.venue, hint)}\n` : "";
+    return `registry (the ONLY allowed p_tag values — pick exactly one name, or null if none clearly fits; never invent a name, never use NEW:):\n${registryCandidateLines(candidates)}\n${hintLine}role=${input.role}\nmessage: ${input.message}`;
   }
   // Slim user prompt — description (보통 길고 가변) 제거, 이름만 (~50% 토큰 절감)
   const candList = candidates.length > 0
@@ -265,7 +300,8 @@ async function resolveRegistryAnswer(raw: unknown, candidates: ProjectTagCandida
  */
 export async function tagMessage(input: TagInput): Promise<TagResult> {
   const { rows: candidates, registry } = await listProjectTagCandidates();
-  const userPrompt = buildUserPrompt(input, candidates, registry);
+  const hint = registry && input.venue ? (await listChannelHints()).get(input.venue) : undefined;
+  const userPrompt = buildUserPrompt(input, candidates, registry, hint);
 
   const isLocal = ROLE_REGISTRY.tagger.provider === 'local';
   let raw: string;

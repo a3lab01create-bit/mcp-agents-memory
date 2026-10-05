@@ -27,7 +27,7 @@ import {
   type NewTagDecision,
 } from "../cold_path/dtag_promoter.js";
 import { parseRecommendation, planApplyRecommendations } from "../cold_path/dtag_suggest_gate.js";
-import { REGISTRY_MEMBER_SQL } from "../cold_path/project_registry.js";
+import { HINT_CHANNELS_MAX, REGISTRY_MEMBER_SQL, isUndefinedColumn, validateHintChannels } from "../cold_path/project_registry.js";
 
 const REGISTRY_DESCRIPTION_MAX = 200; // 태거가 매 호출 읽는 안내문이라 짧게
 
@@ -343,6 +343,14 @@ async function listRegistry(userId: number) {
     // 명부 항목이 다른 태그의 별칭이 되면 태거 후보에서 빠진다 — 보이게 표시
     ...(r.alias_of != null ? { warning: "this entry is now an alias of another tag, so it is NOT offered to the tagger" } : {}),
   }));
+  // 채널 힌트는 따로 읽는다 — hint_venues 칼럼(마이그레이션 032)이 없어도 명부는 보여야 한다
+  try {
+    const hints = await db.query(`SELECT name, hint_venues FROM project_tags WHERE kind IS NOT NULL AND hint_venues IS NOT NULL`);
+    const byName = new Map<string, string[]>(hints.rows.map((h: any) => [String(h.name), h.hint_venues as string[]]));
+    for (const e of entries as any[]) if (byName.has(e.name)) e.channels = byName.get(e.name);
+  } catch (err) {
+    if (!isUndefinedColumn(err)) throw err;
+  }
   return ok({
     action: "list_registry",
     registry_mode: entries.some((e: any) => !e.warning),
@@ -356,10 +364,34 @@ async function registerProject(
   tagName: string | undefined,
   description: string | undefined,
   kind: "project" | "category" | undefined,
-  paused: boolean | undefined
+  paused: boolean | undefined,
+  channels: string[] | undefined
 ) {
   const name = normalizeTagName(tagName);
   if (!name) return toolError("tag is required for register_project");
+  // 채널 힌트(DEVLOG §24 L3): 안 주면 그대로 두고, 빈 목록이면 지운다. 한 채널은 한 명부 항목에만.
+  let hintVenues: string[] | null | undefined;
+  if (channels !== undefined) {
+    const v = validateHintChannels(channels);
+    if ("error" in v) return toolError(v.error);
+    hintVenues = v.ok.length ? v.ok : null;
+    if (hintVenues) {
+      try {
+        const taken = await db.query(
+          `SELECT name, ARRAY(SELECT unnest(hint_venues) INTERSECT SELECT unnest($2::text[])) AS overlap
+             FROM project_tags WHERE kind IS NOT NULL AND name <> $1 AND hint_venues && $2::text[]`,
+          [name, hintVenues]
+        );
+        if (taken.rows.length) {
+          const owner = taken.rows[0];
+          return toolError(`channel already belongs to registry entry "${owner.name}"`, { channels: owner.overlap });
+        }
+      } catch (err) {
+        if (isUndefinedColumn(err)) return toolError("channels need migration 032 — run `mcp-agents-memory migrate` first");
+        throw err;
+      }
+    }
+  }
   const desc = description?.trim();
   if (!desc) return toolError("description is required for register_project (one line: what belongs here)");
   if (desc.length > REGISTRY_DESCRIPTION_MAX) {
@@ -379,6 +411,14 @@ async function registerProject(
      RETURNING id, kind, paused, (xmax = 0) AS created`,
     [name, kind ?? null, desc, paused ?? null]
   );
+  if (result.rows.length > 0 && hintVenues !== undefined) {
+    try {
+      await db.query(`UPDATE project_tags SET hint_venues = $2::text[], updated_at = NOW() WHERE id = $1`, [Number(result.rows[0].id), hintVenues]);
+    } catch (err) {
+      if (isUndefinedColumn(err)) return toolError("channels need migration 032 — run `mcp-agents-memory migrate` first (description/kind/paused were saved)");
+      throw err;
+    }
+  }
   if (result.rows.length === 0) {
     return toolError("tag is an alias of another tag; register the canonical tag instead", { tag: name });
   }
@@ -398,6 +438,7 @@ async function registerProject(
     kind: String(row.kind),
     paused: row.paused === true,
     description: desc,
+    ...(hintVenues !== undefined ? { channels: hintVenues ?? [] } : {}),
     project_tag_id: Number(row.id),
     created: row.created === true,
   });
@@ -568,7 +609,7 @@ Alias suggestions (two existing tags look like the same project):
 
 Project registry (the short, human-chosen list the tagger picks from — DEVLOG §24). When the registry has at least one entry, the tagger only assigns registry tags (or their aliases) and never invents names:
   - list_registry: show registry entries (kind, paused, description, aliases, 30-day uses).
-  - register_project: add or update an entry. tag + description (one line: what belongs here) required; kind = project (default) or category (not a project but a standing bucket, e.g. personal facts); paused = true keeps it as a tagger candidate but hides it from "active projects".
+  - register_project: add or update an entry. tag + description (one line: what belongs here) required; kind = project (default) or category (not a project but a standing bucket, e.g. personal facts); paused = true keeps it as a tagger candidate but hides it from "active projects"; channels = the Buzz channels (venues like "buzz:MarketDev") where this project is worked on — messages from them get a one-line project hint for the tagger (omit to keep, [] to clear; one channel belongs to one entry; shared places like buzz:general are refused; a renamed Buzz channel needs updating here).
   - unregister_project: take a tag off the registry (the tag and its old memories stay).
 
 New project tag suggestions (a frequent d_tag that is not a project tag yet; ids are separate from alias ids; not created while the registry is in use):
@@ -602,6 +643,7 @@ New project tag suggestions (a frequent d_tag that is not a project tag yet; ids
         description: z.string().optional().describe("register_project: 한 줄 설명(무엇이 여기 속하나) — 태거 안내문"),
         kind: z.enum(["project", "category"]).optional().describe("register_project: project(기본) 또는 category"),
         paused: z.boolean().optional().describe("register_project: 멈춘 프로젝트면 true"),
+        channels: z.array(z.string()).max(HINT_CHANNELS_MAX).optional().describe("register_project: 이 프로젝트를 다루는 버즈 채널(venue, 예: buzz:MarketDev). 그 채널 글에 태거 힌트 한 줄. 안 주면 그대로, [] 이면 지움"),
       },
     },
     async (args) => {
@@ -643,7 +685,7 @@ New project tag suggestions (a frequent d_tag that is not a project tag yet; ids
         }
 
         if (args.action === "register_project") {
-          return registerProject(userId, args.tag, args.description, args.kind, args.paused);
+          return registerProject(userId, args.tag, args.description, args.kind, args.paused, args.channels);
         }
 
         if (args.action === "unregister_project") {

@@ -67,3 +67,32 @@ export function registryCandidateLines(candidates: Array<{ name: string; descrip
     .map((c) => (c.description && c.description.trim() ? `- ${c.name}: ${c.description.trim()}` : `- ${c.name}`))
     .join("\n");
 }
+
+/**
+ * 채널 → 프로젝트 힌트 (DEVLOG §24 L3, 2026-10-05). 명부 항목에 그 프로젝트를 다루는 버즈 채널(venue)을 적어 두면,
+ * 그 채널에서 온 글을 태깅할 때 "이 채널은 X 프로젝트 채널"이라고 한 줄 알려 준다 — 정답 강제가 아니라 힌트.
+ * 짧은 한 줄("Committing")처럼 글만으로는 프로젝트를 알 수 없는 경우를 채널이 메운다.
+ *
+ * 프로젝트가 없는 공용 자리는 힌트로 못 건다. venue는 채널 *이름*이라 버즈에서 채널 이름을 바꾸면 힌트가 조용히 끊긴다
+ * — list_registry에 채널을 보여 주는 이유.
+ */
+export const HINT_CHANNELS_MAX = 10;
+const SHARED_VENUES: ReadonlySet<string> = new Set(["buzz:general", "buzz:dm", "buzz:welcome-everyone"]);
+
+export function validateHintChannels(channels: unknown): { ok: string[] } | { error: string } {
+  if (!Array.isArray(channels)) return { error: "channels must be a list of venues like \"buzz:MarketDev\"" };
+  const out: string[] = [];
+  for (const raw of channels) {
+    const v = typeof raw === "string" ? raw.trim() : "";
+    if (!/^buzz:[^\s:]{1,100}$/.test(v)) return { error: `"${String(raw)}" is not a Buzz channel venue (expected "buzz:<channel>")` };
+    if (SHARED_VENUES.has(v)) return { error: `"${v}" is a shared place, not a project's channel` };
+    if (!out.includes(v)) out.push(v);
+  }
+  if (out.length > HINT_CHANNELS_MAX) return { error: `at most ${HINT_CHANNELS_MAX} channels per project` };
+  return { ok: out };
+}
+
+/** 명부 모드 태거 user prompt에 붙는 힌트 한 줄. 힌트가 걸린 채널의 글에만 붙는다 — 다른 글의 안내문은 그대로. */
+export function registryHintLine(venue: string, project: { name: string }): string {
+  return `channel: ${venue} is the "${project.name}" project's channel — messages here are usually about ${project.name}. Choose ${project.name} unless the message is clearly about a different listed project, or clearly unrelated to any project (small talk, machine setup).`;
+}

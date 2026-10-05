@@ -54,6 +54,7 @@ interface ColdRow {
   role: 'user' | 'assistant';
   agent_platform: string;
   agent_model: string;
+  venue: string | null;
   needs_tag: boolean;
   needs_embed: boolean;
 }
@@ -78,7 +79,7 @@ async function claimBatch(client: any, batch: number): Promise<ColdRow[]> {
   // (tagger가 "이 메시지엔 p_tag 없음" 판정한 case)도 포함하므로 충분치 않음.
   // → tag_processed 컬럼이 명시 상태 표식 (P1 fix migration 020).
   const r = await client.query(
-    `SELECT id, message, role, agent_platform, agent_model,
+    `SELECT id, message, role, agent_platform, agent_model, venue,
             (NOT tag_processed) AS needs_tag,
             (embedding IS NULL) AS needs_embed
        FROM memory
@@ -101,6 +102,7 @@ async function claimBatch(client: any, batch: number): Promise<ColdRow[]> {
     role: row.role,
     agent_platform: row.agent_platform,
     agent_model: row.agent_model,
+    venue: row.venue ?? null,
     needs_tag: row.needs_tag,
     needs_embed: row.needs_embed,
   }));
@@ -132,6 +134,7 @@ async function processOne(client: any, row: ColdRow): Promise<void> {
             role: row.role,
             agent_platform: row.agent_platform,
             agent_model: row.agent_model,
+            venue: row.venue,
           });
         } catch (err) {
           tagError = err;

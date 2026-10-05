@@ -242,7 +242,7 @@ Usage:
                                     raw_message), and fixes Buzz envelopes an older server stored uncleaned; --no-reclean skips both. Needs BUZZ_RELAY_URL, BUZZ_PRIVATE_KEY and BUZZ_INGEST_OWNER
                                     (the memory owner's pubkeys, comma-separated) in the environment of this command only —
                                     not in the shared .env; optional BUZZ_CLI.
-  mcp-agents-memory retag-ptag [--count | --dry-run | --rollback] [--only stale|untagged] [--untagged-days N]
+  mcp-agents-memory retag-ptag [--count | --dry-run | --rollback] [--only stale|untagged | --venue buzz:<channel>] [--untagged-days N]
                                [--before ISO] [--max N] [--minutes N] [--concurrency N] [--sample] [--seed S]
                                [--log PATH] [--allow-fallback]
                                     (Project registry only) Re-decide ONLY the project tag of already-tagged memories:
@@ -255,6 +255,8 @@ Usage:
                                     dryrun-*.jsonl next to the log — review that file before the real run (--sample mixes
                                     both targets instead of newest first). The grok fallback is off unless
                                     --allow-fallback: failed rows are logged and retried next run; 5 errors in a row stop it.
+                                    --venue re-decides every row from one channel instead (registry tags included), e.g.
+                                    after giving that channel a project hint with register_project channels.
   mcp-agents-memory help            Show this message.
 
 Configuration is loaded from (first hit wins):
