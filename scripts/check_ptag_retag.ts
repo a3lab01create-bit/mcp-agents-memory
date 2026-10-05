@@ -92,6 +92,19 @@ check("보류(held)는 결정이 아니다 — 다음 실행 때 다시 판정�
   assert.deepEqual(transitionCounts([...latest.values()]).map(([k]) => k).sort(), ["#20 → #3", "(none) → (none)"]);
 });
 
+check("되돌리기 범위 --since: 그 시각 이후에 쓴 것만, --rollback 없이는 거절", () => {
+  const { latest } = replayLog([
+    line({ id: 31, result: "updated", old: 20, new: 1, at: "2026-10-06T10:00:00.000Z" }),
+    line({ id: 32, result: "updated", old: 20, new: 2, at: "2026-10-11T13:00:00.000Z" }),
+    line({ id: 33, result: "updated", old: null, new: 3, at: "2026-10-11T14:00:00.000Z" }),
+  ]);
+  assert.deepEqual(rollbackPlan(latest, "2026-10-11T22:00:00+09:00").map((p) => p.id), [32, 33]);
+  assert.deepEqual(rollbackPlan(latest).map((p) => p.id), [31, 32, 33], "범위 없으면 전부");
+  assert.equal(parseRetagArgs(["--rollback", "--since", "2026-10-11T22:00:00+09:00"]).since, "2026-10-11T13:00:00.000Z");
+  assert.throws(() => parseRetagArgs(["--since", "2026-10-11T22:00:00+09:00"]), /--rollback 범위/);
+  assert.throws(() => parseRetagArgs(["--rollback", "--since", "어제"]), /ISO/);
+});
+
 check("기록 다시 읽기: 같은 행은 마지막 줄이 이김, 깨진 줄은 세고 넘어감", () => {
   const { latest, malformed } = replayLog([
     line({ id: 1, result: "error" }),

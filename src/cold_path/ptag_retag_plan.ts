@@ -33,6 +33,8 @@ export interface RetagOptions {
    * 2026-10-05 채점에서 mcp-agents-memory 판정만 27%가 맞았다(없음 93%·다른 프로젝트 79%).
    */
   holdNew: string[];
+  /** --rollback 범위: 이 시각(ISO) 이후에 쓴 결정만 되돌린다 — 같은 기록을 쓰는 앞선 실행(채널 패스 등)은 그대로 */
+  since: string | null;
 }
 
 export const DEFAULT_UNTAGGED_DAYS = 30;
@@ -60,6 +62,7 @@ export function parseRetagArgs(argv: string[]): RetagOptions {
     log: null,
     allowFallback: false,
     holdNew: [],
+    since: null,
   };
   let only: RetagMode | null = null;
   for (let i = 0; i < argv.length; i++) {
@@ -69,7 +72,11 @@ export function parseRetagArgs(argv: string[]): RetagOptions {
     else if (a === "--rollback") o.rollback = true;
     else if (a === "--sample") o.sample = true;
     else if (a === "--allow-fallback") o.allowFallback = true;
-    else if (a === "--hold-new") {
+    else if (a === "--since") {
+      const v = argv[++i];
+      if (v === undefined || Number.isNaN(Date.parse(v))) throw new Error("--since: ISO 시각 (예: 2026-10-11T22:00:00+09:00)");
+      o.since = new Date(v).toISOString();
+    } else if (a === "--hold-new") {
       const v = argv[++i];
       const names = (v ?? "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
       if (!names.length) throw new Error("--hold-new: 명부 태그 이름 (여럿이면 쉼표로, 또는 여러 번)");
@@ -114,6 +121,7 @@ export function parseRetagArgs(argv: string[]): RetagOptions {
   if (o.count && o.rollback) throw new Error("--count와 --rollback은 같이 못 씀");
   if (o.rollback && (o.sample || o.max !== null)) throw new Error("--rollback은 기록 전체를 되돌린다 (--sample·--max 못 씀)");
   if (o.rollback && o.holdNew.length) throw new Error("--hold-new는 다시 판정할 때만 쓴다 (--rollback과 같이 못 씀)");
+  if (o.since !== null && !o.rollback) throw new Error("--since는 --rollback 범위를 좁힐 때만 쓴다");
   return o;
 }
 
@@ -167,10 +175,18 @@ export function decidedIds(latest: ReadonlyMap<number, LogEntry>): Set<number> {
   return out;
 }
 
-/** 되돌리기: 마지막 결정이 updated인 행만, new → old. */
-export function rollbackPlan(latest: ReadonlyMap<number, LogEntry>): Array<{ id: number; from: number | null; to: number | null }> {
+/** 되돌리기: 마지막 결정이 updated인 행만, new → old. since(ISO)를 주면 그 시각 이후에 쓴 것만. */
+export function rollbackPlan(
+  latest: ReadonlyMap<number, LogEntry>,
+  since: string | null = null
+): Array<{ id: number; from: number | null; to: number | null }> {
+  const cutoff = since === null ? null : Date.parse(since);
   const out: Array<{ id: number; from: number | null; to: number | null }> = [];
-  for (const e of latest.values()) if (e.result === "updated") out.push({ id: e.id, from: e.new, to: e.old });
+  for (const e of latest.values()) {
+    if (e.result !== "updated") continue;
+    if (cutoff !== null && !(Date.parse(e.at) >= cutoff)) continue;
+    out.push({ id: e.id, from: e.new, to: e.old });
+  }
   return out.sort((a, b) => a.id - b.id);
 }
 

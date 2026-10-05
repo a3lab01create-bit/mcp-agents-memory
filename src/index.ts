@@ -244,7 +244,7 @@ Usage:
                                     not in the shared .env; optional BUZZ_CLI.
   mcp-agents-memory retag-ptag [--count | --dry-run | --rollback] [--only stale|untagged | --venue buzz:<channel>] [--untagged-days N]
                                [--before ISO] [--max N] [--minutes N] [--concurrency N] [--sample] [--seed S]
-                               [--log PATH] [--allow-fallback] [--hold-new <registry tag>[,...]]
+                               [--log PATH] [--allow-fallback] [--hold-new <registry tag>[,...]] [--since ISO (with --rollback)]
                                     (Project registry only) Re-decide ONLY the project tag of already-tagged memories:
                                     (a) rows whose tag is outside the registry (pinned rows skipped), (b) untagged rows from
                                     the last N days (default 30) written before the registry existed. Same tagger as the

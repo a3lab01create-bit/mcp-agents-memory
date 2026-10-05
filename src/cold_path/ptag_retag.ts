@@ -216,7 +216,7 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
   const base = { log: logFile, registry, taggerPrompt, before, venueHint, malformedLogLines: malformed || undefined };
 
   if (opts.rollback) {
-    const plan = rollbackPlan(latest);
+    const plan = rollbackPlan(latest, opts.since);
     if (opts.dryRun) return { action: "rollback-preview", ...base, rollback: { planned: plan.length, restored: 0, conflicts: 0 } };
     let restored = 0;
     let conflicts = 0;
