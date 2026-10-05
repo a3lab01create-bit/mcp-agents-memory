@@ -244,7 +244,7 @@ Usage:
                                     not in the shared .env; optional BUZZ_CLI.
   mcp-agents-memory retag-ptag [--count | --dry-run | --rollback] [--only stale|untagged | --venue buzz:<channel>] [--untagged-days N]
                                [--before ISO] [--max N] [--minutes N] [--concurrency N] [--sample] [--seed S]
-                               [--log PATH] [--allow-fallback]
+                               [--log PATH] [--allow-fallback] [--hold-new <registry tag>[,...]] [--since ISO (with --rollback)]
                                     (Project registry only) Re-decide ONLY the project tag of already-tagged memories:
                                     (a) rows whose tag is outside the registry (pinned rows skipped), (b) untagged rows from
                                     the last N days (default 30) written before the registry existed. Same tagger as the
@@ -257,6 +257,8 @@ Usage:
                                     --allow-fallback: failed rows are logged and retried next run; 5 errors in a row stop it.
                                     --venue re-decides every row from one channel instead (registry tags included), e.g.
                                     after giving that channel a project hint with register_project channels.
+                                    --hold-new <tag> leaves a row untouched when the tagger picks that tag (logged as
+                                    "held" and re-decided next run) — for a tag the tagger is known to over-assign.
   mcp-agents-memory help            Show this message.
 
 Configuration is loaded from (first hit wins):

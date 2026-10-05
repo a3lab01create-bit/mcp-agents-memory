@@ -72,6 +72,39 @@ check("옵션: --venue는 그 채널만 (a)(b) 끄고, --only와는 같이 못 �
   assert.equal(parseRetagArgs([]).venue, null);
 });
 
+check("옵션: --hold-new는 여러 번·쉼표 둘 다, 소문자로, 빈 값·--rollback과는 거절", () => {
+  assert.deepEqual(parseRetagArgs([]).holdNew, []);
+  assert.deepEqual(parseRetagArgs(["--hold-new", "MCP-Agents-Memory", "--hold-new", "buzz,pacefy", "--hold-new", "buzz"]).holdNew, ["mcp-agents-memory", "buzz", "pacefy"]);
+  assert.throws(() => parseRetagArgs(["--hold-new"]), /명부 태그 이름/);
+  assert.throws(() => parseRetagArgs(["--hold-new", " , "]), /명부 태그 이름/);
+  assert.throws(() => parseRetagArgs(["--rollback", "--hold-new", "buzz"]), /같이 못 씀/);
+});
+
+check("보류(held)는 결정이 아니다 — 다음 실행 때 다시 판정하고, 되돌리기 대상도 아니다", () => {
+  const { latest } = replayLog([
+    line({ id: 21, result: "held", old: 20, new: 1 }),
+    line({ id: 22, result: "updated", old: 20, new: 3 }),
+    line({ id: 23, result: "held", old: null, new: 1 }),
+    line({ id: 23, result: "same", old: null, new: null }),
+  ]);
+  assert.deepEqual([...decidedIds(latest)].sort(), [22, 23]);
+  assert.deepEqual(rollbackPlan(latest), [{ id: 22, from: 3, to: 20 }]);
+  assert.deepEqual(transitionCounts([...latest.values()]).map(([k]) => k).sort(), ["#20 → #3", "(none) → (none)"]);
+});
+
+check("되돌리기 범위 --since: 그 시각 이후에 쓴 것만, --rollback 없이는 거절", () => {
+  const { latest } = replayLog([
+    line({ id: 31, result: "updated", old: 20, new: 1, at: "2026-10-06T10:00:00.000Z" }),
+    line({ id: 32, result: "updated", old: 20, new: 2, at: "2026-10-11T13:00:00.000Z" }),
+    line({ id: 33, result: "updated", old: null, new: 3, at: "2026-10-11T14:00:00.000Z" }),
+  ]);
+  assert.deepEqual(rollbackPlan(latest, "2026-10-11T22:00:00+09:00").map((p) => p.id), [32, 33]);
+  assert.deepEqual(rollbackPlan(latest).map((p) => p.id), [31, 32, 33], "범위 없으면 전부");
+  assert.equal(parseRetagArgs(["--rollback", "--since", "2026-10-11T22:00:00+09:00"]).since, "2026-10-11T13:00:00.000Z");
+  assert.throws(() => parseRetagArgs(["--since", "2026-10-11T22:00:00+09:00"]), /--rollback 범위/);
+  assert.throws(() => parseRetagArgs(["--rollback", "--since", "어제"]), /ISO/);
+});
+
 check("기록 다시 읽기: 같은 행은 마지막 줄이 이김, 깨진 줄은 세고 넘어감", () => {
   const { latest, malformed } = replayLog([
     line({ id: 1, result: "error" }),
