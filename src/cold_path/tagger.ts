@@ -19,7 +19,8 @@ import { REGISTRY_MEMBER_SQL, isUndefinedColumn, parsePTagAnswer, registryCandid
 
 // local 프로바이더 사용 시 실패하면 grok으로 fallback (LOCAL_GROK_FALLBACK=false 로 끄기 가능)
 const GROK_FALLBACK_SPEC: ModelSpec = { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' };
-const localFallbackEnabled = process.env.LOCAL_GROK_FALLBACK !== 'false';
+// 호출마다 읽는다 — retag-ptag는 실행 중에 끈다(대량 작업이 유료 grok으로 새지 않게)
+const localFallbackEnabled = (): boolean => process.env.LOCAL_GROK_FALLBACK !== 'false';
 
 export interface TagInput {
   message: string;
@@ -281,7 +282,7 @@ export async function tagMessage(input: TagInput): Promise<TagResult> {
         // jsonSchema → llama.cpp grammar로 <think> bleed 차단 (Qwen3 bug #20345).
       });
     } catch (err) {
-      if (!localFallbackEnabled) throw err;
+      if (!localFallbackEnabled()) throw err;
       console.warn(`⚠️ [Tagger] Local model 실패, grok fallback: ${(err as Error).message?.slice(0, 80)}`);
       raw = await callSpec(GROK_FALLBACK_SPEC, {
         system: SYSTEM_PROMPT,
