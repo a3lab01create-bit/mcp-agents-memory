@@ -5,7 +5,7 @@
  * 같은 행이 여러 번 나오면 마지막 줄이 이긴다.
  */
 
-export type RetagMode = "stale" | "untagged";
+export type RetagMode = "stale" | "untagged" | "venue";
 
 export interface RetagOptions {
   /** 대상 (a): 정본이 명부 밖인 p_tag가 붙은 행 */
@@ -14,6 +14,8 @@ export interface RetagOptions {
   untaggedDays: number | null;
   /** (b)의 상한 시각(ISO). null이면 명부가 생긴 시각(명부 항목의 가장 이른 updated_at) — 그 뒤 글은 이미 명부로 판정됐다 */
   before: string | null;
+  /** (c) 한 채널(venue)의 글 전부를 다시 판정 — 채널 힌트(§24 L3)를 건 뒤 그 채널의 지난 글을 바로잡을 때. 주면 (a)(b)는 안 한다 */
+  venue: string | null;
   count: boolean;
   dryRun: boolean;
   rollback: boolean;
@@ -41,6 +43,7 @@ export function parseRetagArgs(argv: string[]): RetagOptions {
     stale: true,
     untaggedDays: DEFAULT_UNTAGGED_DAYS,
     before: null,
+    venue: null,
     count: false,
     dryRun: false,
     rollback: false,
@@ -65,6 +68,11 @@ export function parseRetagArgs(argv: string[]): RetagOptions {
       if (v !== "stale" && v !== "untagged") throw new Error("--only: stale 또는 untagged");
       only = v;
     } else if (a === "--untagged-days") o.untaggedDays = intArg(a, argv[++i], 1);
+    else if (a === "--venue") {
+      const v = argv[++i];
+      if (!v || !/^[a-z]+(:\S+)?$/.test(v)) throw new Error("--venue: 글이 온 자리 (예: buzz:MDs_copy_db)");
+      o.venue = v;
+    }
     else if (a === "--before") {
       const v = argv[++i];
       if (v === undefined || Number.isNaN(Date.parse(v))) throw new Error("--before: ISO 시각 (예: 2026-10-04T15:28:12+09:00)");
@@ -83,6 +91,11 @@ export function parseRetagArgs(argv: string[]): RetagOptions {
       if (!v) throw new Error("--log: 파일 경로 필요");
       o.log = v;
     } else throw new Error(`retag-ptag: 모르는 옵션 ${a}`);
+  }
+  if (o.venue !== null) {
+    if (only !== null) throw new Error("--venue와 --only는 같이 못 씀 (--venue는 그 채널 글만 다시 판정한다)");
+    o.stale = false;
+    o.untaggedDays = null;
   }
   if (only === "stale") o.untaggedDays = null;
   if (only === "untagged") o.stale = false;

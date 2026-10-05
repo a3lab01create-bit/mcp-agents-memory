@@ -4,7 +4,7 @@
  *   npm run check:registry        # esbuild로 묶어서 실행
  */
 import assert from "node:assert/strict";
-import { isUndefinedColumn, parsePTagAnswer, registryCandidateLines, registryVerdict } from "../src/cold_path/project_registry.ts";
+import { HINT_CHANNELS_MAX, isUndefinedColumn, parsePTagAnswer, registryCandidateLines, registryHintLine, registryVerdict, validateHintChannels } from "../src/cold_path/project_registry.ts";
 
 function check(name: string, fn: () => void) {
   fn();
@@ -55,6 +55,22 @@ check("예전 방식으로 돌아가는 건 '칸 없음(42703)'일 때만 — �
   assert.equal(isUndefinedColumn({ code: "57P01" }), false, "서버 재시작");
   assert.equal(isUndefinedColumn(new Error("Connection terminated")), false);
   assert.equal(isUndefinedColumn(null), false);
+});
+
+check("채널 힌트: 버즈 채널만, 공용 자리는 거절, 중복은 하나로", () => {
+  assert.deepEqual(validateHintChannels(["buzz:MarketDev", " buzz:MDs_copy_db ", "buzz:MarketDev"]), { ok: ["buzz:MarketDev", "buzz:MDs_copy_db"] });
+  assert.deepEqual(validateHintChannels([]), { ok: [] }, "빈 목록 = 지우기");
+  for (const bad of ["buzz:general", "buzz:dm", "buzz:welcome-everyone"]) assert.ok("error" in validateHintChannels([bad]), bad);
+  for (const bad of ["terminal", "slack", "buzz:", "buzz:has space", "MarketDev", 42]) assert.ok("error" in validateHintChannels([bad]), String(bad));
+  assert.ok("error" in validateHintChannels("buzz:MarketDev"), "목록이 아님");
+  assert.ok("error" in validateHintChannels(Array.from({ length: HINT_CHANNELS_MAX + 1 }, (_, i) => `buzz:c${i}`)), "너무 많음");
+});
+
+check("채널 힌트 줄: 채널·프로젝트 이름이 들어가고, 다른 프로젝트·무관한 글은 예외로 둔다", () => {
+  const line = registryHintLine("buzz:MDs_copy_db", { name: "md-copy-db" });
+  assert.ok(line.includes("buzz:MDs_copy_db") && line.includes('"md-copy-db"'));
+  assert.ok(/unless the message is clearly about a different listed project/.test(line));
+  assert.ok(!line.includes("\n"), "한 줄");
 });
 
 console.log("\n모든 검사 통과");

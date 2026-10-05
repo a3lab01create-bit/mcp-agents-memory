@@ -18,7 +18,7 @@ import { createHash } from "node:crypto";
 import { db } from "../db.js";
 import { tagMessage } from "./tagger.js";
 import { beginJevRun } from "./jev_judge.js";
-import { REGISTRY_MEMBER_SQL } from "./project_registry.js";
+import { REGISTRY_MEMBER_SQL, isUndefinedColumn } from "./project_registry.js";
 import { promptSource } from "../prompts/index.js";
 import {
   decidedIds,
@@ -39,17 +39,29 @@ const PROGRESS_EVERY_MS = 60_000;
 
 const REGISTRY_IDS_SQL = `SELECT id FROM project_tags WHERE ${REGISTRY_MEMBER_SQL}`;
 
-/** 대상 조건. $1 = (b) 일수, $2 = (b) 상한 시각 — (a)는 파라미터 없음. */
+/** 대상을 고르는 값들 — (b) 일수·상한 시각, (c) 채널. */
+type Scope = { days: number; before: string; venue: string | null };
+
+/**
+ * 대상 조건. (a)는 파라미터 없음, (b)는 $1 = 일수·$2 = 상한 시각, (c)는 $1 = 채널.
+ * (c)는 명부 태그가 붙은 행도 다시 판정한다(채널 힌트 전 판정이 틀렸을 수 있다). 고정 행은 무태그일 때만 — (a)·(b)와 같은 규칙.
+ */
 function targetWhere(mode: RetagMode): string {
-  return mode === "stale"
-    ? `m.is_active AND m.tag_processed AND NOT m.is_pinned AND m.p_tag_id IS NOT NULL
-       AND canonical_project_tag_id(m.p_tag_id) NOT IN (${REGISTRY_IDS_SQL})`
-    : `m.is_active AND m.tag_processed AND m.p_tag_id IS NULL
+  if (mode === "stale") {
+    return `m.is_active AND m.tag_processed AND NOT m.is_pinned AND m.p_tag_id IS NOT NULL
+       AND canonical_project_tag_id(m.p_tag_id) NOT IN (${REGISTRY_IDS_SQL})`;
+  }
+  if (mode === "untagged") {
+    return `m.is_active AND m.tag_processed AND m.p_tag_id IS NULL
        AND m.created_at >= NOW() - make_interval(days => $1::int) AND m.created_at < $2::timestamptz`;
+  }
+  return `m.is_active AND m.tag_processed AND m.venue = $1 AND (NOT m.is_pinned OR m.p_tag_id IS NULL)`;
 }
 
-function targetParams(mode: RetagMode, days: number, before: string): unknown[] {
-  return mode === "stale" ? [] : [days, before];
+function targetParams(mode: RetagMode, scope: Scope): unknown[] {
+  if (mode === "stale") return [];
+  if (mode === "untagged") return [scope.days, scope.before];
+  return [scope.venue];
 }
 
 function defaultLogPath(): string {
@@ -69,8 +81,8 @@ function appendLog(file: string, e: LogEntry): void {
   fs.appendFileSync(file, JSON.stringify(e) + "\n");
 }
 
-async function listTargetIds(mode: RetagMode, days: number, before: string): Promise<number[]> {
-  const r = await db.query(`SELECT m.id FROM memory m WHERE ${targetWhere(mode)} ORDER BY m.id DESC`, targetParams(mode, days, before));
+async function listTargetIds(mode: RetagMode, scope: Scope): Promise<number[]> {
+  const r = await db.query(`SELECT m.id FROM memory m WHERE ${targetWhere(mode)} ORDER BY m.id DESC`, targetParams(mode, scope));
   return r.rows.map((row: { id: string | number }) => Number(row.id));
 }
 
@@ -85,15 +97,16 @@ interface TargetRow {
   role: "user" | "assistant";
   agent_platform: string;
   agent_model: string;
+  venue: string | null;
   p_tag_id: number | null;
 }
 
 /** 처리 직전에 다시 읽는다 — 목록을 뽑은 뒤 콜드패스 등이 바꿨으면 더는 대상이 아니다(null). */
-async function fetchTarget(mode: RetagMode, id: number, days: number, before: string): Promise<TargetRow | null> {
-  const params = targetParams(mode, days, before);
+async function fetchTarget(mode: RetagMode, id: number, scope: Scope): Promise<TargetRow | null> {
+  const params = targetParams(mode, scope);
   params.push(id);
   const r = await db.query(
-    `SELECT m.id, m.message, m.role, m.agent_platform, m.agent_model, m.p_tag_id
+    `SELECT m.id, m.message, m.role, m.agent_platform, m.agent_model, m.venue, m.p_tag_id
        FROM memory m WHERE ${targetWhere(mode)} AND m.id = $${params.length}`,
     params
   );
@@ -105,6 +118,7 @@ async function fetchTarget(mode: RetagMode, id: number, days: number, before: st
     role: row.role,
     agent_platform: row.agent_platform,
     agent_model: row.agent_model,
+    venue: row.venue ?? null,
     p_tag_id: row.p_tag_id === null ? null : Number(row.p_tag_id),
   };
 }
@@ -131,7 +145,17 @@ export interface RetagReport {
   taggerPrompt: "env" | "local" | "generic";
   before: string;
   /** stale·untagged는 지금 조건에 맞는 행 수(이미 결정된 행 포함), queued가 이번에 실제로 할 행 수 */
-  targets?: { stale: number | null; untagged: number | null; overlap: number; alreadyDecided: number; queued: number; queuedByMode: Record<RetagMode, number> };
+  targets?: {
+    stale: number | null;
+    untagged: number | null;
+    venue: number | null;
+    overlap: number;
+    alreadyDecided: number;
+    queued: number;
+    queuedByMode: Record<RetagMode, number>;
+  };
+  /** --venue일 때 그 채널에 걸린 명부 항목(채널 힌트). null이면 힌트 없이 다시 판정하는 것 */
+  venueHint?: string | null;
   processed?: number;
   updated?: number;
   same?: number;
@@ -166,7 +190,18 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
   if (taggerPrompt === "generic") {
     console.error("⚠️ [retag-ptag] 태거 안내문이 공개용 기본값이다 (prompts.local/tagger.md·MEMORY_PROMPTS_DIR 없음) — 운영 태깅과 판정이 다르다. 운영 체크아웃에서 돌리고 있는지 확인할 것.");
   }
-  const base = { log: logFile, registry, taggerPrompt, before, malformedLogLines: malformed || undefined };
+  let venueHint: string | null | undefined;
+  if (opts.venue !== null) {
+    try {
+      const h = await db.query(`SELECT name FROM project_tags WHERE ${REGISTRY_MEMBER_SQL} AND $1 = ANY(hint_venues)`, [opts.venue]);
+      venueHint = h.rows[0]?.name ?? null;
+    } catch (err) {
+      if (!isUndefinedColumn(err)) throw err;
+      venueHint = null;
+    }
+    if (venueHint === null) console.error(`⚠️ [retag-ptag] ${opts.venue}에 걸린 채널 힌트가 없다 — 힌트 없이 다시 판정한다 (register_project channels)`);
+  }
+  const base = { log: logFile, registry, taggerPrompt, before, venueHint, malformedLogLines: malformed || undefined };
 
   if (opts.rollback) {
     const plan = rollbackPlan(latest);
@@ -181,15 +216,17 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
     return { action: "rollback", ...base, rollback: { planned: plan.length, restored, conflicts } };
   }
 
-  // 대상 목록 — (a) 먼저, (b)는 (a)에 없는 것만. 이미 결정된 행은 뺀다(재개).
+  // 대상 목록 — (a) 먼저, (b)는 (a)에 없는 것만, (c)는 --venue일 때만. 이미 결정된 행은 뺀다(재개).
+  const scope: Scope = { days, before, venue: opts.venue };
   const decided = decidedIds(latest);
-  const staleIds = opts.stale ? await listTargetIds("stale", days, before) : [];
-  const untaggedIds = opts.untaggedDays !== null ? await listTargetIds("untagged", days, before) : [];
+  const staleIds = opts.stale ? await listTargetIds("stale", scope) : [];
+  const untaggedIds = opts.untaggedDays !== null ? await listTargetIds("untagged", scope) : [];
+  const venueIds = opts.venue !== null ? await listTargetIds("venue", scope) : [];
   const seen = new Set<number>();
   const queue: Array<{ id: number; mode: RetagMode }> = [];
   let overlap = 0;
   let alreadyDecided = 0;
-  for (const [mode, ids] of [["stale", staleIds], ["untagged", untaggedIds]] as const) {
+  for (const [mode, ids] of [["stale", staleIds], ["untagged", untaggedIds], ["venue", venueIds]] as const) {
     for (const id of ids) {
       if (seen.has(id)) {
         overlap++;
@@ -203,12 +240,13 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
       queue.push({ id, mode });
     }
   }
-  const queuedByMode: Record<RetagMode, number> = { stale: 0, untagged: 0 };
+  const queuedByMode: Record<RetagMode, number> = { stale: 0, untagged: 0, venue: 0 };
   for (const q of queue) queuedByMode[q.mode]++;
   if (opts.sample) queue.sort((a, b) => (sampleKey(a.id, opts.seed) < sampleKey(b.id, opts.seed) ? -1 : 1));
   const targets = {
     stale: opts.stale ? staleIds.length : null,
     untagged: opts.untaggedDays !== null ? untaggedIds.length : null,
+    venue: opts.venue !== null ? venueIds.length : null,
     overlap,
     alreadyDecided,
     queued: queue.length,
@@ -270,7 +308,7 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
       }
       const item = work[next++];
       if (!item) return;
-      const row = await fetchTarget(item.mode, item.id, days, before);
+      const row = await fetchTarget(item.mode, item.id, scope);
       if (!row) {
         c.gone++;
         continue;
@@ -279,7 +317,7 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
       let newId: number | null;
       try {
         newId = (
-          await tagMessage({ message: row.message, role: row.role, agent_platform: row.agent_platform, agent_model: row.agent_model })
+          await tagMessage({ message: row.message, role: row.role, agent_platform: row.agent_platform, agent_model: row.agent_model, venue: row.venue })
         ).p_tag_id;
       } catch (err) {
         const msg = String((err as Error)?.message ?? err).slice(0, 300);

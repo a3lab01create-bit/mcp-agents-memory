@@ -61,6 +61,17 @@ check("옵션: 잘못된 입력은 거절", () => {
   assert.throws(() => parseRetagArgs(["--rollback", "--max", "5"]), /전체를 되돌린다/);
 });
 
+check("옵션: --venue는 그 채널만 (a)(b) 끄고, --only와는 같이 못 씀", () => {
+  const o = parseRetagArgs(["--venue", "buzz:MDs_copy_db", "--dry-run"]);
+  assert.equal(o.venue, "buzz:MDs_copy_db");
+  assert.equal(o.stale, false);
+  assert.equal(o.untaggedDays, null);
+  assert.throws(() => parseRetagArgs(["--venue", "buzz:X", "--only", "stale"]), /같이 못 씀/);
+  assert.throws(() => parseRetagArgs(["--venue"]), /글이 온 자리/);
+  assert.throws(() => parseRetagArgs(["--venue", "has space"]), /글이 온 자리/);
+  assert.equal(parseRetagArgs([]).venue, null);
+});
+
 check("기록 다시 읽기: 같은 행은 마지막 줄이 이김, 깨진 줄은 세고 넘어감", () => {
   const { latest, malformed } = replayLog([
     line({ id: 1, result: "error" }),
