@@ -158,6 +158,9 @@ export interface RetagReport {
   venueHint?: string | null;
   processed?: number;
   updated?: number;
+  /** --hold-new 태그로 판정돼 쓰지 않은 행 (다음 실행 때 다시 판정) */
+  held?: number;
+  holdNew?: string[];
   same?: number;
   conflict?: number;
   gone?: number;
@@ -180,6 +183,15 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
   ).rows[0];
   if (!reg || reg.n === 0) throw new Error("retag-ptag: 명부가 비어 있다 — 명부 모드가 아니면 다시 붙일 기준이 없다");
   const registry = { members: Number(reg.n), since: new Date(reg.since).toISOString() };
+  // --hold-new: 오타로 아무것도 안 보류한 채 돌지 않게, 명부에 있는 이름인지 먼저 확인한다
+  const holdIds = new Set<number>();
+  if (opts.holdNew.length) {
+    const h = await db.query(`SELECT id, name FROM project_tags WHERE ${REGISTRY_MEMBER_SQL} AND name = ANY($1)`, [opts.holdNew]);
+    const found = new Set(h.rows.map((r: { name: string }) => r.name));
+    const missing = opts.holdNew.filter((n) => !found.has(n));
+    if (missing.length) throw new Error(`--hold-new: 명부 태그가 아니다 — ${missing.join(", ")}`);
+    for (const r of h.rows) holdIds.add(Number(r.id));
+  }
   const before = opts.before ?? registry.since;
   const days = opts.untaggedDays ?? 0;
 
@@ -284,7 +296,7 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
   const started = Date.now();
   const durations: number[] = [];
   const entries: LogEntry[] = [];
-  const c = { processed: 0, updated: 0, same: 0, conflict: 0, gone: 0, errors: 0, overflow: 0 };
+  const c = { processed: 0, updated: 0, same: 0, conflict: 0, held: 0, gone: 0, errors: 0, overflow: 0 };
   let consecutiveErrors = 0;
   let next = 0;
   let lastProgress = Date.now();
@@ -296,7 +308,7 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
     const rate = mins > 0 ? c.processed / mins : 0;
     const left = Math.max(0, work.length - c.processed - c.gone);
     console.error(
-      `🔁 [retag-ptag] ${c.processed}/${work.length} · 바꿈 ${c.updated} · 그대로 ${c.same} · 오류 ${c.errors} · ${rate.toFixed(1)}행/분 · 남은 ${left}행 ≈ ${rate > 0 ? formatDuration((left / rate) * 60) : "?"}`
+      `🔁 [retag-ptag] ${c.processed}/${work.length} · 바꿈 ${c.updated} · 그대로 ${c.same}${holdIds.size ? ` · 보류 ${c.held}` : ""} · 오류 ${c.errors} · ${rate.toFixed(1)}행/분 · 남은 ${left}행 ≈ ${rate > 0 ? formatDuration((left / rate) * 60) : "?"}`
     );
   };
 
@@ -341,9 +353,10 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
 
       let result: LogEntry["result"];
       if (newId === row.p_tag_id) result = "same";
+      else if (newId !== null && holdIds.has(newId)) result = "held";
       else if (opts.dryRun) result = "updated";
       else result = (await writePTag(row.id, row.p_tag_id, newId, true)) ? "updated" : "conflict";
-      c[result === "updated" ? "updated" : result === "same" ? "same" : "conflict"]++;
+      c[result === "updated" ? "updated" : result === "same" ? "same" : result === "held" ? "held" : "conflict"]++;
       const e: LogEntry = {
         id: row.id,
         mode: item.mode,
@@ -385,6 +398,7 @@ export async function runRetag(opts: RetagOptions): Promise<RetagReport> {
     updated: c.updated,
     same: c.same,
     conflict: c.conflict,
+    ...(opts.holdNew.length ? { held: c.held, holdNew: opts.holdNew } : {}),
     gone: c.gone,
     errors: c.errors,
     contextOverflow: c.overflow,

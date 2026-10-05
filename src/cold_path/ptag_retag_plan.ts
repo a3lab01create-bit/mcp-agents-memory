@@ -28,6 +28,11 @@ export interface RetagOptions {
   log: string | null;
   /** 로컬 모델이 실패하면 grok으로 넘어가도 되는지 (기본: 안 됨 — 실패한 행은 기록만 하고 다음 실행 때 다시 시도) */
   allowFallback: boolean;
+  /**
+   * 이 명부 태그로 판정되면 쓰지 않고 보류한다(옛 값 그대로, 다음 실행 때 다시 판정). 태거가 유독 못 맞히는 태그용 —
+   * 2026-10-05 채점에서 mcp-agents-memory 판정만 27%가 맞았다(없음 93%·다른 프로젝트 79%).
+   */
+  holdNew: string[];
 }
 
 export const DEFAULT_UNTAGGED_DAYS = 30;
@@ -54,6 +59,7 @@ export function parseRetagArgs(argv: string[]): RetagOptions {
     seed: "ptag-retag",
     log: null,
     allowFallback: false,
+    holdNew: [],
   };
   let only: RetagMode | null = null;
   for (let i = 0; i < argv.length; i++) {
@@ -63,6 +69,12 @@ export function parseRetagArgs(argv: string[]): RetagOptions {
     else if (a === "--rollback") o.rollback = true;
     else if (a === "--sample") o.sample = true;
     else if (a === "--allow-fallback") o.allowFallback = true;
+    else if (a === "--hold-new") {
+      const v = argv[++i];
+      const names = (v ?? "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+      if (!names.length) throw new Error("--hold-new: 명부 태그 이름 (여럿이면 쉼표로, 또는 여러 번)");
+      for (const n of names) if (!o.holdNew.includes(n)) o.holdNew.push(n);
+    }
     else if (a === "--only") {
       const v = argv[++i];
       if (v !== "stale" && v !== "untagged") throw new Error("--only: stale 또는 untagged");
@@ -101,6 +113,7 @@ export function parseRetagArgs(argv: string[]): RetagOptions {
   if (only === "untagged") o.stale = false;
   if (o.count && o.rollback) throw new Error("--count와 --rollback은 같이 못 씀");
   if (o.rollback && (o.sample || o.max !== null)) throw new Error("--rollback은 기록 전체를 되돌린다 (--sample·--max 못 씀)");
+  if (o.rollback && o.holdNew.length) throw new Error("--hold-new는 다시 판정할 때만 쓴다 (--rollback과 같이 못 씀)");
   return o;
 }
 
@@ -110,7 +123,8 @@ export type LogResult =
   | "conflict" // 읽은 뒤 다른 곳에서 p_tag가 바뀌어 안 썼다
   | "error" // 태거 실패 — 다음 실행 때 다시 시도
   | "rolledback" // --rollback으로 옛 값으로 되돌렸다
-  | "rollback_conflict"; // 되돌리려는데 그 사이 p_tag가 또 바뀌어 안 건드렸다
+  | "rollback_conflict" // 되돌리려는데 그 사이 p_tag가 또 바뀌어 안 건드렸다
+  | "held"; // --hold-new 태그로 판정돼 쓰지 않고 보류했다 — 다음 실행 때 다시 판정한다
 
 export interface LogEntry {
   id: number;
@@ -125,7 +139,7 @@ export interface LogEntry {
   err?: string;
 }
 
-/** 이미 결정된 것으로 보고 다음 실행에서 건너뛰는 결과. error·rolledback은 다시 시도한다. */
+/** 이미 결정된 것으로 보고 다음 실행에서 건너뛰는 결과. error·rolledback·held는 다시 시도한다. */
 const DECIDED: ReadonlySet<LogResult> = new Set<LogResult>(["updated", "same", "conflict", "rollback_conflict"]);
 
 export function replayLog(lines: Iterable<string>): { latest: Map<number, LogEntry>; malformed: number } {
