@@ -559,7 +559,7 @@ codex/gemini에 이어 **Grok Build·Antigravity** passive capture 추가 → �
 
 ---
 
-## §25. alias 제안의 거짓 증거 — 명부를 안 읽는 생성기 + 봉투를 사람 말로 읽는 신호 🔵 SHIPPED (2026-10-12)
+## §25. alias 제안의 거짓 증거 — 명부를 안 읽는 생성기 + 봉투를 사람 말로 읽는 신호 🟡 PR #26 (2026-10-12, 머지·배포 전)
 
 사람에게 올라온 대기 제안 2건(A559 `mcp-agents-memory → marketadmin` · A560 `restart → merr-auto-restarter`)이
 둘 다 오답이었고, 형 판단으로 반려했다. 둘을 파보니 **같은 결함이 아니라 세 경로**였다.

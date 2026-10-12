@@ -1303,9 +1303,17 @@ export async function maybeRunProjectAliasPromoter(): Promise<void> {
     );
 
     const summary = await runProjectAliasPromoter({ userId });
-    if (summary.candidates > 0 || summary.inserted > 0 || summary.errors > 0 || summary.swept > 0 || summary.blockedBeforeJudge > 0) {
+    if (
+      summary.candidates > 0 ||
+      summary.inserted > 0 ||
+      summary.errors > 0 ||
+      summary.swept > 0 ||
+      summary.blockedBeforeJudge > 0 ||
+      summary.blockedRegistryPair > 0 ||
+      summary.blockedRegistrySource > 0
+    ) {
       console.error(
-        `🔁 [ProjectAliasPromoter] done — candidates=${summary.candidates}, judged=${summary.judged}, inserted=${summary.inserted}, autoApplied=${summary.autoApplied}, skipped=${summary.skipped}, errors=${summary.errors}, blockedBeforeJudge=${summary.blockedBeforeJudge}, blockedAfterJudge=${summary.blockedAfterJudge}, swept=${summary.swept}`
+        `🔁 [ProjectAliasPromoter] done — candidates=${summary.candidates}, judged=${summary.judged}, inserted=${summary.inserted}, autoApplied=${summary.autoApplied}, skipped=${summary.skipped}, errors=${summary.errors}, blockedBeforeJudge=${summary.blockedBeforeJudge}, blockedAfterJudge=${summary.blockedAfterJudge}, blockedRegistryPair=${summary.blockedRegistryPair}, blockedRegistrySource=${summary.blockedRegistrySource}, swept=${summary.swept}`
       );
     }
   } catch (err) {
