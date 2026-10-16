@@ -559,6 +559,85 @@ codex/gemini에 이어 **Grok Build·Antigravity** passive capture 추가 → �
 
 ---
 
+## §25. alias 제안의 거짓 증거 — 명부를 안 읽는 생성기 + 봉투를 사람 말로 읽는 신호 🟡 PR #26 (2026-10-12, 머지·배포 전)
+
+사람에게 올라온 대기 제안 2건(A559 `mcp-agents-memory → marketadmin` · A560 `restart → merr-auto-restarter`)이
+둘 다 오답이었고, 형 판단으로 반려했다. 둘을 파보니 **같은 결함이 아니라 세 경로**였다.
+
+### 실측 (2026-10-12, 운영 DB user_id=1)
+
+| # | 사실 | 수치 |
+|---|---|---|
+| 1 | **적용 경로엔 명부 가드가 있는데 생성 경로는 `kind` 를 아예 안 읽는다** | `manage_project_tags.ts registrySourceError` 는 source 가 명부면 거부한다(가동 중 번들에 있음 — 확인). `project_alias_promoter.ts` 전체에 `kind` 0회 → **절대 "예"가 될 수 없는 질문이 사람 앞에 온다** |
+| 2 | A559 는 둘 다 명부 등록 프로젝트 | `mcp-agents-memory`(kind=project, 기억 7,406) ↔ `marketadmin`(kind=project, 2,163). 저장 방향은 큰 쪽 → 작은 쪽 |
+| 3 | 역사적으로 명부-명부 쌍은 2건, **둘 다 오답** | #522 `buzz → mcp-agents-memory`(09-27, 명부 가동 10-04 전) · #559. 명부 이후 생성분은 1건이고 이 가드로 1/1 막힌다 |
+| 4 | **`explicit_user_statement`(가중치 100) 근거 14건 중 12건이 버즈 `<context>` 봉투** | `marketadmin` 은 12/12 전부 봉투 안(185번째 글자 = `Project slug:` 줄, 봉투는 1,329~1,424 에서 닫힘). 걸린 패턴 `%동일%` 9 · `%이제%로%` 3 · `%합쳐%` 1 — 실제 문장은 "HEAD 와 바이트 동일"·"7/7 동일"·"한 숫자로 합쳐져 있어" |
+| 5 | 판정 모델이 읽은 본문도 봉투였다 | `formatMemoryForPrompt` 가 message 앞 700자를 넘기는데 버즈 행은 그 구간이 전부 봉투 머리글이다. 모델 근거 원문: *"The user explicitly mentions 'marketadmin' as a project slug"* |
+| 6 | **그 메모의 자기 `p_tag` 를 "언급 1개"로 셌다 → 순환** | A559 근거 2건(100462·101730)은 본문에 `mcp-agents-memory` 글자가 **없고** p_tag=1 때문에만 쌍이 됐다. §24 실측 4(MarketDev 글의 30%가 mcp-agents-memory 로 분류됨)가 그대로 alias 근거로 되돌아온다 |
+| 7 | `%이제%로%` 는 구가 아니다 | "이제" 뒤 **어디든** "로". 증거행 1,146 중 561건이 이것 때문 |
+| 8 | A560 은 양쪽 기억 1건 + 내용 무관 | `restart`(뮤즈 PC 프로세스 사망 09-27) ↔ `merr-auto-restarter`(제작 09-24). 근거는 `name_similarity 0.78`(= `restart` 가 `merr-auto-restarter` 안에 든 조각 — 349 vs 339, 딱 `merr-auto-` 10자) + 태그 이름이 나열된 메모 1건 |
+
+### 조건별 전수 대조 (explicit 신호가 붙은 제안 46건 = confirmed 17 · rejected 29, 증거행 1,146)
+
+"이 조건을 걸면 **맞았던 제안의 근거는 살아남고 틀린 제안의 근거는 죽나**" — 역사 전수로 쟀다.
+
+| 조건 | confirmed 유지 /17 | rejected 유지 /29 | 증거행 유지 /1,146 |
+|---|---|---|---|
+| A 현행 | 16 | 28 | 881 |
+| B +봉투 벗김(`buzzEmbeddingText`) | 16 | 28 | 859 |
+| C +자기 `p_tag` 제외 | **16** | **24** | 783 |
+| D +`%이제%로%` 제거 ← 출시 | 12 | 20 | 253 |
+
+- **B·C 는 맞은 걸 하나도 안 잃는다.** D 는 confirmed 4건(`npm-publish→npm` · `thread→slack-thread` ·
+  `config→configuration` · `ios-build→ios`)의 explicit 근거를 지우는데, 네 쌍 다 `nameSimilarity` **0.780**
+  ≥ 문턱(0.45 저빈도 / 0.55 일반)이라 후보로는 그대로 잡힌다(실측). 거리를 묶어도(≤20/40/80자)
+  그 4건은 안 돌아와서 묶는 이득이 없다 → 제거.
+- `%동일%` 은 그냥 둔다: 빼도 제안 단위 득실 0(0 confirmed / 0 rejected)이라 건드릴 이유가 없다.
+
+### ⚠️ 재보고 **버린** 안 — 다시 제안하지 말 것
+
+| 버린 조건 | confirmed 유지 /17 | 왜 |
+|---|---|---|
+| 이름 경계 검사(한 이름이 다른 이름의 조각으로 잡히는 것 차단) | **5** | 2026-10-02 승인한 "하위행위 → 상위" 병합 11건이 **전부 이름이 서로 포함되는 쌍**이다(`debug`⊂`debugging`·`ios`⊂`ios-build`). A560 의 조각 문제는 맞지만 처방이 그 집합을 통째로 죽인다 |
+| 구와 두 이름을 160자 창 안에 요구 | **1** | 같은 이유 + A559 는 이 조건에서도 살아남는다 |
+| 구와 두 이름을 같은 줄에 요구 | **0** | 위와 같고 더 심하다 |
+
+**두 필터의 사상자가 정반대라 교차표를 먼저 깐 게 결론을 바꿨다.** A560 모양(한쪽 이름이 다른 쪽에 포함,
+양쪽 기억 1건)의 진짜 처방은 증거 게이트가 아니라 **"둘 다 프로젝트가 아니다"** — §24 L4 명부 정리 쪽이다.
+
+### 구현
+
+- `src/cold_path/alias_candidate_gates.ts` (새 순수 모듈, 검사 `npm run check:alias-evidence`)
+  - `EXPLICIT_PHRASES` / `EXPLICIT_LIKE_PATTERNS` — 구 목록 한 곳. SQL 선별기와 TS 재검사가 같은 목록을 쓴다
+  - `isRegistryTag` / `bothInRegistry` — 적용 가드와 같은 조건(`kind IS NOT NULL`)
+  - `aliasEvidenceText` — 판정 경로 전용 봉투 벗김. **저장 본문은 그대로다**(봉투의 프로젝트 슬러그는
+    태깅엔 도움이 돼서 일부러 남아 있다 — 벗기는 건 alias 판정 경로뿐)
+  - `explicitEvidence(message, tags)` — p_tag 를 **넘길 자리가 없다**(순환 차단을 타입으로 고정)
+- `project_alias_promoter.ts`
+  - 명부 가드 **두 자리**: ① 생성 때 `bothInRegistry` → 후보로 안 만든다(후보 12칸·판정 LLM 호출도 아낀다)
+    ② 판정이 방향을 정한 **뒤** 최종 source 가 명부면 올리지 않는다.
+    🔴 생성 때 "source 가 명부면 버린다"로 하면 **과잉 차단**이다 — 그 자리 source 는 건수로 임시 정한
+    방향이라, `잡동사니태그 → 명부프로젝트`(합쳐야 맞는 방향)까지 날아간다. 그래서 자리를 둘로 나눴다
+  - 보고에 `blockedRegistryPair` / `blockedRegistrySource` 추가
+  - 대표 메모(`listRepresentativeMemories`)도 봉투를 벗겨 판정 모델에 넘긴다 (실측 5의 자리)
+  - `PROJECT_ALIAS_EXPLICIT_SCAN_LIMIT` 기본 200 → **500**. ILIKE 가 느슨한 선별기가 된 만큼 TS 에서
+    떨어질 행이 창을 차지해 옛 진짜 발언을 밀어내면 안 된다(새 패턴 매칭 전체 466건인데 최근 200건 창의
+    170건이 봉투였다). `%…%` 는 어차피 전수 평가라 WHERE 비용은 창 크기와 무관하다
+  - `pt.kind` 는 마이그레이션 031 전 DB 에서 `isUndefinedColumn` 으로 kind 없이 다시 읽는다(예전 동작 그대로)
+- 선별기 매칭 행: **784 → 466** (운영 DB 전수)
+
+### 검사 — 양성·음성 대조를 같이 둔다
+
+`scripts/check_alias_evidence.ts` 는 봉투 예시를 `cleanBuzzEnvelope` 로 **실제로 만들어** 쓴다(손으로 쓴
+모양이 저장 모양과 어긋나면 "안 걸렸다"가 통과로 보인다). 짝으로 심은 두 행:
+- 봉투 안 채널 메타로만 두 이름이 나오면 → 증거 아님
+- **같은 봉투 턴인데 사람이 본문에서 말했으면 → 증거로 남는다** (누락 축)
+
+음성 대조도 돌려 확인했다: 봉투 벗김을 되돌리면 "봉투가 벗겨져야 한다"가, `이제` 를 구 목록에 되살리면
+"이제…로 류는 구가 아니다"가 각각 FAIL 한다.
+
+---
+
 ## 반복 검출 패턴 (memory cross-ref)
 
 - `feedback_root_cause_not_eyeball_fix.md` — narrow-first reflex
