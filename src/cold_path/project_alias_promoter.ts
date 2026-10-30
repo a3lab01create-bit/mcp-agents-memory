@@ -19,6 +19,16 @@ import {
   userRejectedDirection,
   type PairHistoryRow,
 } from "./alias_reject_gate.js";
+import {
+  aliasEvidenceText,
+  bothInRegistry,
+  compactText,
+  explicitEvidence,
+  isRegistryTag,
+  normalizeText,
+  EXPLICIT_LIKE_PATTERNS,
+} from "./alias_candidate_gates.js";
+import { isUndefinedColumn } from "./project_registry.js";
 
 type AliasRelation =
   | "rename"
@@ -41,6 +51,8 @@ interface TagInfo {
   id: number;
   name: string;
   description: string | null;
+  /** 명부(project_registry) 종류: 'project' | 'category' | null=명부 밖. 명부 가드가 읽는다. */
+  kind: string | null;
   createdAt: Date;
   updatedAt: Date;
   memoryCount: number;
@@ -90,6 +102,10 @@ export interface ProjectAliasPromoterSummary {
   blockedAfterJudge: number;
   /** 대기 중이던 반려 반복 제안을 닫은 수 (배포 전 옛 코드가 올린 것 등) */
   swept: number;
+  /** 둘 다 명부 등록이라 후보로 만들지 않은 쌍 수 (명부 가드 — 생성 자리) */
+  blockedRegistryPair: number;
+  /** 판정이 정한 최종 source 가 명부 등록이라 올리지 않은 수 (명부 가드 — 적용 조건과 같은 자리) */
+  blockedRegistrySource: number;
 }
 
 export interface ApplyAliasResult {
@@ -115,25 +131,6 @@ const ALL_RELATIONS = new Set<AliasRelation>([
   "misfile_suspected",
   "insufficient",
 ]);
-
-const EXPLICIT_PATTERNS = [
-  "%이름 바꿈%",
-  "%이름바꿈%",
-  "%이름을 바꿈%",
-  "%개명%",
-  "%이제%로%",
-  "%같은 프로젝트%",
-  "%동일%",
-  "%합쳐%",
-  "%합치%",
-  "%별칭%",
-  "%동의어%",
-  "%rename%",
-  "%renamed%",
-  "%now called%",
-  "%same as%",
-  "%alias%",
-];
 
 let projectAliasPromoterRunning = false;
 
@@ -231,22 +228,6 @@ function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }
 
-function normalizeText(text: string): string {
-  return text
-    .toLowerCase()
-    .normalize("NFKC")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim()
-    .replace(/\s+/g, " ");
-}
-
-function compactText(text: string): string {
-  return text
-    .toLowerCase()
-    .normalize("NFKC")
-    .replace(/[^\p{L}\p{N}]+/gu, "");
-}
-
 function tokenSet(name: string): Set<string> {
   return new Set(normalizeText(name).split(" ").filter((t) => t.length > 0));
 }
@@ -339,6 +320,7 @@ function chooseDirection(a: TagInfo, b: TagInfo): { sourceId: number; targetId: 
 function getOrAddPair(
   pairs: Map<string, CandidatePair>,
   tagsById: Map<number, TagInfo>,
+  registrySkipped: Set<string>,
   aId: number,
   bId: number
 ): CandidatePair | null {
@@ -346,6 +328,13 @@ function getOrAddPair(
   const a = tagsById.get(aId);
   const b = tagsById.get(bId);
   if (!a || !b) return null;
+
+  // 명부 가드(생성 자리): 둘 다 명부면 어느 방향으로도 적용할 수 없다 → 후보로 만들지 않는다.
+  // 후보 12칸과 판정 LLM 호출을 아끼고, 무엇보다 사람에게 "예"가 불가능한 질문을 안 보낸다.
+  if (bothInRegistry(a, b)) {
+    registrySkipped.add(pairKey(aId, bId));
+    return null;
+  }
 
   const key = pairKey(aId, bId);
   const existing = pairs.get(key);
@@ -389,48 +378,51 @@ function addLowFrequencySignal(pair: CandidatePair, tagId: number): void {
   pair.signals.low_frequency_anchor_ids = uniqueSortedNumbers([...current, tagId]);
 }
 
-function messageMentionsTag(message: string, tag: TagInfo): boolean {
-  const lowerMessage = message.toLowerCase();
-  const lowerName = tag.name.toLowerCase();
-  if (lowerName.length >= 3 && lowerMessage.includes(lowerName)) return true;
-
-  const normalizedName = normalizeText(tag.name);
-  const normalizedMessage = normalizeText(message);
-  if (normalizedName.length >= 3 && normalizedMessage.includes(normalizedName)) return true;
-
-  const compactName = compactText(tag.name);
-  const compactMessage = compactText(message);
-  return compactName.length >= 3 && compactMessage.includes(compactName);
+/**
+ * 정본 태그 목록. `pt.kind`(명부, 마이그레이션 031)를 같이 읽는다 —
+ * 칼럼이 없는 DB(031 전)에서는 kind 없이 다시 읽어 예전 동작 그대로 돈다(명부 가드는 무동작).
+ * 다른 오류는 그대로 던진다 (project_registry.ts isUndefinedColumn 과 같은 원칙).
+ */
+async function queryCanonicalTags(userId: number, maxTags: number, withKind = true) {
+  const kindColumn = withKind ? "pt.kind," : "";
+  try {
+    return await db.query(
+      `SELECT pt.id,
+              pt.name,
+              pt.description,
+              ${kindColumn}
+              pt.created_at,
+              pt.updated_at,
+              COUNT(m.id)::int AS memory_count,
+              MIN(m.created_at) AS first_seen,
+              MAX(m.created_at) AS last_seen
+         FROM project_tags pt
+         LEFT JOIN memory m
+           ON m.user_id = $1
+          AND m.is_active = TRUE
+          AND m.p_tag_id IS NOT NULL
+          AND canonical_project_tag_id(m.p_tag_id) = pt.id
+        WHERE pt.alias_of IS NULL
+        GROUP BY pt.id
+        ORDER BY MAX(m.created_at) DESC NULLS LAST, pt.created_at DESC
+        LIMIT $2`,
+      [userId, maxTags]
+    );
+  } catch (err) {
+    if (withKind && isUndefinedColumn(err)) return queryCanonicalTags(userId, maxTags, false);
+    throw err;
+  }
 }
 
 async function listCanonicalTags(userId: number): Promise<TagInfo[]> {
   const maxTags = envInt("PROJECT_ALIAS_MAX_TAGS", 120);
-  const result = await db.query(
-    `SELECT pt.id,
-            pt.name,
-            pt.description,
-            pt.created_at,
-            pt.updated_at,
-            COUNT(m.id)::int AS memory_count,
-            MIN(m.created_at) AS first_seen,
-            MAX(m.created_at) AS last_seen
-       FROM project_tags pt
-       LEFT JOIN memory m
-         ON m.user_id = $1
-        AND m.is_active = TRUE
-        AND m.p_tag_id IS NOT NULL
-        AND canonical_project_tag_id(m.p_tag_id) = pt.id
-      WHERE pt.alias_of IS NULL
-      GROUP BY pt.id
-      ORDER BY MAX(m.created_at) DESC NULLS LAST, pt.created_at DESC
-      LIMIT $2`,
-    [userId, maxTags]
-  );
+  const result = await queryCanonicalTags(userId, maxTags);
 
   const tags: TagInfo[] = result.rows.map((row: any) => ({
     id: Number(row.id),
     name: String(row.name),
     description: row.description === null ? null : String(row.description),
+    kind: row.kind == null ? null : String(row.kind),
     createdAt: toDate(row.created_at),
     updatedAt: toDate(row.updated_at),
     memoryCount: Number(row.memory_count ?? 0),
@@ -510,7 +502,9 @@ async function listRepresentativeMemories(
     list.push({
       id: Number(row.id),
       role: row.role === "assistant" ? "assistant" : "user",
-      message: String(row.message),
+      // 판정 모델이 읽는 본문 — 봉투를 벗긴다. 벗기지 않으면 버즈 행의 앞 700자가
+      // 전부 봉투 머리글이라, 모델이 "이 태그는 무슨 프로젝트인가"를 채널 메타로 배운다.
+      message: aliasEvidenceText(String(row.message)),
       dTags: toStringArray(row.d_tag),
       createdAt: toDate(row.created_at),
     });
@@ -524,17 +518,24 @@ async function addExplicitStatementCandidates(
   userId: number,
   tags: TagInfo[],
   tagsById: Map<number, TagInfo>,
-  pairs: Map<string, CandidatePair>
+  pairs: Map<string, CandidatePair>,
+  registrySkipped: Set<string>
 ): Promise<void> {
-  const scanLimit = envInt("PROJECT_ALIAS_EXPLICIT_SCAN_LIMIT", 200);
-  const clauses = EXPLICIT_PATTERNS.map((_, i) => `message ILIKE $${i + 2}`).join(" OR ");
-  const limitParam = EXPLICIT_PATTERNS.length + 2;
+  // 창을 200 → 500 으로 넓힌다. ILIKE 는 느슨한 선별기이고 정밀 판정이 TS 로 내려갔으니,
+  // TS 에서 떨어질 행(봉투 등)이 창을 차지해 **옛 진짜 발언을 밀어내면** 안 된다.
+  // 실측(2026-10-12, 운영 DB user_id=1): 새 패턴으로 매칭되는 전체 행 466건인데
+  // 최근 200건 창의 170건이 봉투 행이었다. WHERE 비용은 창 크기와 무관하다
+  // (ILIKE %…% 는 어차피 전수 평가) — 넘어오는 행 수만 늘어난다.
+  const scanLimit = envInt("PROJECT_ALIAS_EXPLICIT_SCAN_LIMIT", 500);
+  const clauses = EXPLICIT_LIKE_PATTERNS.map((_, i) => `message ILIKE $${i + 2}`).join(" OR ");
+  const limitParam = EXPLICIT_LIKE_PATTERNS.length + 2;
+  // 이 ILIKE 는 느슨한 선별기다 (저장 본문에는 버즈 봉투가 들어 있다).
+  // 정밀 판정은 아래 explicitEvidence 가 봉투를 벗긴 본문으로 다시 한다.
   const result = await db.query(
     `SELECT id,
             message,
             d_tag,
-            created_at,
-            canonical_project_tag_id(p_tag_id) AS memory_tag_id
+            created_at
        FROM memory
       WHERE user_id = $1
         AND role = 'user'
@@ -542,34 +543,27 @@ async function addExplicitStatementCandidates(
         AND (${clauses})
       ORDER BY created_at DESC
       LIMIT $${limitParam}`,
-    [userId, ...EXPLICIT_PATTERNS, scanLimit]
+    [userId, ...EXPLICIT_LIKE_PATTERNS, scanLimit]
   );
 
   for (const row of result.rows) {
+    // 봉투를 벗긴 본문으로만 판정하고, 그 본문을 증거로 남긴다 (판정 모델도 이걸 읽는다).
+    // 그 메모에 붙은 p_tag 는 "언급"으로 세지 않는다 — 태거의 분류를 그 분류를 바꾸는 근거로
+    // 쓰는 순환이 된다. 근거는 사람이 쓴 글에서만 나와야 한다.
+    const evidence = explicitEvidence(String(row.message), tags);
+    const ids = evidence.tagIds;
+    if (ids.length < 2) continue;
+
     const memory: MemoryEvidence = {
       id: Number(row.id),
       role: "user",
-      message: String(row.message),
+      message: evidence.text,
       dTags: toStringArray(row.d_tag),
       createdAt: toDate(row.created_at),
     };
-
-    const mentioned = new Set<number>();
-    for (const tag of tags) {
-      if (messageMentionsTag(memory.message, tag)) {
-        mentioned.add(tag.id);
-      }
-    }
-    const memoryTagId = row.memory_tag_id === null ? null : Number(row.memory_tag_id);
-    if (memoryTagId && tagsById.has(memoryTagId)) {
-      mentioned.add(memoryTagId);
-    }
-
-    const ids = Array.from(mentioned);
-    if (ids.length < 2) continue;
     for (let i = 0; i < ids.length; i++) {
       for (let j = i + 1; j < ids.length; j++) {
-        const pair = getOrAddPair(pairs, tagsById, ids[i], ids[j]);
+        const pair = getOrAddPair(pairs, tagsById, registrySkipped, ids[i], ids[j]);
         if (pair) addExplicitStatement(pair, memory);
       }
     }
@@ -579,7 +573,8 @@ async function addExplicitStatementCandidates(
 function addNameAndDtagCandidates(
   tags: TagInfo[],
   tagsById: Map<number, TagInfo>,
-  pairs: Map<string, CandidatePair>
+  pairs: Map<string, CandidatePair>,
+  registrySkipped: Set<string>
 ): void {
   for (let i = 0; i < tags.length; i++) {
     for (let j = i + 1; j < tags.length; j++) {
@@ -593,7 +588,7 @@ function addNameAndDtagCandidates(
       const dtagThreshold = lowAnchor ? 0.18 : 0.25;
 
       if (nScore >= nameThreshold) {
-        const pair = getOrAddPair(pairs, tagsById, a.id, b.id);
+        const pair = getOrAddPair(pairs, tagsById, registrySkipped, a.id, b.id);
         if (pair) {
           addSource(pair, "name_similarity");
           pair.signals.name_similarity = Math.max(
@@ -606,7 +601,7 @@ function addNameAndDtagCandidates(
       }
 
       if (dScore >= dtagThreshold) {
-        const pair = getOrAddPair(pairs, tagsById, a.id, b.id);
+        const pair = getOrAddPair(pairs, tagsById, registrySkipped, a.id, b.id);
         if (pair) {
           addSource(pair, "d_tag_overlap");
           pair.signals.d_tag_jaccard = Math.max(
@@ -626,7 +621,8 @@ async function addVectorCandidates(
   userId: number,
   tags: TagInfo[],
   tagsById: Map<number, TagInfo>,
-  pairs: Map<string, CandidatePair>
+  pairs: Map<string, CandidatePair>,
+  registrySkipped: Set<string>
 ): Promise<void> {
   const anchorLimit = envInt("PROJECT_ALIAS_VECTOR_ANCHOR_LIMIT", 12);
   const representativeLimit = envInt("PROJECT_ALIAS_VECTOR_REPRESENTATIVE_LIMIT", 5);
@@ -691,7 +687,7 @@ async function addVectorCandidates(
     for (const row of result.rows) {
       const targetId = Number(row.target_tag_id);
       if (!tagsById.has(targetId)) continue;
-      const pair = getOrAddPair(pairs, tagsById, anchor.id, targetId);
+      const pair = getOrAddPair(pairs, tagsById, registrySkipped, anchor.id, targetId);
       if (!pair) continue;
 
       addSource(pair, "vector_neighbor");
@@ -718,14 +714,15 @@ async function buildCandidatePairs(
   userId: number,
   tags: TagInfo[],
   limit: number,
-  exclude: (pair: CandidatePair) => boolean = () => false
+  exclude: (pair: CandidatePair) => boolean = () => false,
+  registrySkipped: Set<string> = new Set()
 ): Promise<CandidatePair[]> {
   const tagsById = new Map(tags.map((tag) => [tag.id, tag]));
   const pairs = new Map<string, CandidatePair>();
 
-  await addExplicitStatementCandidates(userId, tags, tagsById, pairs);
-  addNameAndDtagCandidates(tags, tagsById, pairs);
-  await addVectorCandidates(userId, tags, tagsById, pairs);
+  await addExplicitStatementCandidates(userId, tags, tagsById, pairs, registrySkipped);
+  addNameAndDtagCandidates(tags, tagsById, pairs, registrySkipped);
+  await addVectorCandidates(userId, tags, tagsById, pairs, registrySkipped);
 
   for (const pair of pairs.values()) {
     const source = tagsById.get(pair.sourceId);
@@ -1159,6 +1156,8 @@ export async function runProjectAliasPromoter(
     blockedBeforeJudge: 0,
     blockedAfterJudge: 0,
     swept: 0,
+    blockedRegistryPair: 0,
+    blockedRegistrySource: 0,
   };
 
   const history = await loadPairHistory(userId);
@@ -1170,11 +1169,19 @@ export async function runProjectAliasPromoter(
   if (tags.length < 2) return summary;
 
   const tagsById = new Map(tags.map((tag) => [tag.id, tag]));
-  const pairs = await buildCandidatePairs(userId, tags, candidateLimit, (pair) => {
-    const skip = skipBeforeJudge(history.get(pairKey(pair.sourceId, pair.targetId)));
-    if (skip) summary.blockedBeforeJudge++;
-    return skip;
-  });
+  const registrySkipped = new Set<string>();
+  const pairs = await buildCandidatePairs(
+    userId,
+    tags,
+    candidateLimit,
+    (pair) => {
+      const skip = skipBeforeJudge(history.get(pairKey(pair.sourceId, pair.targetId)));
+      if (skip) summary.blockedBeforeJudge++;
+      return skip;
+    },
+    registrySkipped
+  );
+  summary.blockedRegistryPair = registrySkipped.size;
   summary.candidates = pairs.length;
   if (pairs.length === 0) return summary;
 
@@ -1202,6 +1209,15 @@ export async function runProjectAliasPromoter(
 
       if (sourceId === targetId) {
         summary.skipped++;
+        continue;
+      }
+
+      // 명부 가드(방향이 확정된 자리): 최종 source 가 명부면 적용 경로가 거부한다
+      // (registrySourceError — 별칭이 되면 명부에서 조용히 빠지니까). 올려도 누를 수 없는
+      // 질문이므로 올리지 않는다. 생성 자리의 가드는 "둘 다 명부"만 걸러서, 한쪽만 명부인
+      // 쌍은 여기까지 와서 방향으로 갈린다.
+      if (isRegistryTag(tagsById.get(sourceId))) {
+        summary.blockedRegistrySource++;
         continue;
       }
 
@@ -1287,9 +1303,17 @@ export async function maybeRunProjectAliasPromoter(): Promise<void> {
     );
 
     const summary = await runProjectAliasPromoter({ userId });
-    if (summary.candidates > 0 || summary.inserted > 0 || summary.errors > 0 || summary.swept > 0 || summary.blockedBeforeJudge > 0) {
+    if (
+      summary.candidates > 0 ||
+      summary.inserted > 0 ||
+      summary.errors > 0 ||
+      summary.swept > 0 ||
+      summary.blockedBeforeJudge > 0 ||
+      summary.blockedRegistryPair > 0 ||
+      summary.blockedRegistrySource > 0
+    ) {
       console.error(
-        `🔁 [ProjectAliasPromoter] done — candidates=${summary.candidates}, judged=${summary.judged}, inserted=${summary.inserted}, autoApplied=${summary.autoApplied}, skipped=${summary.skipped}, errors=${summary.errors}, blockedBeforeJudge=${summary.blockedBeforeJudge}, blockedAfterJudge=${summary.blockedAfterJudge}, swept=${summary.swept}`
+        `🔁 [ProjectAliasPromoter] done — candidates=${summary.candidates}, judged=${summary.judged}, inserted=${summary.inserted}, autoApplied=${summary.autoApplied}, skipped=${summary.skipped}, errors=${summary.errors}, blockedBeforeJudge=${summary.blockedBeforeJudge}, blockedAfterJudge=${summary.blockedAfterJudge}, blockedRegistryPair=${summary.blockedRegistryPair}, blockedRegistrySource=${summary.blockedRegistrySource}, swept=${summary.swept}`
       );
     }
   } catch (err) {
