@@ -105,6 +105,24 @@ export interface HotPathInsertResult {
  * 시간 순서 raw INSERT. 빈 칸 (p_tag_id, d_tag, embedding) NULL로 들어감.
  * Cold Path가 다음 사이클에 처리.
  */
+/**
+ * raw_message 칸에 넣을 원문을 고른다.
+ *
+ * 🔴 2026-10-31: 예전 식은 `cleaned !== null ? message : params.raw_message` 였다.
+ *    봉투 정리가 성공하면 **호출자가 넘긴 원문을 조용히 버리고** 정리 입력(message)을 원문으로
+ *    적었다. codex 캡처처럼 "message 는 주입문을 뺀 본문, raw 는 조각 원문"을 따로 넘기는
+ *    호출자에게는 그게 원문 유실이다 (Codi 반례: plugins 조각이 raw 에서 사라진다).
+ *    ⇒ **호출자가 명시한 원문이 있으면 그게 원문이다.** 없을 때만 정리 입력을 원문으로 쓴다.
+ */
+export function chooseRawMessage(
+  cleaned: string | null,
+  message: string,
+  paramRaw: string | null
+): string | null {
+  if (paramRaw !== null) return paramRaw;
+  return cleaned !== null ? message : null;
+}
+
 export async function insertRawMemory(
   params: HotPathInsertParams
 ): Promise<HotPathInsertResult> {
@@ -142,7 +160,7 @@ export async function insertRawMemory(
   // venue: 캡처가 알려준 값 우선. 없으면 받은 말(user)이 버즈 턴일 때만 방 정보에서 읽는다.
   const venue = params.venue ?? (role === "user" ? buzzTurnVenue(cleaned ?? message) : null);
 
-  const raw = cleaned !== null ? message : (params.raw_message ?? null);
+  const raw = chooseRawMessage(cleaned, message, params.raw_message ?? null);
   const optional: Array<[OptionalColumn, string]> = [];
   if (raw !== null) optional.push(["raw_message", raw]);
   if (venue) optional.push(["venue", venue]);

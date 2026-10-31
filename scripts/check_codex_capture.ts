@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { parseEntry, type CaptureParseState } from "../src/auto_save/codex_capture.js";
+import { chooseRawMessage } from "../src/hot_path.js";
 
 const response = (role: string, text: string, extra = {}) => JSON.stringify({
   type: "response_item", payload: { type: "message", role, content: [{ type: "input_text", text }], ...extra },
@@ -116,6 +117,17 @@ for (const order of [["response", "item"], ["item", "response"]] as const) {
     assert.ok(r?.venueSource?.includes("Channel: x (#"), `venue 원문은 조각 전체 (${kind})`);
   }
 }
+
+// ④ hot_path: 호출자가 넘긴 원문은 봉투 정리가 성공해도 살아남는다.
+//    (예전 식은 cleaned !== null 이면 message 를 원문으로 적어 넘긴 raw 를 버렸다)
+assert.equal(chooseRawMessage("정리본", "정리입력", "조각원문"), "조각원문",
+  "④ 명시한 원문이 있으면 그것이 원문이다");
+assert.equal(chooseRawMessage(null, "정리입력", "조각원문"), "조각원문",
+  "④ 정리 안 됐을 때도 명시한 원문을 쓴다");
+assert.equal(chooseRawMessage("정리본", "정리입력", null), "정리입력",
+  "④ 명시한 원문이 없으면 정리 입력이 원문이다");
+assert.equal(chooseRawMessage(null, "정리입력", null), null,
+  "④ 정리도 원문도 없으면 raw 는 비운다");
 
 // Optional local rollout check: counts only, never print or store conversation bodies.
 if (process.argv[2]) {
