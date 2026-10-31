@@ -192,9 +192,31 @@ function isInjectedUserText(text: string): boolean {
     /^# AGENTS\.md instructions for /i.test(t);
 }
 
-/** 같은 메시지가 다른 스키마로도 기록됐으면 한 번만 반환한다 (같은 스키마의 반복 턴은 억제하지 않는다). */
-function isMirroredEntry(state: CaptureParseState, source: string, role: string, message: string): boolean {
-  const key = createHash("sha256").update(role + "\0" + message).digest("hex");
+/**
+ * 같은 메시지가 다른 스키마로도 기록됐으면 한 번만 반환한다
+ * (같은 스키마의 반복 턴은 억제하지 않는다).
+ *
+ * 🔴 2026-10-31: 키에 **제외된 조각 목록까지** 넣는다. 본문 해시만 보면
+ *    `response=[plugins, hello]` 와 `item=[hello]` 가 같은 턴으로 판정돼
+ *    **먼저 온 쪽의 raw 만 남는다** → 저장되는 원문이 도착 순서에 따라 달라졌다.
+ *    제외된 조각이 다르면 "같은 턴"이라는 증거가 아니므로 **둘 다 남긴다.**
+ *    ⇒ 어느 쪽이 먼저 와도 저장 집합이 같다(순서 무관). 버퍼링도 커서 조작도 필요 없다.
+ *    ⚠️ raw 전체를 키로 쓰면 안 된다 — `join("\n")` 의 **공백 한 글자 차이**로 같은 턴이 갈린다
+ *       (동결 코퍼스에서 raw 길이가 1바이트만 다른 묶음 5건이 전부 같은 턴이었다).
+ *       그래서 trim 한 **제외 목록**으로 비교한다.
+ *    ⚠️ 이것은 손실 방지책이다. "중복제거 완료"로 보고하지 않는다 —
+ *       조각 집합이 다른 두 기록은 근거가 없어 **합치지 않고 둘 다 보존**하는 것이다.
+ */
+function isMirroredEntry(
+  state: CaptureParseState,
+  source: string,
+  role: string,
+  message: string,
+  dropped: string[],
+): boolean {
+  const key = createHash("sha256")
+    .update(role + "\0" + message + "\0" + dropped.join("\u0001"))
+    .digest("hex");
   const mirror = state.mirrors.find((item) => item.key === key && !item.sources.includes(source));
   if (mirror) {
     mirror.sources.push(source);
@@ -220,14 +242,22 @@ function isMirroredEntry(state: CaptureParseState, source: string, role: string,
  *    `<invoice>`·`<새것>` 같은 글은 구조적으로 건드려지지 않는다.
  * ⚠️ raw 는 주입문 필터와 trim **이전**의 조각이어야 "원문 보존"이 성립한다.
  */
-function fragmentsOf(content: any, role: "user" | "assistant"): { message: string; raw: string } {
-  if (typeof content === "string") return { message: content.trim(), raw: content };
-  if (!Array.isArray(content) || content.length === 0) return { message: "", raw: "" };
+function fragmentsOf(
+  content: any,
+  role: "user" | "assistant",
+): { message: string; raw: string; dropped: string[] } {
+  if (typeof content === "string") return { message: content.trim(), raw: content, dropped: [] };
+  if (!Array.isArray(content) || content.length === 0) return { message: "", raw: "", dropped: [] };
   const all = content.map((c: any) => (c && typeof c.text === "string" ? c.text : ""));
-  const kept = all
-    .map((t: string) => t.trim())
-    .filter((t: string) => t && (role !== "user" || !isInjectedUserText(t)));
-  return { message: kept.join("\n"), raw: all.join("\n") };
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  for (const t of all) {
+    const trimmed = t.trim();
+    if (!trimmed) continue;
+    if (role === "user" && isInjectedUserText(trimmed)) dropped.push(trimmed);
+    else kept.push(trimmed);
+  }
+  return { message: kept.join("\n"), raw: all.join("\n"), dropped };
 }
 
 /**
@@ -262,6 +292,7 @@ export function parseEntry(
   let role: "user" | "assistant";
   let message: string;
   let rawMessage: string | undefined;
+  let droppedFragments: string[] = [];
   let venueSource: string | undefined;
   const source =
     entry.type === "response_item" ? "response" : ptype === "item_completed" ? "item" : "legacy";
@@ -277,6 +308,7 @@ export function parseEntry(
     const f = fragmentsOf(payload.content, role);
     message = f.message;
     rawMessage = f.raw;
+    droppedFragments = f.dropped;
     if (role === "user") venueSource = f.raw;
   } else if (ptype === "user_message" || ptype === "agent_message") {
     role = ptype === "user_message" ? "user" : "assistant";
@@ -290,6 +322,7 @@ export function parseEntry(
     const f = fragmentsOf(item?.content, role);
     message = f.message;
     rawMessage = f.raw;
+    droppedFragments = f.dropped;
     if (role === "user") venueSource = f.raw;
   } else {
     return null;
@@ -303,7 +336,7 @@ export function parseEntry(
     return null;
   }
 
-  if (state && isMirroredEntry(state, source, role, message)) return null;
+  if (state && isMirroredEntry(state, source, role, message, droppedFragments)) return null;
 
   const out: ParsedEntry = { byteOffset, role, message };
   if (venueSource !== undefined) out.venueSource = venueSource;

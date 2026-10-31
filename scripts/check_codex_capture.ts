@@ -129,6 +129,40 @@ assert.equal(chooseRawMessage("정리본", "정리입력", null), "정리입력"
 assert.equal(chooseRawMessage(null, "정리입력", null), null,
   "④ 정리도 원문도 없으면 raw 는 비운다");
 
+// ⑤-2 조각 집합이 **다른** 두 미러 — 저장 집합이 **도착 순서**에 무관해야 한다.
+//     ⚠️ 스키마 배정이 아니라 *도착 순서*를 뒤집어야 이 결함이 보인다.
+//        (rich 를 항상 먼저 보내면 옛 키로도 집합이 같아 보여 검사가 통과한다)
+{
+  const rich = ["<recommended_plugins>p</recommended_plugins>", "hello"];
+  const lean = ["hello"];
+  const norm = (e: ReturnType<typeof parseEntry>) =>
+    e ? `${e.role}\u0000${e.message}\u0000${e.rawMessage ?? e.message}` : null;
+  // 같은 본문을 두 스키마가 서로 다른 조각 집합으로 싣고, 도착 순서만 뒤집는다.
+  const run = (firstTexts: string[], secondTexts: string[]) => {
+    const state: CaptureParseState = { mirrors: [] };
+    const a = parseEntry(multi("user", firstTexts, "response"), 0, state);
+    const b = parseEntry(multi("user", secondTexts, "item"), 100, state);
+    return [norm(a), norm(b)].filter((x): x is string => x !== null).sort();
+  };
+  const richFirst = run(rich, lean);
+  const leanFirst = run(lean, rich);
+  assert.deepEqual(richFirst, leanFirst, "⑤-2 저장 집합이 도착 순서에 무관해야 한다");
+  assert.equal(richFirst.length, 2, "⑤-2 조각 집합이 다르면 둘 다 보존한다 (합칠 근거가 없다)");
+  assert.ok(richFirst.some((x) => x.endsWith("hello")), "⑤-2 lean 쪽 원문이 남는다");
+  assert.ok(richFirst.some((x) => x.includes("recommended_plugins")), "⑤-2 rich 쪽 원문이 남는다");
+}
+
+// ⑤-3 조각 집합이 **같은** 두 미러는 여전히 한 번만 남는다 (중복제거 회귀 방지).
+{
+  const same = ["<environment_context>env</environment_context>", "body"];
+  for (const order of [["response", "item"], ["item", "response"]] as const) {
+    const state: CaptureParseState = { mirrors: [] };
+    assert.ok(parseEntry(multi("user", same, order[0]), 0, state), `⑤-3 ${order.join("→")}: 첫 기록은 남는다`);
+    assert.equal(parseEntry(multi("user", same, order[1]), 100, state), null,
+      `⑤-3 ${order.join("→")}: 조각이 같으면 두 번째는 억제된다`);
+  }
+}
+
 // Optional local rollout check: counts only, never print or store conversation bodies.
 if (process.argv[2]) {
   const state: CaptureParseState = { mirrors: [] };
