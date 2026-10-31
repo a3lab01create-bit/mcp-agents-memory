@@ -163,9 +163,38 @@ export interface ParsedEntry {
 }
 
 /**
+ * item_completed.item.content[] → 캡처할 본문.
+ *
+ * UserMessage 의 content 는 codex 가 조립한 프롬프트 조각들이다:
+ *   [시스템프롬프트(17KB급), agent-instructions, core-memory, context, 실제 입력]
+ * 2026-09-21~10-31 rollout 23개 전수에서 **마지막 요소가 항상 실제 입력**이었다
+ * (요소가 1개인 경우도 그 하나가 실제 입력). 전부 담으면 매 턴 시스템 프롬프트가
+ * user 행으로 쌓이므로 마지막 요소만 쓴다.
+ * AgentMessage 는 조각이 하나뿐이지만 방어적으로 join 한다.
+ */
+function textFromItemContent(item: any, role: "user" | "assistant"): string {
+  const content = item?.content;
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content) || content.length === 0) return "";
+  const texts = content
+    .map((c: any) => (c && typeof c.text === "string" ? c.text : ""))
+    .filter((t: string) => t.length > 0);
+  if (texts.length === 0) return "";
+  if (role === "user") return texts[texts.length - 1].trim();
+  return texts.join("\n").trim();
+}
+
+/**
  * 한 jsonl line → ParsedEntry | null.
- * event_msg payload.type = user_message | agent_message만 캡처.
- * 그 외 (response_item / turn_context / session_meta / function_call / reasoning 등) skip.
+ *
+ * 구 스키마 (~2026-06): event_msg payload.type = user_message | agent_message, payload.message 평문.
+ * 신 스키마 (2026-09~): event_msg payload.type = item_completed,
+ *                      payload.item.type = UserMessage | AgentMessage, 본문은 item.content[].
+ *   → codex 가 중간에 스키마를 바꿨고 이 파서가 따라가지 못해 2026-06-14 이후 캡처가
+ *     전원(사람 터미널 포함) 0건이었다. 두 스키마를 모두 받는다.
+ * 그 외 (response_item / turn_context / session_meta / CommandExecution / McpToolCall / Reasoning) skip.
+ *   ⚠️ response_item/message 로 바꾸지 마라 — role='developer' 인 주입 지시문과
+ *      <recommended_plugins> 보일러플레이트가 같이 들어온다.
  */
 export function parseEntry(line: string, byteOffset: number): ParsedEntry | null {
   let entry: any;
@@ -181,15 +210,20 @@ export function parseEntry(line: string, byteOffset: number): ParsedEntry | null
 
   const ptype = payload.type;
   let role: "user" | "assistant";
-  if (ptype === "user_message") {
-    role = "user";
-  } else if (ptype === "agent_message") {
-    role = "assistant";
+  let message: string;
+  if (ptype === "user_message" || ptype === "agent_message") {
+    role = ptype === "user_message" ? "user" : "assistant";
+    message = typeof payload.message === "string" ? payload.message.trim() : "";
+  } else if (ptype === "item_completed") {
+    const item = payload.item;
+    const itype = item && typeof item === "object" ? item.type : null;
+    if (itype === "UserMessage") role = "user";
+    else if (itype === "AgentMessage") role = "assistant";
+    else return null;
+    message = textFromItemContent(item, role);
   } else {
     return null;
   }
-
-  const message = typeof payload.message === "string" ? payload.message.trim() : "";
   if (!message) return null;
 
   // Codex agent_message에는 tool call 로그가 섞임 — 메모리 노이즈 제거
