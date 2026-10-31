@@ -20,7 +20,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
@@ -34,12 +34,27 @@ const DEVICE_NAME = os.hostname();
 //    전달해야 이 코드가 효력을 갖는다. 코드만 고치면 동작이 안 바뀐다 (2026-10-31 실측).
 const CODEX_HOME = process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
 const SESSIONS_ROOT = path.join(CODEX_HOME, "sessions");
-const STATE_DB = path.join(CODEX_HOME, "state_5.sqlite");
+/**
+ * `state_5.sqlite` 경로. **호출 시점**에 env 를 읽는다 (SESSIONS_ROOT 는 watcher 때문에 로드 시점 고정).
+ * 이렇게 두면 검사에서 CODEX_HOME 을 case 별로 바꿔 끼울 수 있다.
+ */
+function stateDbPath(): string {
+  return path.join(process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex"), "state_5.sqlite");
+}
 const FLUSH_DEBOUNCE_MS = 200;
 const POLL_INTERVAL_MS = 3000; // OS 버퍼링 우회 — fs.watch 미발화 보완
 
-/** state_5.sqlite threads.source → agent_platform 매핑 */
-function sourceToPlatform(source: string): string {
+/**
+ * state_5.sqlite `threads.source` → agent_platform **폴백** 매핑.
+ *
+ * 🔴 `source` 는 더 이상 플랫폼 구분자가 아니다 (2026-10-31 실측, `~/.codex`):
+ *    codex 신버전은 CLI(`codex-tui`)·`buzz-acp`·`codex-acp` 를 전부 `source='vscode'` 로 쓴다.
+ *    같은 originator 가 source 두 값으로 나오기도 한다 — `codex-tui`: vscode 2 · cli 1.
+ *    `source='cli'` 은 2026-09-19 이후 0건이다.
+ * ⇒ 구분자는 `originator` 다. 이 함수는 originator 가 없거나 모르는 값일 때만 쓴다.
+ * ⚠️ 미확인 source 를 desktop 으로 만들지 않는다 — default 는 기존대로 codex-mcp-client.
+ */
+export function sourceToPlatform(source: string): string {
   switch (source) {
     case "cli":    return "codex-cli";
     case "vscode": return "codex-desktop";
@@ -49,17 +64,69 @@ function sourceToPlatform(source: string): string {
   }
 }
 
-/** sessionId로 state_5.sqlite 조회 → platform string. 실패 시 default. */
-function lookupPlatform(sessionId: string): string {
+/**
+ * `threads.originator` → agent_platform. 모르는 값이면 null (호출자가 source 로 폴백).
+ *
+ * 확인된 값은 **실행 경로**이지 사람/에이전트의 정체가 아니다 — 그래서 `codex-acp` 로 쓴다
+ * (`codex-agent` 는 exec·CLI 로 돌는 에이전트까지 포함해 범위가 모호하다).
+ */
+export function originatorToPlatform(originator: string): string | null {
+  const o = originator.trim();
+  if (!o) return null;
+  if (o === "codex-tui") return "codex-cli";
+  if (o === "codex_exec") return "codex-exec";
+  if (o === "buzz-acp" || o.includes("codex-acp")) return "codex-acp";
+  return null;
+}
+
+/**
+ * node:sqlite 를 **지연·동기** 로드한다 (Node 22.13+/23.4+ 빌트인).
+ * 최상위 static import 로 두면 미지원 Node 에서 서버 전체 기동이 깨진다 → 여기서 try 로 감싼다.
+ * `lookupPlatform` 이 동기 함수라 opencode_capture 의 async 로더를 그대로 쓸 수 없어 createRequire 를 쓴다.
+ */
+let _DatabaseSync: any | null | undefined;
+function sqliteSync(): any | null {
+  if (_DatabaseSync !== undefined) return _DatabaseSync;
   try {
-    const res = spawnSync(
-      "sqlite3",
-      [STATE_DB, `SELECT source FROM threads WHERE id='${sessionId}' LIMIT 1;`],
-      { encoding: "utf-8", timeout: 500 },
+    // @ts-ignore — @types/node(node20 타겟)엔 node:sqlite 타입이 없다
+    _DatabaseSync = createRequire(import.meta.url)("node:sqlite")?.DatabaseSync ?? null;
+  } catch {
+    _DatabaseSync = null;
+  }
+  return _DatabaseSync;
+}
+
+/** sessionId로 state_5.sqlite 조회 → platform string. 실패 시 default. */
+export function lookupPlatform(sessionId: string): string {
+  const DatabaseSync = sqliteSync();
+  if (!DatabaseSync) return "codex-mcp-client";
+  let db: any = null;
+  try {
+    db = new DatabaseSync(stateDbPath(), { readOnly: true });
+    // 구형 DB 에는 `originator` 칸이 없다 → 있을 때만 읽는다 (없으면 source 만)
+    const cols = new Set<string>(
+      db.prepare("PRAGMA table_info(threads)").all().map((c: any) => String(c.name)),
     );
-    const source = (res.stdout ?? "").trim();
+    const hasOriginator = cols.has("originator");
+    const row: any = db
+      .prepare(
+        hasOriginator
+          ? "SELECT source, originator FROM threads WHERE id = ? LIMIT 1"
+          : "SELECT source FROM threads WHERE id = ? LIMIT 1",
+      )
+      .get(sessionId);
+    if (!row) return "codex-mcp-client";
+    if (hasOriginator && typeof row.originator === "string") {
+      const byOriginator = originatorToPlatform(row.originator);
+      if (byOriginator) return byOriginator;
+    }
+    const source = typeof row.source === "string" ? row.source.trim() : "";
     if (source) return sourceToPlatform(source);
-  } catch {}
+  } catch {
+    // DB 없음·잠김·스키마 변경 → 라벨만 포기하고 **캡처는 계속한다**
+  } finally {
+    try { db?.close(); } catch {}
+  }
   return "codex-mcp-client";
 }
 
