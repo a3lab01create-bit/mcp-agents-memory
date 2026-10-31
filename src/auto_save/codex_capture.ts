@@ -71,10 +71,15 @@ export function sourceToPlatform(source: string): string {
  * (`codex-agent` 는 exec·CLI 로 돌는 에이전트까지 포함해 범위가 모호하다).
  */
 export function originatorToPlatform(originator: string): string | null {
-  const o = originator.trim();
+  // 값의 표기가 통일돼 있지 않다 — `codex-tui`·`codex_exec`·`buzz-acp` 는 소문자 기호식인데
+  // 데스크톱 앱은 **`Codex Desktop`**(공백·대문자, cli_version 0.166.0-alpha.5.1, 2026-10-31
+  // 맥스튜디오 실측)이다. 그래서 소문자로 맞춰 비교한다. 느슨한 정규화는 하지 않는다 —
+  // 모르는 값을 억지로 분류하면 지금 고치는 오분류가 다른 모양으로 재발한다.
+  const o = originator.trim().toLowerCase();
   if (!o) return null;
   if (o === "codex-tui") return "codex-cli";
   if (o === "codex_exec") return "codex-exec";
+  if (o === "codex desktop") return "codex-desktop";
   if (o === "buzz-acp" || o.includes("codex-acp")) return "codex-acp";
   return null;
 }

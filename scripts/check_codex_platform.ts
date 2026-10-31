@@ -20,6 +20,12 @@ assert.equal(originatorToPlatform("@agentclientprotocol/codex-acp"), "codex-acp"
 assert.equal(originatorToPlatform(""), null, "빈 값은 폴백으로 넘긴다");
 assert.equal(originatorToPlatform("   "), null, "공백만도 폴백");
 assert.equal(originatorToPlatform("codex-brandnew-client"), null, "모르는 값은 폴백으로 넘긴다");
+// 데스크톱 앱은 표기가 다르다 — `Codex Desktop` (공백·대문자). 2026-10-31 맥스튜디오 실측값
+assert.equal(originatorToPlatform("Codex Desktop"), "codex-desktop", "데스크톱 앱 실측 표기");
+assert.equal(originatorToPlatform("codex desktop"), "codex-desktop", "대소문자 무시");
+assert.equal(originatorToPlatform("CODEX DESKTOP"), "codex-desktop", "대소문자 무시");
+assert.equal(originatorToPlatform("Codex Desktop Beta"), null,
+  "비슷하지만 다른 값은 억지로 분류하지 않는다 — 폴백으로 넘긴다");
 assert.equal(sourceToPlatform("cli"), "codex-cli");
 assert.equal(sourceToPlatform("vscode"), "codex-desktop");
 assert.equal(sourceToPlatform('{"subagent":"review"}'), "codex-mcp-client",
@@ -52,6 +58,7 @@ process.env.CODEX_HOME = mk("new", true, [
   ["s-null-cli", "cli", null],
   ["s-null-sub", '{"subagent":"review"}', null],
   ["s-unknown-orig", "vscode", "codex-brandnew-client"],
+  ["s-desktop", "vscode", "Codex Desktop"],
 ]);
 assert.equal(lookupPlatform("s-tui-vscode"), "codex-cli", "🎯 CLI 가 source=vscode 여도 cli 로 찍힌다");
 assert.equal(lookupPlatform("s-tui-cli"), "codex-cli", "source 가 cli 여도 같은 결과");
@@ -63,6 +70,8 @@ assert.equal(lookupPlatform("s-null-cli"), "codex-cli", "originator 없으면 so
 assert.equal(lookupPlatform("s-null-sub"), "codex-mcp-client", "미확인 source → default (desktop 아님)");
 assert.equal(lookupPlatform("s-unknown-orig"), "codex-desktop",
   "모르는 originator 는 source 폴백 — **호환 폴백이고 정확성 보장이 아니다**");
+assert.equal(lookupPlatform("s-desktop"), "codex-desktop",
+  "🎯 데스크톱은 **originator 로** 판정된다 (source 폴백에 의존하지 않는다)");
 assert.equal(lookupPlatform("no-such-id"), "codex-mcp-client", "없는 세션은 default");
 
 // ② originator 칸이 **없는** 구형 DB → source 만 조회해야 한다 (throw 금지)
