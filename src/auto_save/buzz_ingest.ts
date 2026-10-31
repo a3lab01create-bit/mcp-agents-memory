@@ -410,6 +410,8 @@ async function replaceWithCleaned(
       //    이 경로에 영원히 못 들어왔다). 그 조건이 하던 두 일을 각각 대체한다:
       //      원문 보존  → SET 의 coalesce (기존 raw 는 **절대 덮지 않는다**)
       //      멱등성     → `$2 <> message` (정리해도 안 바뀌면 0건)
+      //                   ⚠️ 이 조건도 현재는 발화하지 않는다 (정리기가 안 줄어들면 null) — 방어용이다.
+      //                      실제 멱등성은 위 SELECT 단계의 `cleaned === null` 제외가 담당한다.
       //    그리고 읽은 뒤 바뀐 행을 건드리지 않도록 message·raw 를 **둘 다** 스냅샷 비교하고
       //    (raw 는 NULL 안전 비교), is_active·NOT is_pinned 를 UPDATE 에서 다시 확인한다.
       `UPDATE memory
@@ -511,9 +513,14 @@ async function recleanEnvelopes(
     const cleaned = cleanBuzzEnvelope(r.message, { baseless: true });
     const quotes = buzzQuotedMessages(r.message);
     if (cleaned === null && quotes !== null && quotes.length === 0) continue; // 걷어낼 게 없음
-    // 🔴 정리해도 message 가 안 바뀌면 후보가 아니다. `raw_message IS NULL` 를 뺀 뒤로는
-    //    이미 정리된 행도 SELECT 에 걸리는데, 예산이 `ready.slice(0, budget)` 로 **후보 목록**을
-    //    자르므로 그런 행이 앞자리를 차지하면 (ORDER BY created_at, id) 다음 후보를 영구히 굶긴다.
+    // 방어적 가드 (현재 코드에서는 발화하지 않는다 — 2026-10-31 확인):
+    //   `cleanBuzzEnvelope` 는 결과가 입력보다 짧지 않으면 null 을 돌려준다
+    //   (buzz_envelope.ts `if (cleaned.length >= message.length) return null`)
+    //   ⇒ `cleaned === r.message` 는 구조적으로 불가능하고, 이미 정리된 행은 위의
+    //     `cleaned === null && quotes.length === 0` 에서 조용히 빠진다(by.shape 도 안 올린다).
+    // 남겨두는 이유: 예산이 성공 건수가 아니라 **후보 목록**을 자르므로
+    //   (`ready.slice(0, budget)` + `ORDER BY created_at, id`), 만약 정리기의 길이 규칙이
+    //   바뀌어 "안 줄어드는 정리본"이 생기면 그 행이 앞자리를 차지해 다음 후보를 굶길 수 있다.
     if (cleaned !== null && cleaned === r.message) continue;
     // 버즈 자리만 (terminal/slack/auto 같은 다른 자리는 버즈 봉투가 아님)
     const venue =
