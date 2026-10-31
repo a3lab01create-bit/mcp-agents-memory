@@ -394,17 +394,32 @@ const norm = (s: string) => s.replace(/\s+/g, " ").trim();
  * 그 사이 행이 바뀌었으면(이미 정리됨 등) 손대지 않는다. 콜드패스 워커가 그 행을 잡고 있으면
  * 2초만 기다리고, 넘으면 false — 다음 실행에 한다.
  */
-async function replaceWithCleaned(id: number, cleaned: string, original: string, venue: string | null): Promise<boolean> {
+async function replaceWithCleaned(
+  id: number,
+  cleaned: string,
+  original: string,
+  venue: string | null,
+  priorRaw: string | null,
+): Promise<boolean> {
   const client = await db.getClient();
   try {
     await client.query("BEGIN");
     await client.query("SET LOCAL lock_timeout = '2s'");
     const r = await client.query(
+      // 🔴 2026-10-31: `raw_message IS NULL` 를 선택 조건에서 뺐다(codex 캡처가 raw 를 미리 채우면
+      //    이 경로에 영원히 못 들어왔다). 그 조건이 하던 두 일을 각각 대체한다:
+      //      원문 보존  → SET 의 coalesce (기존 raw 는 **절대 덮지 않는다**)
+      //      멱등성     → `$2 <> message` (정리해도 안 바뀌면 0건)
+      //                   ⚠️ 이 조건도 현재는 발화하지 않는다 (정리기가 안 줄어들면 null) — 방어용이다.
+      //                      실제 멱등성은 위 SELECT 단계의 `cleaned === null` 제외가 담당한다.
+      //    그리고 읽은 뒤 바뀐 행을 건드리지 않도록 message·raw 를 **둘 다** 스냅샷 비교하고
+      //    (raw 는 NULL 안전 비교), is_active·NOT is_pinned 를 UPDATE 에서 다시 확인한다.
       `UPDATE memory
-          SET message = $2, raw_message = $3, venue = coalesce(venue, $4),
+          SET message = $2, raw_message = coalesce(raw_message, $3), venue = coalesce(venue, $4),
               p_tag_id = NULL, d_tag = '{}', tag_processed = FALSE, embedding = NULL, cold_error = NULL
-        WHERE id = $1 AND raw_message IS NULL AND message = $3`,
-      [id, cleaned, original, venue]
+        WHERE id = $1 AND message = $3 AND raw_message IS NOT DISTINCT FROM $5
+          AND $2 <> message AND is_active AND NOT is_pinned`,
+      [id, cleaned, original, venue, priorRaw]
     );
     await client.query("COMMIT");
     client.release();
@@ -431,8 +446,8 @@ async function healBaseEnvelopes(
   dryRun: boolean
 ): Promise<{ healed: number; byDevice: Record<string, number>; ready: number; rejected: number }> {
   const rows = (await db.query(
-    `SELECT id, message, device_name FROM memory
-      WHERE user_id = $1 AND role = 'user' AND raw_message IS NULL AND message ~ '^\\s*<base>'
+    `SELECT id, message, device_name, raw_message FROM memory
+      WHERE user_id = $1 AND role = 'user' AND message ~ '^\\s*<base>'
         AND agent_platform <> 'buzz' AND is_active AND NOT is_pinned
       ORDER BY created_at, id`,
     [userId]
@@ -447,11 +462,13 @@ async function healBaseEnvelopes(
       rejected++; // 형식이 바뀐 봉투 — 감시가 알린다
       continue;
     }
+    // 정리해도 안 바뀌는 행은 후보가 아니다 — 예산을 먹고 다음 후보를 굶기지 않게 먼저 뺀다
+    if (cleaned === r.message) continue;
     if (healed >= budget) {
       ready++;
       continue;
     }
-    if (dryRun || (await replaceWithCleaned(Number(r.id), cleaned, r.message, buzzTurnVenue(cleaned)))) {
+    if (dryRun || (await replaceWithCleaned(Number(r.id), cleaned, r.message, buzzTurnVenue(cleaned), r.raw_message ?? null))) {
       healed++;
       const d = r.device_name ?? "unknown";
       byDevice[d] = (byDevice[d] ?? 0) + 1;
@@ -477,14 +494,15 @@ async function recleanEnvelopes(
   dryRun: boolean
 ): Promise<{ recleaned: number; ready: number; stuck: number; by: StuckBreakdown }> {
   const rows = (await db.query(
-    `SELECT id, message, venue FROM memory
-      WHERE user_id = $1 AND role = 'user' AND raw_message IS NULL AND message LIKE '<context>%'
+    `SELECT id, message, venue, raw_message FROM memory
+      WHERE user_id = $1 AND role = 'user' AND message LIKE '<context>%'
         AND agent_platform <> 'buzz' AND is_active AND NOT is_pinned
       ORDER BY created_at, id`,
     [userId]
   )).rows;
   type Cand = {
-    id: number; message: string; cleaned: string; venue: string; quotes: Array<{ ms: number; text: string }>;
+    id: number; message: string; cleaned: string; venue: string; priorRaw: string | null;
+    quotes: Array<{ ms: number; text: string }>;
     /** 인용 본문에 다음 번호(`[k] `)로 시작하는 줄이 있음 — 못 읽은 인용 머리가 본문에 붙었을 수 있다 */
     misread: boolean;
   };
@@ -495,6 +513,15 @@ async function recleanEnvelopes(
     const cleaned = cleanBuzzEnvelope(r.message, { baseless: true });
     const quotes = buzzQuotedMessages(r.message);
     if (cleaned === null && quotes !== null && quotes.length === 0) continue; // 걷어낼 게 없음
+    // 방어적 가드 (현재 코드에서는 발화하지 않는다 — 2026-10-31 확인):
+    //   `cleanBuzzEnvelope` 는 결과가 입력보다 짧지 않으면 null 을 돌려준다
+    //   (buzz_envelope.ts `if (cleaned.length >= message.length) return null`)
+    //   ⇒ `cleaned === r.message` 는 구조적으로 불가능하고, 이미 정리된 행은 위의
+    //     `cleaned === null && quotes.length === 0` 에서 조용히 빠진다(by.shape 도 안 올린다).
+    // 남겨두는 이유: 예산이 성공 건수가 아니라 **후보 목록**을 자르므로
+    //   (`ready.slice(0, budget)` + `ORDER BY created_at, id`), 만약 정리기의 길이 규칙이
+    //   바뀌어 "안 줄어드는 정리본"이 생기면 그 행이 앞자리를 차지해 다음 후보를 굶길 수 있다.
+    if (cleaned !== null && cleaned === r.message) continue;
     // 버즈 자리만 (terminal/slack/auto 같은 다른 자리는 버즈 봉투가 아님)
     const venue =
       [r.venue, venueFromBuzzMessage(r.message)].find((v): v is string => typeof v === "string" && v.startsWith("buzz")) ?? null;
@@ -504,7 +531,7 @@ async function recleanEnvelopes(
       continue;
     }
     const misread = quotes.some((x, i) => x.content.split("\n").some((line) => line.startsWith(`[${i + 2}] `)));
-    cands.push({ id: Number(r.id), message: r.message, cleaned, venue, quotes: q, misread });
+    cands.push({ id: Number(r.id), message: r.message, cleaned, venue, priorRaw: r.raw_message ?? null, quotes: q, misread });
   }
   const times = [...new Set(cands.flatMap((c) => c.quotes.map((x) => x.ms)))];
   const have = new Set<string>(); // venue \0 ms \0 본문
@@ -531,7 +558,7 @@ async function recleanEnvelopes(
   }
   let n = 0;
   for (const c of ready.slice(0, Math.max(0, budget))) {
-    if (dryRun || (await replaceWithCleaned(c.id, c.cleaned, c.message, c.venue))) n++;
+    if (dryRun || (await replaceWithCleaned(c.id, c.cleaned, c.message, c.venue, c.priorRaw))) n++;
   }
   return { recleaned: n, ready: ready.length - n, stuck: by.shape + by.noRow + by.textDiffers, by };
 }
