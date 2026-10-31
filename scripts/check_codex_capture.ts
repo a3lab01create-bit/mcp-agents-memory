@@ -163,6 +163,32 @@ assert.equal(chooseRawMessage(null, "정리입력", null), null,
   }
 }
 
+// ⑤-4 정규화 범위를 **검사로 못 박는다** (과장 방지).
+//     키가 같은데 raw 만 다른 경우는 선착순이다 — 이것이 현재의 한계이고, 침묵하지 않고 기록한다.
+//     ① 조각 순서만 다름 → 같은 키 → 먼저 온 raw 만 남는다 (남아 있는 한계)
+//     ② 공백만 다름      → 같은 키 → 먼저 온 raw 만 남는다 (같은 턴을 쪼개지 않으려는 의도된 정규화)
+{
+  const P = "<recommended_plugins>p</recommended_plugins>";
+  const raws = (first: string[], second: string[]) => {
+    const state: CaptureParseState = { mirrors: [] };
+    const a = parseEntry(multi("user", first, "response"), 0, state);
+    const b = parseEntry(multi("user", second, "item"), 100, state);
+    return [a, b].filter((x): x is NonNullable<typeof x> => x !== null)
+                 .map((e) => e.rawMessage ?? e.message);
+  };
+  // ① 조각 순서만 다르면 한 행만 남고, 남는 원문은 **먼저 온 쪽**이다
+  const order1 = raws([P, "hello"], ["hello", P]);
+  const order2 = raws(["hello", P], [P, "hello"]);
+  assert.equal(order1.length, 1, "⑤-4① 조각 순서만 다르면 같은 키 → 한 행");
+  assert.equal(order2.length, 1, "⑤-4① 반대 순서도 한 행");
+  assert.equal(order1[0], [P, "hello"].join("\n"), "⑤-4① 먼저 온 원문이 남는다");
+  assert.notEqual(order1[0], order2[0],
+    "⑤-4① 알려진 한계: 조각 순서만 다를 때 저장되는 원문은 도착 순서에 의존한다");
+  // ② 공백만 다른 경우도 한 행 — 같은 턴을 쪼개지 않는다 (이쪽은 의도된 정규화)
+  const ws = raws(["body"], ["body  "]);
+  assert.equal(ws.length, 1, "⑤-4② 공백만 다르면 같은 턴으로 보고 한 행만 남긴다");
+}
+
 // Optional local rollout check: counts only, never print or store conversation bodies.
 if (process.argv[2]) {
   const state: CaptureParseState = { mirrors: [] };
