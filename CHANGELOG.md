@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.9.30 — 2026-10-31
+
+### Codex capture: stop discarding user text, and unblock the envelope re-clean (#28)
+
+#### Fragments are no longer thrown away (`codex_capture.ts`)
+
+Codex hands the prompt to us as a `content[]` array — platform manual, agent
+instructions, core memory, room context, then the turn itself. The parser kept
+only the **last** element, on the assumption that the last fragment is always
+the real input. It usually is. But when someone pastes something *before* their
+question, that paste is a separate fragment and it was silently dropped:
+
+    ["<invoice><amount>100</amount></invoice>", "What's the amount in this XML?"]
+    → stored: "What's the amount in this XML?"      (the XML is gone)
+
+The shape of a fragment is not evidence of where it came from. Two attempts to
+filter by shape were both defeated by counterexamples — one deleted user-pasted
+XML, the other missed non-ASCII tag names entirely. So the capture no longer
+drops fragments at all. Envelope removal is left to `cleanBuzzEnvelope`, which
+only strips what it can confirm by grammar (`Scope:` plus `Channel: … (#uuid)`),
+so hand-written `<invoice>` or `<새것>` are structurally out of its reach.
+
+`message` now holds every fragment, `raw_message` keeps the pre-filter original,
+and the room (`venue`) is still read from the whole fragment set because
+`<context>` sits outside the body.
+
+#### A caller's original is no longer silently overwritten (`hot_path.ts`)
+
+`raw_message` was chosen as `cleaned !== null ? message : params.raw_message`.
+When envelope cleaning succeeded, an original passed in by the caller was
+dropped and the *cleaning input* was recorded as the original instead. For a
+caller that deliberately separates the two — body in `message`, untouched
+fragments in `raw_message` — that is data loss. The expression is now
+`chooseRawMessage()`: an explicitly supplied original always wins.
+
+#### Rows that already had a `raw_message` can be re-cleaned (`buzz_ingest.ts`)
+
+Three call sites selected candidates with `raw_message IS NULL`. Because the
+capture change fills `raw_message` on every Codex row, those rows could never
+enter the re-clean path again — the fix above would have closed the one route
+that removes repeated history from `message`.
+
+That single condition was doing two jobs, so it is replaced by two:
+preservation via `SET raw_message = coalesce(raw_message, $3)` (an existing
+original is never overwritten), and idempotence via the candidate-collection
+skip plus `AND $2 <> message`. Concurrent-modification safety compares both
+`message` and `raw_message` (NULL-safe) and re-checks `is_active` and
+`NOT is_pinned` inside the `UPDATE`.
+
+#### Known limits
+
+- **Not "zero loss."** When two records carry the same body but differ only in
+  fragment order or whitespace, the stored `raw_message` is whichever arrived
+  first. Test `⑤-4` pins that behaviour as a characterization test — it must be
+  changed when the limit is fixed, not treated as a passing requirement.
+- The existing injected-text filter still cannot fully separate a user's quotation
+  from genuine injected instructions.
+- Re-clean progress is bounded by whether the quoted originals were captured. On
+  the production database at release time, 26 candidates had no origin row and 15
+  had an origin whose text differed.
+
+
 ## 0.9.29 — 2026-10-05
 
 ### Buzz envelopes: cleaner embeddings, folded search results, no false "format changed" alerts
