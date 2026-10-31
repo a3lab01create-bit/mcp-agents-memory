@@ -20,6 +20,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
+import { buzzTurnVenue } from "./venue.js";
 
 const DEVICE_NAME = os.hostname();
 const GEMINI_ROOT = path.join(os.homedir(), ".gemini");
@@ -41,6 +42,8 @@ interface FileState {
   agentPlatform: string; // 어느 변종 root에서 왔는지
   /** USER_INPUT의 <USER_SETTINGS_CHANGE>에서 추적한 현재 모델. 없으면 null → 'unknown'. */
   currentModel: string | null;
+  /** 버즈 세션: 가장 최근 user 턴의 venue. 답장은 이걸 따른다. */
+  buzzVenue?: string | null;
 }
 
 interface DirState {
@@ -235,6 +238,15 @@ async function flushDeltaForFile(
     if (parsed.modelHint) fileState.currentModel = parsed.modelHint;
     const agentModel = parsed.role === "user" ? null : (fileState.currentModel ?? "unknown");
 
+    // 버즈 세션: user 턴에서 자리를 읽어 두고, 답장(assistant)은 그 값을 따른다.
+    // 답장엔 `<context>` 봉투가 없어서 이걸 안 하면 venue 가 전부 NULL 이 된다.
+    if (parsed.role === "user") {
+      const own = buzzTurnVenue(parsed.message);
+      if (own) fileState.buzzVenue = own;
+    }
+    const venue = fileState.buzzVenue ?? null;
+
+
     const externalUuid = `antigravity:${fileState.sessionId}:${parsed.stepIndex}`;
 
     try {
@@ -246,6 +258,7 @@ async function flushDeltaForFile(
         message: parsed.message,
         external_uuid: externalUuid,
         device_name: DEVICE_NAME,
+        venue,
       });
       if (result.inserted) inserted++;
       else dedup++;

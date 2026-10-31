@@ -32,6 +32,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
+import { buzzTurnVenue } from "./venue.js";
 
 const DEVICE_NAME = os.hostname();
 const SESSIONS_ROOT = path.join(os.homedir(), ".grok", "sessions");
@@ -47,6 +48,8 @@ interface FileState {
   lastSize: number;
   /** chat_history.jsonl의 부모 폴더명 = session UUID. */
   sessionId: string;
+  /** 버즈 세션: 가장 최근 user 턴의 venue. 답장은 이걸 따른다. */
+  buzzVenue?: string | null;
 }
 
 interface DirState {
@@ -238,6 +241,15 @@ async function flushDeltaForFile(
 
     const externalUuid = `grok:${fileState.sessionId}:${parsed.lineIndex}`;
 
+    // 버즈 세션: user 턴에서 자리를 읽어 두고, 답장(assistant)은 그 값을 따른다.
+    // 답장엔 `<context>` 봉투가 없어서 이걸 안 하면 venue 가 전부 NULL 이 된다.
+    if (parsed.role === "user") {
+      const own = buzzTurnVenue(parsed.message);
+      if (own) fileState.buzzVenue = own;
+    }
+    const venue = fileState.buzzVenue ?? null;
+
+
     try {
       const result = await insertRawMemory({
         user_id: userId,
@@ -247,6 +259,7 @@ async function flushDeltaForFile(
         message: parsed.message,
         external_uuid: externalUuid,
         device_name: DEVICE_NAME,
+        venue,
       });
       if (result.inserted) inserted++;
       else dedup++;

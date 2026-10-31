@@ -23,6 +23,7 @@ import * as os from "node:os";
 import { spawnSync } from "node:child_process";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
+import { buzzTurnVenue } from "./venue.js";
 
 const DEVICE_NAME = os.hostname();
 // 2026-10-31: CODEX_HOME 을 존중한다. 버즈 코디는 codex-home 을 쓰고(launcher 가 env 로 지정),
@@ -68,6 +69,8 @@ interface FileState {
   sessionId: string;
   /** state_5.sqlite source → platform (cli→codex-cli, vscode→codex-desktop …). */
   agentPlatform: string;
+  /** 버즈 세션: 가장 최근 user 턴의 venue. 답장은 이걸 따른다. */
+  buzzVenue?: string | null;
   /** 마지막으로 본 turn_context.payload.model (없으면 null → 'unknown'). */
   currentModel: string | null;
 }
@@ -160,6 +163,12 @@ export interface ParsedEntry {
   byteOffset: number;
   role: "user" | "assistant";
   message: string;
+  /**
+   * venue(자리) 를 읽을 원문. UserMessage 는 message 에 마지막 조각만 담기지만
+   * `<context>` 조각은 그 앞에 따로 있어서, 자리는 조각 전체에서 읽어야 한다.
+   * assistant 턴은 없음 → 세션에 물려둔 값을 쓴다.
+   */
+  venueSource?: string;
 }
 
 /**
@@ -211,6 +220,7 @@ export function parseEntry(line: string, byteOffset: number): ParsedEntry | null
   const ptype = payload.type;
   let role: "user" | "assistant";
   let message: string;
+  let venueSource: string | undefined;
   if (ptype === "user_message" || ptype === "agent_message") {
     role = ptype === "user_message" ? "user" : "assistant";
     message = typeof payload.message === "string" ? payload.message.trim() : "";
@@ -221,6 +231,12 @@ export function parseEntry(line: string, byteOffset: number): ParsedEntry | null
     else if (itype === "AgentMessage") role = "assistant";
     else return null;
     message = textFromItemContent(item, role);
+    if (role === "user" && Array.isArray(item?.content)) {
+      // 자리(venue)는 `<context>` 조각에 있고 그건 message(마지막 조각) 밖이다 → 조각 전체를 넘긴다.
+      venueSource = item.content
+        .map((c: any) => (c && typeof c.text === "string" ? c.text : ""))
+        .join("\n");
+    }
   } else {
     return null;
   }
@@ -232,7 +248,9 @@ export function parseEntry(line: string, byteOffset: number): ParsedEntry | null
     return null;
   }
 
-  return { byteOffset, role, message };
+  return venueSource === undefined
+    ? { byteOffset, role, message }
+    : { byteOffset, role, message, venueSource };
 }
 
 /**
@@ -311,6 +329,14 @@ async function flushDeltaForFile(
     const agentModel =
       parsed.role === "user" ? null : (fileState.currentModel ?? "unknown");
 
+    // 버즈 세션: user 턴에서 자리를 읽어 두고, 답장(assistant)은 그 값을 따른다.
+    // 답장엔 `<context>` 봉투가 없어서 이걸 안 하면 venue 가 전부 NULL 이 된다.
+    if (parsed.role === "user" && parsed.venueSource) {
+      const own = buzzTurnVenue(parsed.venueSource);
+      if (own) fileState.buzzVenue = own;
+    }
+    const venue = fileState.buzzVenue ?? null;
+
     try {
       const result = await insertRawMemory({
         user_id: userId,
@@ -320,6 +346,7 @@ async function flushDeltaForFile(
         message: parsed.message,
         external_uuid: externalUuid,
         device_name: DEVICE_NAME,
+        venue,
       });
       if (result.inserted) inserted++;
       else dedup++;
