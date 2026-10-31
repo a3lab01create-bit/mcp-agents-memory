@@ -1,7 +1,8 @@
 /**
  * Codex CLI 자동 캡처 — RESPEC PROBLEMS.md §5 (cross-platform passive capture).
  *
- * Codex transcript: ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<sid>.jsonl
+ * Codex transcript: $CODEX_HOME/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<sid>.jsonl
+ *   (CODEX_HOME 미설정 시 ~/.codex)
  *
  * jsonl_capture.ts 패턴 그대로 복제 + Codex 고유 처리:
  *   - dir 구조가 cwd 기반 아니라 *날짜 기반*. 모든 cwd 세션이 같은 dir에 섞임.
@@ -24,8 +25,14 @@ import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
 
 const DEVICE_NAME = os.hostname();
-const SESSIONS_ROOT = path.join(os.homedir(), ".codex", "sessions");
-const STATE_DB = path.join(os.homedir(), ".codex", "state_5.sqlite");
+// 2026-10-31: CODEX_HOME 을 존중한다. 버즈 코디는 codex-home 을 쓰고(launcher 가 env 로 지정),
+// Isaac 터미널 codex 는 이 변수가 없어 ~/.codex 로 떨어진다 → 기존 동작 불변.
+// ⚠️ codex 는 MCP 서버 자식에게 env 를 5개(HOME/LOGNAME/PATH/SHELL/USER)만 넘긴다 →
+//    codex-home/config.toml 의 [mcp_servers.mcp-agents-memory.env] 로 CODEX_HOME 을
+//    전달해야 이 코드가 효력을 갖는다. 코드만 고치면 동작이 안 바뀐다 (2026-10-31 실측).
+const CODEX_HOME = process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
+const SESSIONS_ROOT = path.join(CODEX_HOME, "sessions");
+const STATE_DB = path.join(CODEX_HOME, "state_5.sqlite");
 const FLUSH_DEBOUNCE_MS = 200;
 const POLL_INTERVAL_MS = 3000; // OS 버퍼링 우회 — fs.watch 미발화 보완
 
