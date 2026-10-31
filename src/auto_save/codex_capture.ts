@@ -21,6 +21,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
 import { buzzTurnVenue } from "./venue.js";
@@ -69,6 +70,8 @@ interface FileState {
   sessionId: string;
   /** state_5.sqlite source → platform (cli→codex-cli, vscode→codex-desktop …). */
   agentPlatform: string;
+  /** 두 스키마에 같은 메시지가 기록되는 것을 억제하기 위한 파일별 상태. */
+  parseState: CaptureParseState;
   /** 버즈 세션: 가장 최근 user 턴의 venue. 답장은 이걸 따른다. */
   buzzVenue?: string | null;
   /** 마지막으로 본 turn_context.payload.model (없으면 null → 'unknown'). */
@@ -150,6 +153,7 @@ export function captureSessionStart(_cwd: string): void {
       sessionId,
       agentPlatform: lookupPlatform(sessionId),
       currentModel: null,
+      parseState: { mirrors: [] },
     });
     count++;
   }
@@ -169,28 +173,61 @@ export interface ParsedEntry {
    * assistant 턴은 없음 → 세션에 물려둔 값을 쓴다.
    */
   venueSource?: string;
+  /**
+   * 조각 원문 (주입문 필터·trim 이전). hot_path 가 raw_message 칸에 넣는다.
+   * message 와 같으면 생략한다.
+   */
+  rawMessage?: string;
+}
+
+/** 파일 하나 안에서 같은 메시지가 두 스키마로 두 번 기록되는 것을 억제하기 위한 상태. */
+export interface CaptureParseState {
+  mirrors: Array<{ key: string; sources: string[] }>;
+}
+
+/** 알려진 단독 주입 블록만 판정한다. 인용된 평문은 남긴다. */
+function isInjectedUserText(text: string): boolean {
+  const t = text.trim();
+  return /^(?:<environment_context>[\s\S]*<\/environment_context>|<recommended_plugins>[\s\S]*<\/recommended_plugins>)$/.test(t) ||
+    /^# AGENTS\.md instructions for /i.test(t);
+}
+
+/** 같은 메시지가 다른 스키마로도 기록됐으면 한 번만 반환한다 (같은 스키마의 반복 턴은 억제하지 않는다). */
+function isMirroredEntry(state: CaptureParseState, source: string, role: string, message: string): boolean {
+  const key = createHash("sha256").update(role + "\0" + message).digest("hex");
+  const mirror = state.mirrors.find((item) => item.key === key && !item.sources.includes(source));
+  if (mirror) {
+    mirror.sources.push(source);
+    return true;
+  }
+  state.mirrors.push({ key, sources: [source] });
+  if (state.mirrors.length > 256) state.mirrors.shift();
+  return false;
 }
 
 /**
- * item_completed.item.content[] → 캡처할 본문.
+ * content[] → { message, raw }.
  *
- * UserMessage 의 content 는 codex 가 조립한 프롬프트 조각들이다:
- *   [시스템프롬프트(17KB급), agent-instructions, core-memory, context, 실제 입력]
- * 2026-09-21~10-31 rollout 23개 전수에서 **마지막 요소가 항상 실제 입력**이었다
- * (요소가 1개인 경우도 그 하나가 실제 입력). 전부 담으면 매 턴 시스템 프롬프트가
- * user 행으로 쌓이므로 마지막 요소만 쓴다.
- * AgentMessage 는 조각이 하나뿐이지만 방어적으로 join 한다.
+ * UserMessage/response_item 의 content 는 codex 가 조립한 프롬프트 조각들이다:
+ *   [<base> 설명서, <agent-instructions>, <core-memory>, <context>, 이번 턴]
+ *
+ * ⚠️ message 는 조각을 **전부** 잇는다. 조각을 골라 버리는 규칙(옛 "마지막 조각만")은
+ *    사람이 앞 조각에 붙인 XML·인용문까지 같이 버린다 (2026-10-31 Codi 반례:
+ *    ["<invoice><amount>100</amount></invoice>", "위 XML의 금액을 알려줘"] → XML 소실).
+ *    조각 텍스트의 모양은 그 조각이 주입문이라는 증거가 아니다.
+ * 🎯 버즈 봉투는 여기서 걷지 않는다 — hot_path 의 cleanBuzzEnvelope 가
+ *    `Scope:` + `Channel: …(#uuid)` 문법으로 **확인된 봉투만** 걷는다. 그래서 사람이 쓴
+ *    `<invoice>`·`<새것>` 같은 글은 구조적으로 건드려지지 않는다.
+ * ⚠️ raw 는 주입문 필터와 trim **이전**의 조각이어야 "원문 보존"이 성립한다.
  */
-function textFromItemContent(item: any, role: "user" | "assistant"): string {
-  const content = item?.content;
-  if (typeof content === "string") return content.trim();
-  if (!Array.isArray(content) || content.length === 0) return "";
-  const texts = content
-    .map((c: any) => (c && typeof c.text === "string" ? c.text : ""))
-    .filter((t: string) => t.length > 0);
-  if (texts.length === 0) return "";
-  if (role === "user") return texts[texts.length - 1].trim();
-  return texts.join("\n").trim();
+function fragmentsOf(content: any, role: "user" | "assistant"): { message: string; raw: string } {
+  if (typeof content === "string") return { message: content.trim(), raw: content };
+  if (!Array.isArray(content) || content.length === 0) return { message: "", raw: "" };
+  const all = content.map((c: any) => (c && typeof c.text === "string" ? c.text : ""));
+  const kept = all
+    .map((t: string) => t.trim())
+    .filter((t: string) => t && (role !== "user" || !isInjectedUserText(t)));
+  return { message: kept.join("\n"), raw: all.join("\n") };
 }
 
 /**
@@ -205,7 +242,11 @@ function textFromItemContent(item: any, role: "user" | "assistant"): string {
  *   ⚠️ response_item/message 로 바꾸지 마라 — role='developer' 인 주입 지시문과
  *      <recommended_plugins> 보일러플레이트가 같이 들어온다.
  */
-export function parseEntry(line: string, byteOffset: number): ParsedEntry | null {
+export function parseEntry(
+  line: string,
+  byteOffset: number,
+  state?: CaptureParseState,
+): ParsedEntry | null {
   let entry: any;
   try {
     entry = JSON.parse(line);
@@ -213,15 +254,31 @@ export function parseEntry(line: string, byteOffset: number): ParsedEntry | null
     return null;
   }
 
-  if (entry.type !== "event_msg") return null;
+  if (!entry || (entry.type !== "event_msg" && entry.type !== "response_item")) return null;
   const payload = entry.payload;
   if (!payload || typeof payload !== "object") return null;
 
   const ptype = payload.type;
   let role: "user" | "assistant";
   let message: string;
+  let rawMessage: string | undefined;
   let venueSource: string | undefined;
-  if (ptype === "user_message" || ptype === "agent_message") {
+  const source =
+    entry.type === "response_item" ? "response" : ptype === "item_completed" ? "item" : "legacy";
+
+  if (entry.type === "response_item") {
+    // response_item/message 에는 role='developer'/'system'/'tool' 인 주입 지시문도 온다 → 둘만 받는다.
+    if (ptype !== "message" || (payload.role !== "user" && payload.role !== "assistant")) return null;
+    // 내부 추론 채널(analysis 등)은 담지 않는다.
+    if (payload.channel && !["final", "commentary"].includes(payload.channel)) return null;
+    if (payload.phase && !["final", "final_answer", "commentary"].includes(payload.phase)) return null;
+    role = payload.role;
+    if (!Array.isArray(payload.content)) return null;
+    const f = fragmentsOf(payload.content, role);
+    message = f.message;
+    rawMessage = f.raw;
+    if (role === "user") venueSource = f.raw;
+  } else if (ptype === "user_message" || ptype === "agent_message") {
     role = ptype === "user_message" ? "user" : "assistant";
     message = typeof payload.message === "string" ? payload.message.trim() : "";
   } else if (ptype === "item_completed") {
@@ -230,17 +287,15 @@ export function parseEntry(line: string, byteOffset: number): ParsedEntry | null
     if (itype === "UserMessage") role = "user";
     else if (itype === "AgentMessage") role = "assistant";
     else return null;
-    message = textFromItemContent(item, role);
-    if (role === "user" && Array.isArray(item?.content)) {
-      // 자리(venue)는 `<context>` 조각에 있고 그건 message(마지막 조각) 밖이다 → 조각 전체를 넘긴다.
-      venueSource = item.content
-        .map((c: any) => (c && typeof c.text === "string" ? c.text : ""))
-        .join("\n");
-    }
+    const f = fragmentsOf(item?.content, role);
+    message = f.message;
+    rawMessage = f.raw;
+    if (role === "user") venueSource = f.raw;
   } else {
     return null;
   }
   if (!message) return null;
+  if (role === "user" && isInjectedUserText(message)) return null;
 
   // Codex agent_message에는 tool call 로그가 섞임 — 메모리 노이즈 제거
   if (message.startsWith("[external_agent_tool_call:") ||
@@ -248,9 +303,12 @@ export function parseEntry(line: string, byteOffset: number): ParsedEntry | null
     return null;
   }
 
-  return venueSource === undefined
-    ? { byteOffset, role, message }
-    : { byteOffset, role, message, venueSource };
+  if (state && isMirroredEntry(state, source, role, message)) return null;
+
+  const out: ParsedEntry = { byteOffset, role, message };
+  if (venueSource !== undefined) out.venueSource = venueSource;
+  if (rawMessage !== undefined && rawMessage !== message) out.rawMessage = rawMessage;
+  return out;
 }
 
 /**
@@ -318,7 +376,7 @@ async function flushDeltaForFile(
     }
 
     const byteOffset = startBase + lineStartInRaw;
-    const parsed = parseEntry(trimmed, byteOffset);
+    const parsed = parseEntry(trimmed, byteOffset, fileState.parseState);
     if (!parsed) {
       skipped++;
       lineStartInRaw += Buffer.byteLength(line, "utf-8") + 1;
@@ -347,6 +405,7 @@ async function flushDeltaForFile(
         external_uuid: externalUuid,
         device_name: DEVICE_NAME,
         venue,
+        raw_message: parsed.rawMessage ?? null,
       });
       if (result.inserted) inserted++;
       else dedup++;
@@ -392,6 +451,7 @@ async function flushAllFiles(): Promise<{ inserted: number; skipped: number; ded
         sessionId,
         agentPlatform: lookupPlatform(sessionId),
         currentModel: null,
+        parseState: { mirrors: [] },
       };
       _state.files.set(filePath, fileState);
     }
