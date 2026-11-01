@@ -246,6 +246,8 @@ check("병적 입력도 빠르게 끝남", () => {
   const t0 = performance.now();
   cleanBuzzEnvelope(BASE + "\n" + "<context>\n".repeat(60000));
   cleanBuzzEnvelope(BASE + "\n" + CONTEXT + '\n<thread-context x>\n' + "</x> ".repeat(200000));
+  // 닫는 태그 자체가 20만 개 — 경계 루프가 자리마다 문자열을 복사하면 여기서 O(n²) 로 터진다
+  cleanBuzzEnvelope(BASE + "\n" + CONTEXT + '\n<thread-context x>\n' + "</thread-context> ".repeat(200000));
   cleanBuzzEnvelope(BASE + "\n<context>\n" + "q\n".repeat(2_000_000) + "</context>\n<buzz-event>\nREAL");
   const ms = performance.now() - t0;
   assert.ok(ms < 500, `${ms.toFixed(0)}ms`);
