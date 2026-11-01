@@ -10,8 +10,16 @@
  *      ⇒ 센티널 표 `__disposable_test_db__` 가 없으면 SKIP. 운영 DB 엔 그 표가 없다.
  *      ⚠️ `DATABASE_URL` 이 `DB_NAME` 보다 우선이다(`src/db.ts:52`) — 접속 DB 를 눈으로 확인하라.
  *   ② **TRUNCATE 하지 않는다.** 실행별 UUID 접두사 fixture 만 지운다.
- *   ③ **실행별 user_id 로 조회 범위를 가른다.** 고정 user_id 를 쓰면 기존 noRow 가 8건만 있어도
- *      새 fixture 가 표본에서 밀려 **정상 코드가 실패**한다. 격리에 실패하면 통과시키지 않고 SKIP 한다.
+ *   ③ **실행별 사용자로 조회 범위를 가른다.** 고정 user_id 를 쓰면 기존 noRow 가 8건만 있어도
+ *      새 fixture 가 표본에서 밀려 **정상 코드가 실패**한다.
+ *      사용자는 `INSERT INTO users (user_name) RETURNING user_id` 로 **DB 가 배정**한다 —
+ *      무작위 숫자 + `ON CONFLICT DO NOTHING` 은 기존 사용자와 충돌할 수 있어 쓰지 않는다.
+ *      ⚠️ 앞선 판에서 `INSERT INTO users (user_id)` 를 썼는데 정식 스키마는
+ *         `user_name TEXT NOT NULL UNIQUE`(019_respec_fresh_v1) 라서 **실패**했고 예외를 삼켰다.
+ *         결과적으로 **정식 스키마에서 SKIP, 불완전한 복제 DB 에서 PASS** 가 됐다 —
+ *         내가 주장한 것과 정반대였다(Codi 지적).
+ *   ⑤ **cleanup 은 user_id 로 지우지 않는다.** 그 사용자의 모든 행을 지우면 충돌 시 남의 행도
+ *      지운다. fixture 의 UUID 접두사로만 지우고, 사용자는 **이 실행이 만든 id** 만 지운다.
  *   ④ **try/finally** — assert 가 실패해도 그 실행의 fixture 를 지운다(앞선 판에서 27건이 남았다).
  *
  * 준비:  psql <일회용DB> -c 'CREATE TABLE IF NOT EXISTS __disposable_test_db__ ()'
@@ -38,7 +46,6 @@ cl.release();
 
 const RUN = randomUUID().slice(0, 8);
 const PREFIX = `chk:stuck:${RUN}:`;
-const UID = 900000 + Math.floor(Math.random() * 90000);   // 실행별 사용자 → 조회 범위 격리
 const UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 const HEX = "a".repeat(64);
 const CTX = `<context>\nScope: thread\nChannel: t (#${UUID})\n</context>`;
@@ -46,30 +53,25 @@ const QT_SHAPE = "2026-10-31T00:00:00.000Z";
 const QT_NOROW = "2026-10-31T01:00:00.000Z";   // 이 자리엔 원본을 만들지 않는다
 const QT_DIFF  = "2026-10-31T02:00:00.000Z";   // 이 자리에 **본문이 다른** 원본을 만든다
 const VENUE = `buzz:t-${RUN}`;
-const cleanup = async () => {
+const cleanup = async (uid: number | null) => {
+  // fixture 는 UUID 접두사로만 — user_id 로 싹 지우면 충돌 시 남의 행까지 지운다
   await db.query("DELETE FROM memory WHERE external_uuid LIKE $1 OR external_uuid LIKE $2",
     [`${PREFIX}%`, `buzz:${PREFIX}%`]);
-  await db.query("DELETE FROM memory WHERE user_id = $1", [UID]);
+  // 사용자는 **이 실행이 만든 id** 만
+  if (uid !== null) await db.query("DELETE FROM users WHERE user_id = $1", [uid]);
 };
 
-// users 표가 있으면 실행별 사용자를 만든다. 못 만들면 **통과시키지 않고 SKIP** 한다.
+// 준비 미완료 DB(users 표 없음)는 **명확히 SKIP** 한다 — 불완전한 스키마로 통과시키지 않는다
 const hasUsers = (await db.query("SELECT to_regclass('public.users') IS NOT NULL AS ok")).rows[0].ok as boolean;
-if (hasUsers) {
-  try { await db.query("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", [UID]); }
-  catch { /* 스키마가 달라 못 넣으면 아래 삽입에서 걸러진다 */ }
-}
-try {
-  await db.query(
-    `INSERT INTO memory (user_id,agent_platform,role,message,venue,created_at,is_active,is_pinned,tag_processed,d_tag,external_uuid)
-     VALUES ($1,'claude-code','user','probe',$2,now(),TRUE,FALSE,TRUE,'{}',$3)`,
-    [UID, VENUE, `${PREFIX}probe`]);
-} catch (e) {
-  console.log(`SKIP — 실행별 user_id(${UID}) 를 쓸 수 없다 (${(e as Error).message.slice(0, 80)}).\n` +
-    `  고정 user_id 로 돌리면 기존 행이 표본을 밀어내 **정상 코드도 실패**할 수 있어 통과시키지 않는다.`);
-  await cleanup().catch(() => {});
+if (!hasUsers) {
+  console.log(`SKIP — users 표가 없다 (current_database=${dbName}). 정식 스키마의 일회용 DB 가 필요하다.\n` +
+    `  users · project_tags · memory 를 FK 까지 복제한 DB 에서 실행하라.`);
   process.exit(0);
 }
-await db.query("DELETE FROM memory WHERE external_uuid = $1", [`${PREFIX}probe`]);
+// DB 가 user_id 를 배정한다. 예기치 않은 오류는 **삼키지 않는다**
+const UID = Number((await db.query(
+  "INSERT INTO users (user_name) VALUES ($1) RETURNING user_id",
+  [`__chk_stuck_${RUN}`])).rows[0].user_id);
 
 const ins = async (suffix: string, message: string, platform = "claude-code", venue = VENUE) =>
   Number((await db.query(
@@ -129,6 +131,6 @@ try {
   assert.equal(rep.by.textDiffers, 1, "textDiffers 집계가 1 이어야 한다 (격리 확인)");
   console.log("Ingest stuck-id checks passed");
 } finally {
-  await cleanup();   // assert 실패해도 이 실행의 행은 지운다
+  await cleanup(UID);   // assert 실패해도 이 실행이 만든 것만 지운다
 }
 process.exit(0);
