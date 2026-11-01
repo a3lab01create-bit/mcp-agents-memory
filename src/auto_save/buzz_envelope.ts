@@ -151,7 +151,9 @@ function historyBoundary(tail: string): HistoryBoundary {
   //    (임베딩 입력 350자 → 11자. 검사 "경계를 뒤로 옮길 때 … 임베딩·표시도 본문을 지킨다").
   // 🔴 반대로 **건너뛰지 않은 행에까지** 이 가드를 걸면 안 된다 — 경계가 main 과 같은데도 임베딩이
   //    봉투째가 된다(실측 107008·107120: 4,820B → 53,191B). 이 PR 이 만들지 않은 위험까지 떠안는 것이다.
-  //    정리(cleanBuzzEnvelope)는 쓰기라서 그 2행을 계속 거절한다 — 거기엔 자기 가드가 따로 있다.
+  //    그 2행은 cleanBuzzEnvelope 가 자기 가드로 계속 거절한다(main 과 같다).
+  //    🔴 이 범위 제한의 근거는 "읽기 경로는 안전하다"가 **아니다** — 읽기 경로도 자른다(위의 임베딩 사례).
+  //    근거는 "이 변경이 **새로 만든** 위험(경계를 뒤로 옮기는 것)에만 가드를 건다" 하나다.
   for (let close = tail.indexOf(closeTag, bodyStart), movedPast = false;
        close >= 0;
        close = tail.indexOf(closeTag, close + 1), movedPast = true) {
@@ -187,8 +189,10 @@ export function cleanBuzzEnvelope(message: string, opts: { baseless?: boolean } 
     if (hist.kind === "unknown") return null;
     let turnStart = 0;
     if (hist.kind === "span") {
-      // 정리는 **쓰기**라서 더 엄격하다: 경계를 건너뛰지 않았어도, 이력 안에 진짜 턴 블록 모양이
-      // 있으면 거절한다(관측 107008·107120). 임베딩·표시는 쓰기가 아니라 여기까진 가지 않는다.
+      // 정리는 경계를 건너뛰지 않았어도, 이력 안에 진짜 턴 블록 모양이 있으면 거절한다
+      // (관측 107008·107120 — main 부터의 동작이고 이 PR 은 그대로 둔다).
+      // ⚠️ 임베딩·표시가 그 2행에서 이력을 걷는 것은 **미해결 비대칭**이다. "읽기라서 안전" 하거나
+      //    "닫는 태그가 하나라 항상 명확" 해서가 아니다 — 별도 검토 필요(본문 보존 + 임베딩 품질).
       if (historyHidesTurn(tail.slice(0, hist.bodyEnd), tail.slice(hist.bodyStart, hist.bodyEnd))) return null;
       turnStart = hist.turnStart;
     }
