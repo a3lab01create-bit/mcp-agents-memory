@@ -113,6 +113,43 @@ function locateBuzzContext(text: string): { rest: string; pos: number } | null {
   return CONTEXT_OPEN.test(rest.slice(pos, pos + 12)) ? { rest, pos } : null;
 }
 
+/**
+ * 이력 블록(<thread-context>/<conversation-context>) 경계 판정 — **세 자리가 같은 결정을 쓴다**
+ * (cleanBuzzEnvelope · buzzQuotedMessages · turnAfterContext). 따로 구현하면 "정리는 거절했는데
+ * 인용은 읽었다" 처럼 서로 다른 경계를 쓰는 비대칭이 생긴다.
+ *
+ *   none    이력 블록이 없다 (= `</context>` 뒤가 바로 이번 턴)
+ *   span    경계를 하나로 정했다
+ *   unknown 이력은 있는데 경계를 못 정했다 → 호출자는 **손대지 않는다**(원문 보존)
+ */
+type HistoryBoundary =
+  | { kind: "none" }
+  | { kind: "span"; bodyStart: number; bodyEnd: number; turnStart: number }
+  | { kind: "unknown" };
+
+function historyBoundary(tail: string): HistoryBoundary {
+  const history = HISTORY_OPEN.exec(tail);
+  if (!history) return { kind: "none" };
+  const closeTag = `</${history[1]}>`;
+  const bodyStart = history[0].length;
+  // 경계 후보 = **바로 뒤에 이번 턴 블록이 오는** 닫는 태그. 봉투 얘기를 하며 인용한 닫는 태그는
+  // 뒤에 사람 말이 이어지므로 걸리지 않는다 (그래서 그 자리를 건너뛴다).
+  //
+  // 실측(이력 있는 봉투 1,945행, 2026-11-01): 이 조건만으로 후보가 **전 행에서 정확히 1개**다.
+  // 경계가 기존(첫 닫는 태그)과 갈리는 행은 4행뿐 — 전부 봉투 태그를 본문에 인용해 보류됐던 행이다.
+  // 🔴 "줄 머리에 있는 닫는 태그"를 조건에 넣으면 안 된다: grok-cli 형식은 진짜 경계가 줄 중간
+  //    (`old</thread-context> <buzz-event …>`)이고 인용된 쪽이 줄 머리라, **엉뚱한 경계를 고른다**(검사 L).
+  // 🔴 코드펜스(```) 짝으로 거르는 것도 안 된다: 인용 본문의 펜스 짝이 안 맞는 32행에서 진짜 경계가
+  //    "펜스 안"으로 계산돼 **판별력 0에 32행 순손실**이었다.
+  // 후보가 여럿이면 **가장 이른 것**을 쓴다 — 이력을 더 남기는 쪽이고(모듈 정책: 이번 턴은 자르지 않는다),
+  // 기존 동작(첫 닫는 태그)에서 한 칸도 늦게 가지 않는다. 뒤에 숨은 진짜 턴 블록은 historyHidesTurn 이 잡는다.
+  for (let close = tail.indexOf(closeTag, bodyStart); close >= 0; close = tail.indexOf(closeTag, close + 1)) {
+    const turnStart = close + closeTag.length;
+    if (TURN_OPEN.test(tail.slice(turnStart))) return { kind: "span", bodyStart, bodyEnd: close, turnStart };
+  }
+  return { kind: "unknown" };
+}
+
 export function cleanBuzzEnvelope(message: string, opts: { baseless?: boolean } = {}): string | null {
   try {
     const text = message.trimStart();
@@ -130,16 +167,13 @@ export function cleanBuzzEnvelope(message: string, opts: { baseless?: boolean } 
     if (!hasBase && !(BUZZ_SCOPE.test(contextBody) && BUZZ_CHANNEL.test(contextBody))) return null;
     const tail = rest.slice(contextClose + CONTEXT_CLOSE.length);
 
+    // 경계는 historyBoundary 가 정한다 (세 자리가 같은 결정을 쓴다). 못 정하면 손대지 않는다.
+    const hist = historyBoundary(tail);
+    if (hist.kind === "unknown") return null;
     let turnStart = 0;
-    const history = HISTORY_OPEN.exec(tail);
-    if (history) {
-      // 이력의 첫 닫는 태그가 곧 경계이고, 그 바로 뒤에 이번 턴이 와야 한다.
-      // 아니면(이력 안 인용, 형식 변화) 애매하므로 손대지 않는다.
-      const closeTag = `</${history[1]}>`;
-      const close = tail.indexOf(closeTag, history[0].length);
-      if (close < 0) return null;
-      if (historyHidesTurn(tail.slice(0, close), tail.slice(history[0].length, close))) return null;
-      turnStart = close + closeTag.length;
+    if (hist.kind === "span") {
+      if (historyHidesTurn(tail.slice(0, hist.bodyEnd), tail.slice(hist.bodyStart, hist.bodyEnd))) return null;
+      turnStart = hist.turnStart;
     }
 
     if (TURN_IN_DROPPED.test(rest.slice(0, pos))) return null;
@@ -184,12 +218,10 @@ export function buzzQuotedMessages(message: string): BuzzQuote[] | null {
     const contextClose = rest.indexOf(CONTEXT_CLOSE, pos);
     if (contextClose < 0) return null;
     const tail = rest.slice(contextClose + CONTEXT_CLOSE.length);
-    const history = HISTORY_OPEN.exec(tail);
-    if (!history) return [];
-    const closeTag = `</${history[1]}>`;
-    const close = tail.indexOf(closeTag, history[0].length);
-    if (close < 0) return null;
-    return parseQuoteBody(tail.slice(history[0].length, close));
+    const hist = historyBoundary(tail);
+    if (hist.kind === "none") return [];
+    if (hist.kind === "unknown") return null;
+    return parseQuoteBody(tail.slice(hist.bodyStart, hist.bodyEnd));
   } catch {
     return null;
   }
@@ -261,12 +293,9 @@ const IDENTIFIER_ONLY =
  */
 function turnAfterContext(tail: string): string | null {
   if (TURN_OPEN.test(tail)) return tail;
-  const history = HISTORY_OPEN.exec(tail);
-  if (!history) return null;
-  const closeTag = `</${history[1]}>`;
-  const close = tail.indexOf(closeTag, history[0].length);
-  if (close < 0) return null;
-  const rest = tail.slice(close + closeTag.length);
+  const hist = historyBoundary(tail);
+  if (hist.kind !== "span") return null;
+  const rest = tail.slice(hist.turnStart);
   return TURN_OPEN.test(rest) ? rest : null;
 }
 

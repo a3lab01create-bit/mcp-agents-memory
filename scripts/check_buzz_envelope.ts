@@ -139,8 +139,57 @@ check("애매하면 손대지 않음 (null → 원문 저장)", () => {
   assert.equal(clean(BASE, CONTEXT, '<thread-context included="1">', "never closed", EVENT), null, "이력이 안 닫힘");
   assert.equal(clean(BASE, CONTEXT, '<thread-context included="1">', "old", "</thread-context>", "Note: x", EVENT),
     null, "이력과 이번 턴 사이에 모르는 글 (M)");
-  assert.equal(clean(BASE, CONTEXT, '<thread-context included="1">', "we quoted </thread-context> here", "</thread-context>", EVENT),
-    null, "이력 안에 닫는 태그가 인용됨 — 경계 애매");
+  // 이력 안에 닫는 태그가 인용된 경우는 더 이상 "애매"가 아니다 — 아래 (나) 블록으로 옮겼다.
+  // 인용된 닫는 태그는 뒤에 사람 말이 이어지므로 경계 후보가 아니다.
+});
+
+/** 실제 이력처럼 `[n] 이름 (hex) (시각): 본문` 머리를 단 인용 글 */
+const Q = (n: number, text: string) => `[${n}] Agent (${HEX}) (2026-10-04T13:00:0${n}Z): ${text}`;
+
+check("이력 안에 닫는 태그가 인용돼도 진짜 경계를 찾는다 (나) — 판별자는 '바로 뒤에 이번 턴'", () => {
+  // 실측 2026-11-01: 이력 있는 봉투 1,945행에서 이 조건만으로 후보가 전 행 정확히 1개.
+  // 경계가 기존(첫 닫는 태그)과 갈린 행은 4행 — 전부 봉투 태그를 본문에 인용해 보류됐던 행이다.
+  const H = (...body: string[]) => ['<thread-context included="1" total="1" truncated="false">', ...body, "</thread-context>"].join("\n");
+
+  // ⓐ 인용된 닫는 태그가 줄 중간 (관측 id 121273 모양)
+  let out = clean(BASE, CONTEXT, H("[1] Agent 가 `</thread-context>` 를 인용했다"), EVENT);
+  assert.ok(out !== null, "ⓐ 정리된다");
+  assert.ok(!out!.includes("인용했다"), "ⓐ 이력은 빠진다");
+  assert.ok(out!.includes("NEW-MESSAGE-SENTINEL"), "ⓐ 이번 턴은 남는다");
+
+  // ⓑ 인용된 닫는 태그가 줄 머리에 있고 뒤에 사람 말이 이어짐
+  out = clean(BASE, CONTEXT, H("[1] Agent:", "</thread-context> 이 줄이 경계로 잡히면 안 된다"), EVENT);
+  assert.ok(out !== null && !out.includes("경계로 잡히면") && out.includes("NEW-MESSAGE-SENTINEL"), "ⓑ 건너뛴다");
+
+  // ⓒ 코드펜스 안에 인용돼 있어도 같다 (펜스 짝으로 거르지 않는다 — 그러면 32행이 순손실)
+  out = clean(BASE, CONTEXT, H("[1] Agent:", "```", "</thread-context>", "```", "펜스 끝"), EVENT);
+  assert.ok(out !== null && !out.includes("펜스 끝") && out.includes("NEW-MESSAGE-SENTINEL"), "ⓒ 정리된다");
+
+  // ⓓ 후보가 여럿이면 가장 이른 것 — 진짜 경계가 줄 중간이고 인용된 쪽이 줄 머리인 grok 형식(검사 L)이
+  //    바로 그 모양이라, '줄 머리' 를 조건으로 넣으면 엉뚱한 경계를 고른다. 더 남기는 쪽으로 간다.
+  const twoCands = BASE + " " + CONTEXT + ' <thread-context included="1">\nold</thread-context> <buzz-event type="m">\n' +
+    "Content: REAL-HEAD\n</thread-context>\n<buzz-event>\nQUOTED-TAIL\n</buzz-event>";
+  out = cleanBuzzEnvelope(twoCands);
+  assert.ok(out !== null && out.includes("REAL-HEAD") && out.includes("QUOTED-TAIL") && !out.includes("old"),
+    "ⓓ 가장 이른 후보 = 진짜 경계");
+
+  // ⓔ CRLF 에서도 같다
+  out = cleanBuzzEnvelope([BASE, CONTEXT, H("[1] `</thread-context>` 인용"), EVENT].join("\n").replace(/\n/g, "\r\n"));
+  assert.ok(out !== null && !out.includes("인용") && out.includes("NEW-MESSAGE-SENTINEL"), "ⓔ CRLF");
+
+  // ⓕ 인용 확인과 정리가 **같은 경계**를 쓴다 (한쪽만 읽으면 '정리는 거절, 인용은 읽음' 비대칭이 생긴다)
+  const msg = [BASE, CONTEXT, H(Q(1, "`</thread-context>` 를 인용한 글")), EVENT].join("\n");
+  const quotes = buzzQuotedMessages(msg);
+  assert.ok(quotes !== null && quotes.length === 1, "ⓕ 인용 1건으로 읽힌다");
+  assert.ok(quotes![0].content.includes("</thread-context>"), "ⓕ 인용 본문에 그 태그가 그대로 있다");
+  assert.ok(cleanBuzzEnvelope(msg) !== null, "ⓕ 같은 입력을 정리도 받아들인다");
+
+  // ⓖ 여전히 거절해야 하는 것들 — 경계를 바꿨다고 이쪽이 뚫려선 안 된다
+  assert.equal(clean(BASE, CONTEXT, H("[1] Agent:", '<buzz-event type="m">'), EVENT), null,
+    "ⓖ 인용 속에 줄 전체가 턴 태그 (관측 id 107008·107120)");
+  assert.equal(clean(BASE, CONTEXT, '<thread-context included="1">', "old", "</thread-context>", "Note: x", EVENT), null,
+    "ⓖ 이력과 이번 턴 사이에 모르는 글 (M)");
+  assert.equal(clean(BASE, CONTEXT, '<thread-context included="1">', "never closed", EVENT), null, "ⓖ 이력이 안 닫힘");
 });
 
 check("망가진 봉투 + 새 말이 닫는 태그를 인용 → 자르지 않고 null (P1·P2·P6)", () => {
@@ -151,8 +200,6 @@ check("망가진 봉투 + 새 말이 닫는 태그를 인용 → 자르지 않�
     CONTEXT, EVENT), null, "설정 블록이 안 닫혀 이번 턴을 삼킴");
 });
 
-/** 실제 이력처럼 `[n] 이름 (hex) (시각): 본문` 머리를 단 인용 글 */
-const Q = (n: number, text: string) => `[${n}] Agent (${HEX}) (2026-10-04T13:00:0${n}Z): ${text}`;
 const withBase = (...p: string[]) => clean(BASE, PREAMBLE, ...p);
 
 check("인용 글이 봉투 태그를 언급해도 정리 — 진짜 블록 모양이 아니면 언급 (Q1)", () => {
@@ -361,7 +408,9 @@ check("venue: 세션 첫 user 턴으로 자리 가르기", () => {
 
 check("venue: 정리가 거절한 봉투도 자기 채널을 읽고, 못 읽으면 앞 턴을 물려받지 않음", () => {
   const other = CONTEXT.replace("DevRoom", "OtherRoom");
-  const rejected = [BASE, PREAMBLE, other, '<thread-context included="1">', "quoted </thread-context> here", "</thread-context>", EVENT].join("\n");
+  // 거절되는 봉투를 하나 만들어 쓴다 — 이 검사의 주제는 '거절' 이 아니라 '거절돼도 채널은 읽힌다' 다.
+  // 옛 재료(인용된 닫는 태그)는 이제 정리된다((나) 블록) → 아직 거절되는 (M) 모양으로 바꿨다.
+  const rejected = [BASE, PREAMBLE, other, '<thread-context included="1">', "old", "</thread-context>", "Note: x", EVENT].join("\n");
   assert.equal(cleanBuzzEnvelope(rejected), null, "정리기는 거절");
   assert.equal(buzzTurnVenue(rejected), "buzz:OtherRoom", "채널은 읽음");
   assert.equal(buzzTurnVenue(BASE + "\n<unknown-block>\nZ\n</unknown-block>\n" + EVENT), "buzz", "봉투인데 방 정보를 못 찾음 → buzz");
