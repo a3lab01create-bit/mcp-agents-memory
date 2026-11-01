@@ -31,6 +31,8 @@
  * 봉투는 앞에서부터 순서대로 읽는다. 기대한 자리에 기대한 블록이 없거나 이력
  * 경계가 애매하면 null → 호출자는 원본을 그대로 저장한다. 이력 안에 닫는
  * 태그가 인용된 경우엔 null이거나 이력을 조금 더 남길 뿐, 이번 턴은 자르지 않는다.
+ * **이 보존 조건은 정리(cleanBuzzEnvelope)뿐 아니라 인용 읽기·임베딩·표시 전부에서 성립해야 한다**
+ * — 그래서 경계와 안전성을 historyBoundary 한 곳에서 같이 판정한다.
  * 봉투가 망가져 버릴 구간에 이번 턴 블록이 섞여 보이면 역시 null. 단 이력 구간에서는
  * 인용 글 본문 속 언급(봉투 얘기를 하며 붙여 넣은 `<buzz-event …>` 등)은 블록으로 보지 않는다
  * — historyHidesTurn.
@@ -113,6 +115,58 @@ function locateBuzzContext(text: string): { rest: string; pos: number } | null {
   return CONTEXT_OPEN.test(rest.slice(pos, pos + 12)) ? { rest, pos } : null;
 }
 
+/**
+ * 이력 블록(<thread-context>/<conversation-context>) 경계 판정 — **세 자리가 같은 결정을 쓴다**
+ * (cleanBuzzEnvelope · buzzQuotedMessages · turnAfterContext). 따로 구현하면 "정리는 거절했는데
+ * 인용은 읽었다" 처럼 서로 다른 경계를 쓰는 비대칭이 생긴다.
+ *
+ *   none    이력 블록이 없다 (= `</context>` 뒤가 바로 이번 턴)
+ *   span    경계를 하나로 정했다
+ *   unknown 이력은 있는데 경계를 못 정했다 → 호출자는 **손대지 않는다**(원문 보존)
+ */
+type HistoryBoundary =
+  | { kind: "none" }
+  | { kind: "span"; bodyStart: number; bodyEnd: number; turnStart: number }
+  | { kind: "unknown" };
+
+function historyBoundary(tail: string): HistoryBoundary {
+  const history = HISTORY_OPEN.exec(tail);
+  if (!history) return { kind: "none" };
+  const closeTag = `</${history[1]}>`;
+  const bodyStart = history[0].length;
+  // 경계 후보 = **바로 뒤에 이번 턴 블록이 오는** 닫는 태그. 봉투 얘기를 하며 인용한 닫는 태그는
+  // 뒤에 사람 말이 이어지므로 걸리지 않는다 (그래서 그 자리를 건너뛴다).
+  //
+  // 실측(이력 있는 봉투 1,945행, 2026-11-01): 이 조건만으로 후보가 **전 행에서 정확히 1개**다.
+  // 경계가 기존(첫 닫는 태그)과 갈리는 행은 4행뿐 — 전부 봉투 태그를 본문에 인용해 보류됐던 행이다.
+  // 🔴 "줄 머리에 있는 닫는 태그"를 조건에 넣으면 안 된다: grok-cli 형식은 진짜 경계가 줄 중간
+  //    (`old</thread-context> <buzz-event …>`)이고 인용된 쪽이 줄 머리라, **엉뚱한 경계를 고른다**(검사 L).
+  // 🔴 코드펜스(```) 짝으로 거르는 것도 안 된다: 인용 본문의 펜스 짝이 안 맞는 32행에서 진짜 경계가
+  //    "펜스 안"으로 계산돼 **판별력 0에 32행 순손실**이었다.
+  // **적합 후보 중 가장 이른 것**을 쓴다 — 이력을 더 남기는 쪽이다. 인용된 닫는 태그를 건너뛰면
+  // 경계는 기존 동작(첫 닫는 태그)보다 **뒤로 간다** → 버릴 구간이 커진다. 그 건너뛴 구간에 진짜 턴
+  // 블록이 들어오면 이번 턴을 자르게 되므로, **건너뛴 경우에만** 안전성을 따로 본다(movedPast).
+  // 🔴 그 판정은 **여기(경계 판정) 안에** 있어야 한다 — 소비 경로마다 따로 걸면 한 곳이 빠진다.
+  //    실제로 turnAfterContext 엔 가드가 없어서, 정리는 거절하는 입력에서 **임베딩만 본문을 잘랐다**
+  //    (임베딩 입력 350자 → 11자. 검사 "경계를 뒤로 옮길 때 … 임베딩·표시도 본문을 지킨다").
+  // 🔴 반대로 **건너뛰지 않은 행에까지** 이 가드를 걸면 안 된다 — 경계가 main 과 같은데도 임베딩이
+  //    봉투째가 된다(실측 107008·107120: 4,820B → 53,191B). 이 PR 이 만들지 않은 위험까지 떠안는 것이다.
+  //    그 2행은 cleanBuzzEnvelope 가 자기 가드로 계속 거절한다(main 과 같다).
+  //    🔴 이 범위 제한의 근거는 "읽기 경로는 안전하다"가 **아니다** — 읽기 경로도 자른다(위의 임베딩 사례).
+  //    근거는 "이 변경이 **새로 만든** 위험(경계를 뒤로 옮기는 것)에만 가드를 건다" 하나다.
+  for (let close = tail.indexOf(closeTag, bodyStart), movedPast = false;
+       close >= 0;
+       close = tail.indexOf(closeTag, close + 1), movedPast = true) {
+    const turnStart = close + closeTag.length;
+    if (!TURN_OPEN.test(tail.slice(turnStart))) continue;
+    if (movedPast && historyHidesTurn(tail.slice(0, close), tail.slice(bodyStart, close))) {
+      return { kind: "unknown" };
+    }
+    return { kind: "span", bodyStart, bodyEnd: close, turnStart };
+  }
+  return { kind: "unknown" };
+}
+
 export function cleanBuzzEnvelope(message: string, opts: { baseless?: boolean } = {}): string | null {
   try {
     const text = message.trimStart();
@@ -130,16 +184,17 @@ export function cleanBuzzEnvelope(message: string, opts: { baseless?: boolean } 
     if (!hasBase && !(BUZZ_SCOPE.test(contextBody) && BUZZ_CHANNEL.test(contextBody))) return null;
     const tail = rest.slice(contextClose + CONTEXT_CLOSE.length);
 
+    // 경계는 historyBoundary 가 정한다 (세 자리가 같은 결정을 쓴다 — 건너뛴 경우의 안전성까지 그 안에서).
+    const hist = historyBoundary(tail);
+    if (hist.kind === "unknown") return null;
     let turnStart = 0;
-    const history = HISTORY_OPEN.exec(tail);
-    if (history) {
-      // 이력의 첫 닫는 태그가 곧 경계이고, 그 바로 뒤에 이번 턴이 와야 한다.
-      // 아니면(이력 안 인용, 형식 변화) 애매하므로 손대지 않는다.
-      const closeTag = `</${history[1]}>`;
-      const close = tail.indexOf(closeTag, history[0].length);
-      if (close < 0) return null;
-      if (historyHidesTurn(tail.slice(0, close), tail.slice(history[0].length, close))) return null;
-      turnStart = close + closeTag.length;
+    if (hist.kind === "span") {
+      // 정리는 경계를 건너뛰지 않았어도, 이력 안에 진짜 턴 블록 모양이 있으면 거절한다
+      // (관측 107008·107120 — main 부터의 동작이고 이 PR 은 그대로 둔다).
+      // ⚠️ 임베딩·표시가 그 2행에서 이력을 걷는 것은 **미해결 비대칭**이다. "읽기라서 안전" 하거나
+      //    "닫는 태그가 하나라 항상 명확" 해서가 아니다 — 별도 검토 필요(본문 보존 + 임베딩 품질).
+      if (historyHidesTurn(tail.slice(0, hist.bodyEnd), tail.slice(hist.bodyStart, hist.bodyEnd))) return null;
+      turnStart = hist.turnStart;
     }
 
     if (TURN_IN_DROPPED.test(rest.slice(0, pos))) return null;
@@ -184,12 +239,10 @@ export function buzzQuotedMessages(message: string): BuzzQuote[] | null {
     const contextClose = rest.indexOf(CONTEXT_CLOSE, pos);
     if (contextClose < 0) return null;
     const tail = rest.slice(contextClose + CONTEXT_CLOSE.length);
-    const history = HISTORY_OPEN.exec(tail);
-    if (!history) return [];
-    const closeTag = `</${history[1]}>`;
-    const close = tail.indexOf(closeTag, history[0].length);
-    if (close < 0) return null;
-    return parseQuoteBody(tail.slice(history[0].length, close));
+    const hist = historyBoundary(tail);
+    if (hist.kind === "none") return [];
+    if (hist.kind === "unknown") return null;
+    return parseQuoteBody(tail.slice(hist.bodyStart, hist.bodyEnd));
   } catch {
     return null;
   }
@@ -261,12 +314,9 @@ const IDENTIFIER_ONLY =
  */
 function turnAfterContext(tail: string): string | null {
   if (TURN_OPEN.test(tail)) return tail;
-  const history = HISTORY_OPEN.exec(tail);
-  if (!history) return null;
-  const closeTag = `</${history[1]}>`;
-  const close = tail.indexOf(closeTag, history[0].length);
-  if (close < 0) return null;
-  const rest = tail.slice(close + closeTag.length);
+  const hist = historyBoundary(tail);
+  if (hist.kind !== "span") return null;
+  const rest = tail.slice(hist.turnStart);
   return TURN_OPEN.test(rest) ? rest : null;
 }
 
