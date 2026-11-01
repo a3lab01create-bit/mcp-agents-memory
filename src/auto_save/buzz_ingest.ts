@@ -105,11 +105,23 @@ export interface BuzzIngestReport {
   envelopesStuck: number;
   /** envelopesStuck을 사유별로 (합 = envelopesStuck) */
   envelopesStuckBy: StuckBreakdown;
+  /**
+   * 막힌 행의 id·사유 (최대 20건).
+   * 🔴 이게 없으면 알림이 "N건 막혔다"만 말하고 **어느 행인지 알 수 없다** — 2026-11-01 에
+   *    shape 3건 중 1건만 겨우 특정했고 나머지 2건은 집지 못했다. 집계와 식별을 같이 낸다.
+   */
+  envelopesStuckRows: StuckRow[];
   /** --dry-run 때만: 아직 가져오지 않는 종류의 글 수 (최신 한 쪽 기준). */
   unsupported?: number;
 }
 
 /** 못 정리한 봉투의 사유. 한 봉투는 하나로만 센다 (앞의 것 우선). */
+/** 막힌 행 하나 — 어느 행이 왜 막혔는지 (감시 알림에서 바로 집을 수 있게) */
+export interface StuckRow {
+  id: number;
+  why: "shape" | "noRow" | "textDiffers";
+}
+
 export interface StuckBreakdown {
   /** 모양을 못 읽음 (정리기 거절·인용 줄·자리·시각, 본문이 다른 인용에 다음 번호 줄이 붙음) — 늘면 버즈 형식이 바뀐 신호, 고치면 풀린다 */
   shape: number;
@@ -488,11 +500,15 @@ async function healBaseEnvelopes(
  * 못 정리한 봉투는 사유별로 센다 — 늘어도 괜찮은 것(noRow·textDiffers)과 고쳐야 풀리는 것(shape)이
  * 한 숫자에 섞이지 않게.
  */
-async function recleanEnvelopes(
+/**
+ * 봉투 재정리. **검사에서 직접 태우기 위해 export 한다** — `runBuzzIngest` 는
+ * `BUZZ_INGEST_OWNER` 와 릴레이 접속을 요구해서 단위 검사에 쓸 수 없다.
+ */
+export async function recleanEnvelopes(
   userId: number,
   budget: number,
   dryRun: boolean
-): Promise<{ recleaned: number; ready: number; stuck: number; by: StuckBreakdown }> {
+): Promise<{ recleaned: number; ready: number; stuck: number; by: StuckBreakdown; stuckRows: StuckRow[] }> {
   const rows = (await db.query(
     `SELECT id, message, venue, raw_message FROM memory
       WHERE user_id = $1 AND role = 'user' AND message LIKE '<context>%'
@@ -509,6 +525,10 @@ async function recleanEnvelopes(
   const cands: Cand[] = [];
   // 버즈 봉투인데 걷어낼 이력이 있고(또는 모양을 몰라) 이번 단계로는 못 정리하는 것
   const by: StuckBreakdown = { shape: 0, noRow: 0, textDiffers: 0 };
+  const stuckRows: StuckRow[] = [];
+  const noteStuck = (id: number, why: StuckRow["why"]) => {
+    if (stuckRows.length < 20) stuckRows.push({ id, why });
+  };
   for (const r of rows) {
     const cleaned = cleanBuzzEnvelope(r.message, { baseless: true });
     const quotes = buzzQuotedMessages(r.message);
@@ -527,7 +547,7 @@ async function recleanEnvelopes(
       [r.venue, venueFromBuzzMessage(r.message)].find((v): v is string => typeof v === "string" && v.startsWith("buzz")) ?? null;
     const q = (quotes ?? []).map((x) => ({ ms: Date.parse(x.time), text: norm(x.content) }));
     if (cleaned === null || quotes === null || !venue || q.some((x) => !Number.isFinite(x.ms))) {
-      if (venue || looksLikeBuzzTurn(r.message)) by.shape++;
+      if (venue || looksLikeBuzzTurn(r.message)) { by.shape++; noteStuck(Number(r.id), "shape"); }
       continue;
     }
     const misread = quotes.some((x, i) => x.content.split("\n").some((line) => line.startsWith(`[${i + 2}] `)));
@@ -552,15 +572,15 @@ async function recleanEnvelopes(
   const ready: Cand[] = [];
   for (const c of cands) {
     if (c.quotes.every((x) => have.has(`${c.venue}\0${x.ms}\0${x.text}`))) ready.push(c);
-    else if (c.quotes.some((x) => !slots.has(`${c.venue}\0${x.ms}`))) by.noRow++;
-    else if (c.misread) by.shape++; // 본문이 다른 게 수정 때문이 아니라 머리를 못 읽어서일 수 있다
-    else by.textDiffers++;
+    else if (c.quotes.some((x) => !slots.has(`${c.venue}\0${x.ms}`))) { by.noRow++; noteStuck(c.id, "noRow"); }
+    else if (c.misread) { by.shape++; noteStuck(c.id, "shape"); } // 머리를 못 읽어서일 수 있다
+    else { by.textDiffers++; noteStuck(c.id, "textDiffers"); }
   }
   let n = 0;
   for (const c of ready.slice(0, Math.max(0, budget))) {
     if (dryRun || (await replaceWithCleaned(c.id, c.cleaned, c.message, c.venue, c.priorRaw))) n++;
   }
-  return { recleaned: n, ready: ready.length - n, stuck: by.shape + by.noRow + by.textDiffers, by };
+  return { recleaned: n, ready: ready.length - n, stuck: by.shape + by.noRow + by.textDiffers, by, stuckRows };
 }
 
 export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzIngestReport> {
@@ -614,6 +634,7 @@ export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzI
     envelopesReady: 0,
     envelopesStuck: 0,
     envelopesStuckBy: { shape: 0, noRow: 0, textDiffers: 0 },
+    envelopesStuckRows: [],
     byVenue: {},
     ...(dryRun ? { unsupported } : {}),
   };
@@ -662,6 +683,7 @@ export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzI
     report.envelopesReady = env.ready;
     report.envelopesStuck = env.stuck;
     report.envelopesStuckBy = env.by;
+    report.envelopesStuckRows = env.stuckRows;
   }
   return report;
 }
