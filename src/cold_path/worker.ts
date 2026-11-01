@@ -311,9 +311,31 @@ async function releaseColdPathLock(): Promise<void> {
   try { c.release(); } catch {}
 }
 
+/**
+ * 콜드패스를 돌릴지 — **명시적으로 켠 기기에서만 돈다(opt-in)**.
+ *
+ * 🔴 전에는 `=== 'false'` 비교라서 **키가 없으면 돌았다**(opt-out). 메모리 DB 는 몰타르에만 있고
+ *    콜드패스는 그 DB + 로컬 GPU(llama-server)가 있는 기기에서만 의미가 있는데, npm 배포판이 함께
+ *    보내는 `.env.example` 에 이 키가 없어서 **받는 기기마다 켜진 상태로 깔렸다**(실측: 연탄맥의
+ *    설치본·`.claude.json`·`config.toml` 어디에도 키가 없다 = 켜짐). 최근 30일에 같은 DB 를 쓰는
+ *    기기가 다섯이라 advisory lock 도 공유한다 — 몰타르 데몬이 락을 놓는 순간(재부팅·재기동)
+ *    GPU 없는 기기가 락을 잡으면 태깅이 실패하고 몰타르 데몬은 락을 못 잡는다.
+ *    사고가 없었던 건 설계가 맞아서가 아니라 **락이 막아준 것**이다(cold_error 전 기간 0건).
+ *
+ * 전용 데몬(`coldpath` 서브커맨드)은 index.ts 에서 이 값을 "true" 로 덮고 나서 부르므로 그대로 돈다.
+ * 대소문자·앞뒤 공백은 흡수한다 — 켜야 하는 그 한 대에서 `TRUE` 라고 써서 **조용히 꺼지는** 쪽이
+ * 더 위험하다.
+ */
+export function coldPathEnabled(value: string | undefined): boolean {
+  return (value ?? "").trim().toLowerCase() === "true";
+}
+
 export async function startColdPathWorker(): Promise<void> {
-  if (process.env.COLD_PATH_ENABLED === 'false') {
-    console.error("🔵 [ColdPath] disabled (COLD_PATH_ENABLED=false)");
+  if (!coldPathEnabled(process.env.COLD_PATH_ENABLED)) {
+    console.error(
+      `🔵 [ColdPath] disabled — COLD_PATH_ENABLED=${process.env.COLD_PATH_ENABLED ?? "(unset)"}. ` +
+        `메모리 DB·GPU 가 있는 기기에서만 "true" 로 켠다 (전용 데몬은 내부에서 켠다).`,
+    );
     return;
   }
 
