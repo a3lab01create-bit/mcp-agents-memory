@@ -105,8 +105,10 @@ export interface BuzzIngestReport {
   envelopesStuck: number;
   /** envelopesStuck을 사유별로 (합 = envelopesStuck) */
   envelopesStuckBy: StuckBreakdown;
+  /** 사유별로 표본에서 생략된 건수 (합 + envelopesStuckRows.length = envelopesStuck) */
+  envelopesStuckOmitted: Record<StuckRow["why"], number>;
   /**
-   * 막힌 행의 id·사유 (최대 20건).
+   * 막힌 행의 id·사유 (사유별 최대 8건 표본).
    * 🔴 이게 없으면 알림이 "N건 막혔다"만 말하고 **어느 행인지 알 수 없다** — 2026-11-01 에
    *    shape 3건 중 1건만 겨우 특정했고 나머지 2건은 집지 못했다. 집계와 식별을 같이 낸다.
    */
@@ -508,7 +510,10 @@ export async function recleanEnvelopes(
   userId: number,
   budget: number,
   dryRun: boolean
-): Promise<{ recleaned: number; ready: number; stuck: number; by: StuckBreakdown; stuckRows: StuckRow[] }> {
+): Promise<{
+  recleaned: number; ready: number; stuck: number; by: StuckBreakdown;
+  stuckRows: StuckRow[]; stuckOmitted: Record<StuckRow["why"], number>;
+}> {
   const rows = (await db.query(
     `SELECT id, message, venue, raw_message FROM memory
       WHERE user_id = $1 AND role = 'user' AND message LIKE '<context>%'
@@ -526,8 +531,13 @@ export async function recleanEnvelopes(
   // 버즈 봉투인데 걷어낼 이력이 있고(또는 모양을 몰라) 이번 단계로는 못 정리하는 것
   const by: StuckBreakdown = { shape: 0, noRow: 0, textDiffers: 0 };
   const stuckRows: StuckRow[] = [];
+  const stuckOmitted: Record<StuckRow["why"], number> = { shape: 0, noRow: 0, textDiffers: 0 };
+  // 🔴 전체 상한이면 **먼저 도는 루프의 사유가 자리를 다 먹는다** (shape 가 첫 루프,
+  //    noRow·textDiffers 는 뒤 루프). 사유별로 따로 담고 생략 수를 함께 낸다.
+  const PER_REASON_CAP = 8;
   const noteStuck = (id: number, why: StuckRow["why"]) => {
-    if (stuckRows.length < 20) stuckRows.push({ id, why });
+    if (stuckRows.filter((r) => r.why === why).length < PER_REASON_CAP) stuckRows.push({ id, why });
+    else stuckOmitted[why]++;
   };
   for (const r of rows) {
     const cleaned = cleanBuzzEnvelope(r.message, { baseless: true });
@@ -580,7 +590,8 @@ export async function recleanEnvelopes(
   for (const c of ready.slice(0, Math.max(0, budget))) {
     if (dryRun || (await replaceWithCleaned(c.id, c.cleaned, c.message, c.venue, c.priorRaw))) n++;
   }
-  return { recleaned: n, ready: ready.length - n, stuck: by.shape + by.noRow + by.textDiffers, by, stuckRows };
+  return { recleaned: n, ready: ready.length - n, stuck: by.shape + by.noRow + by.textDiffers,
+    by, stuckRows, stuckOmitted };
 }
 
 export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzIngestReport> {
@@ -635,6 +646,7 @@ export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzI
     envelopesStuck: 0,
     envelopesStuckBy: { shape: 0, noRow: 0, textDiffers: 0 },
     envelopesStuckRows: [],
+    envelopesStuckOmitted: { shape: 0, noRow: 0, textDiffers: 0 },
     byVenue: {},
     ...(dryRun ? { unsupported } : {}),
   };
@@ -684,6 +696,7 @@ export async function runBuzzIngest(opts: BuzzIngestOptions = {}): Promise<BuzzI
     report.envelopesStuck = env.stuck;
     report.envelopesStuckBy = env.by;
     report.envelopesStuckRows = env.stuckRows;
+    report.envelopesStuckOmitted = env.stuckOmitted;
   }
   return report;
 }
