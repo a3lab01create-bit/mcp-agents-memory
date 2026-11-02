@@ -231,6 +231,22 @@ function* walkRollouts(root: string): Generator<string> {
   }
 }
 
+/**
+ * 검사용: arm 된 rollout 들의 (파일명, platform, model) 요약. **운영 코드는 쓰지 않는다.**
+ *
+ * 왜 필요한가: arm 자리가 **둘**이다(서버 시작 스냅샷 · flush 루프의 신규 발견). 2026-11-02 에
+ * 모델 씨앗을 한 자리만 채우고 "고쳤다"고 했는데, 실제 보고된 사례는 **못 고친 자리**였다.
+ * 소스 그 자리를 직접 태워서 보지 않으면 그 종류의 누락이 조용히 남는다.
+ */
+export function armedStatesForTest(): Array<{ file: string; platform: string; model: string | null }> {
+  if (!_state) return [];
+  return [..._state.files.entries()].map(([file, st]) => ({
+    file: path.basename(file),
+    platform: st.agentPlatform,
+    model: st.currentModel,
+  }));
+}
+
 export function captureSessionStart(_cwd: string): void {
   const rootExists = fs.existsSync(SESSIONS_ROOT);
   _state = {
@@ -250,11 +266,18 @@ export function captureSessionStart(_cwd: string): void {
     const sessionId = extractSessionId(path.basename(filePath));
     if (!sessionId) continue;
 
+    // 🔴 arm 자리가 **둘**이다 — 여기(서버 시작 스냅샷)와 flush 루프의 신규 발견.
+    //    모델 씨앗을 한 자리만 채우면 **이 자리가 만드는 `unknown` 은 그대로 남는다.**
+    //    그리고 실제 보고된 사례가 이쪽이었다: 데스크톱 앱은 rollout 을 먼저 쓰고 MCP 서버를
+    //    나중에 띄우므로, 서버 시작 시점에 그 파일이 **이미 존재**해 여기서 cursor=size 로 잡힌다
+    //    (맥스튜디오 실측: turn_context 는 10번째 줄, 캡처 시작은 byte 179,436).
+    //    CLI 는 세션 파일이 서버 시작 뒤에 생겨 flush 루프에서 cursor=0 으로 잡히고 그 줄을 읽는다.
+    const thread = lookupThread(sessionId);
     _state.files.set(filePath, {
       cursorBytes: stat.size,
       sessionId,
-      agentPlatform: lookupPlatform(sessionId),
-      currentModel: null,
+      agentPlatform: thread.platform,
+      currentModel: thread.model,
       parseState: { mirrors: [] },
     });
     count++;
