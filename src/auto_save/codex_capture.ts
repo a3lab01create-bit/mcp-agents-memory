@@ -102,37 +102,67 @@ function sqliteSync(): any | null {
 }
 
 /** sessionId로 state_5.sqlite 조회 → platform string. 실패 시 default. */
-export function lookupPlatform(sessionId: string): string {
+/** state_5.sqlite 의 threads 한 행에서 읽는 것들. 못 읽으면 platform=default · model=null. */
+export interface ThreadInfo {
+  platform: string;
+  /** `threads.model` — rollout 의 turn_context 를 못 봤을 때 쓰는 모델 출처 (없으면 null). */
+  model: string | null;
+}
+
+/**
+ * sessionId → threads 한 행(platform·model). **한 번 열고 한 번 쿼리한다.**
+ *
+ * `model` 을 같이 읽는 이유: 모델은 rollout 의 `turn_context.payload.model` 에만 있고
+ * (`session_meta` 엔 없다) 그 줄은 **파일 맨 앞(관측: 10번째 줄)에 한 번 나온 뒤 설정이 바뀔 때만**
+ * 다시 나온다. 그런데 캡처는 서버 시작 전부터 있던 rollout 의 앞부분을 건너뛰므로(bulk dump 방지),
+ * **그 줄을 못 보고 모델이 `unknown` 이 된다.**
+ * 실측 2026-11-02 맥스튜디오: 데스크톱 앱 세션의 turn_context 는 10번째 줄에 있는데 캡처는
+ * byte 179,436 부터 읽기 시작해 그 줄을 지나쳤고, assistant 행이 `unknown` 으로 들어갔다.
+ * `threads.model` 은 최근 12세션에서 rollout 의 마지막 turn_context.model 과 **12/12 일치**했다
+ * (turn_context 가 8개인 세션 포함) ⇒ 폴백 출처로 쓸 수 있다.
+ * 🔴 다만 **턴별 정확도는 turn_context 가 더 높다**(세션 중간에 모델을 바꾸면 threads.model 은
+ *    마지막 값 하나다) → turn_context 를 보면 그 값으로 **덮는다**. 여기 값은 어디까지나 씨앗이다.
+ */
+export function lookupThread(sessionId: string): ThreadInfo {
+  const fallback: ThreadInfo = { platform: "codex-mcp-client", model: null };
   const DatabaseSync = sqliteSync();
-  if (!DatabaseSync) return "codex-mcp-client";
+  if (!DatabaseSync) return fallback;
   let db: any = null;
   try {
     db = new DatabaseSync(stateDbPath(), { readOnly: true });
-    // 구형 DB 에는 `originator` 칸이 없다 → 있을 때만 읽는다 (없으면 source 만)
+    // 구형 DB 에는 `originator`·`model` 칸이 없다 → 있을 때만 읽는다.
+    // 컬럼 이름은 **리터럴만** 넣는다 (PRAGMA 결과를 그대로 SQL 에 붙이지 않는다).
     const cols = new Set<string>(
       db.prepare("PRAGMA table_info(threads)").all().map((c: any) => String(c.name)),
     );
-    const hasOriginator = cols.has("originator");
+    const select = [
+      "source",
+      cols.has("originator") ? "originator" : "NULL AS originator",
+      cols.has("model") ? "model" : "NULL AS model",
+    ].join(", ");
     const row: any = db
-      .prepare(
-        hasOriginator
-          ? "SELECT source, originator FROM threads WHERE id = ? LIMIT 1"
-          : "SELECT source FROM threads WHERE id = ? LIMIT 1",
-      )
+      .prepare(`SELECT ${select} FROM threads WHERE id = ? LIMIT 1`)
       .get(sessionId);
-    if (!row) return "codex-mcp-client";
-    if (hasOriginator && typeof row.originator === "string") {
+    if (!row) return fallback;
+    const model =
+      typeof row.model === "string" && row.model.trim() ? row.model.trim() : null;
+    if (typeof row.originator === "string") {
       const byOriginator = originatorToPlatform(row.originator);
-      if (byOriginator) return byOriginator;
+      if (byOriginator) return { platform: byOriginator, model };
     }
     const source = typeof row.source === "string" ? row.source.trim() : "";
-    if (source) return sourceToPlatform(source);
+    if (source) return { platform: sourceToPlatform(source), model };
+    return { platform: fallback.platform, model };
   } catch {
-    // DB 없음·잠김·스키마 변경 → 라벨만 포기하고 **캡처는 계속한다**
+    // DB 없음·잠김·스키마 변경 → 라벨·모델만 포기하고 **캡처는 계속한다**
   } finally {
     try { db?.close(); } catch {}
   }
-  return "codex-mcp-client";
+  return fallback;
+}
+
+export function lookupPlatform(sessionId: string): string {
+  return lookupThread(sessionId).platform;
 }
 
 interface FileState {
@@ -558,11 +588,15 @@ async function flushAllFiles(): Promise<{ inserted: number; skipped: number; ded
         console.error(`📝 [Codex] new rollout detected: ${path.basename(filePath)}`);
       }
 
+      // 🔴 한 번만 열어 platform·model 을 같이 읽는다. model 을 씨앗으로 넣어야, 앞부분을
+      //    건너뛴 rollout(= turn_context 를 못 본 경우)에서 assistant 행이 `unknown` 이 되지 않는다.
+      //    뒤에 turn_context 를 만나면 그 값으로 덮으므로 턴별 정확도는 유지된다.
+      const thread = lookupThread(sessionId);
       fileState = {
         cursorBytes: initialCursor,
         sessionId,
-        agentPlatform: lookupPlatform(sessionId),
-        currentModel: null,
+        agentPlatform: thread.platform,
+        currentModel: thread.model,
         parseState: { mirrors: [] },
       };
       _state.files.set(filePath, fileState);
