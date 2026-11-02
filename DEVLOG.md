@@ -773,3 +773,51 @@ codex/gemini에 이어 **Grok Build·Antigravity** passive capture 추가 → �
 🔴 **콜드패스 유닛의 `Restart=` 는 그 프로그램의 종료 코드 설계를 읽고 정한다.** 다른 데몬 관례대로
 `always` 로 깔았는데, 이 데몬은 락을 못 잡으면 **exit 0 으로 끝낸다**(코드 주석에 그 전제가 있다) →
 `always` 면 30초마다 영원히 재기동한다. `on-failure` 로 교정.
+
+## §28. codex 모델 라벨 `unknown` — arm 자리가 둘이었다 🟢 PR #33·#34 (2026-11-02~03, 머지·배포·릴리스 완료)
+
+형 보고: "cli 에서는 모델이 잘 나타나는데 codex desktop 에서는 모델이 unknown 으루 나와".
+
+### 숫자 두 개가 맞물려 원인이 확정됐다
+```
+turn_context    10번째 줄        ← 형이 맥스튜디오에서 직접 확인
+캡처 시작 지점   byte 179,436     ← 121818 의 external_uuid 가 그 오프셋을 들고 있다
+```
+모델은 `turn_context.payload.model` **한 곳에만** 있다(`session_meta` 에는 없다). 그 줄은 파일 맨 앞에
+한 번 나오고 설정이 바뀔 때만 다시 나온다. 데스크톱 앱은 설명서·도구 스키마로 앞부분 ~179KB 를 먼저
+쓰고 MCP 서버를 나중에 띄우므로, "이미 있던 파일은 앞부분 건너뛴다"(bulk dump 방지) 규칙에 걸려 그
+줄을 지나친다. **CLI 는 세션 파일이 서버 기동 뒤에 생겨 cursor=0 으로 읽는다** — 즉 차이는 코드 분기가
+아니라 **파일 생성 순서**였다.
+
+🔴 **플랫폼별로 증상이 갈리면 코드 분기보다 '시점'을 먼저 의심하라.**
+
+### 폴백 출처를 쓰기 전에 신뢰도를 쟀다
+`state_5.sqlite` 의 `threads.model` — 0.9.31 이 라벨을 읽는 **그 행**에 이미 있었다.
+최근 12세션에서 rollout 의 마지막 `turn_context.model` 과 **12/12 일치**(turn_context 8개 세션 포함).
+⇒ 씨앗으로 채우고, `turn_context` 를 만나면 **그 값으로 덮는다**(중간에 모델을 바꾸면 threads.model 은
+마지막 값 하나라 턴별 정확도가 낮다). 쿼리 수는 그대로 — 같은 행을 이미 읽고 있었다.
+
+### 🔴 그런데 arm 자리가 둘이고, 첫 수정은 **이미 되던 쪽만** 고쳤다
+```
+captureSessionStart 스냅샷(:253)   서버 시작 시점에 이미 있던 rollout · cursor=size  ← 데스크톱
+flush 루프 신규 발견(:599)          서버 시작 뒤 생긴 rollout · cursor=0            ← CLI
+```
+#33 은 뒤쪽만 고쳤다. **보고된 증상은 그대로 남는 수정이었다.** 배포 **전에**
+`grep -c 'currentModel: null'` 이 0 이 아니라 **1** 인 걸 보고 찾아 #34 로 메웠다.
+⇒ **같은 종류의 상태를 만드는 자리가 N개면 읽은 것도 N개인지 세라**(§26 계열 재발). 처치 뒤
+**"남은 자리 수"를 세는 grep** 을 한 번 돌리는 것으로 잡힌다.
+
+### 검사를 추론이 아니라 실행으로
+`check:codex-arm` — 임시 `CODEX_HOME` + rollout + `state_5.sqlite` 로 **실제 `captureSessionStart`**
+를 돌린다(Postgres 는 안 건드린다). 음성대조로 스냅샷 자리를 #33 상태로 되돌리면 FAIL 하는 것까지 확인.
+- 🔴 `SESSIONS_ROOT` 는 **로드 시점 고정**, `stateDbPath()` 는 **호출 시점** — 검사에서 CODEX_HOME 을
+  바꿀 때 전자는 import 전에 세팅해야 한다. 이 전제도 같은 검사에서 확인한다.
+- 🔴 `captureSessionStart` 는 재귀 watcher·폴링 타이머를 남겨 **프로세스가 스스로 끝나지 않는다** →
+  `process.exit(0)`. 실제로 한 번 매달려 600초 타임아웃을 먹었다.
+- 🔴 번들은 **쓰이지 않는 export 를 tree-shake** 한다(`armedStatesForTest` 가 build 에서 0건). 배포
+  판정 지표는 **실제로 호출되는 심볼**로 잡아야 한다(`lookupThread`).
+
+### 관측 가능성을 먼저 따졌다
+몰타르의 `codex-acp` 는 unknown 0건 ⇒ **이 수정의 차이가 안 나는 경로**다. "몰타르에서 잘 된다"를
+근거로 쓸 수 없고, 확인은 릴리스 후 맥스튜디오에서만 가능하다. **관측 불가를 효과 있음/없음 어느
+쪽으로도 쓰지 마라.**

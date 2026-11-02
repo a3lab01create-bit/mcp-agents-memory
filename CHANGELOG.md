@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.9.32 — 2026-11-03
+
+### The model label stops coming out as `unknown` on the Codex desktop app (#33, #34)
+
+A captured assistant row records which model answered. That value exists in
+exactly one place in a Codex rollout — `turn_context.payload.model`; the
+`session_meta` payload carries `originator`, `cli_version` and
+`model_provider`, but no model. The `turn_context` line appears once near the
+top of the file and then only when the turn configuration changes.
+
+The capture arms a rollout at its current size when the file already exists,
+so that an old session is not bulk-inserted. The desktop app writes the
+session preamble — manual plus tool schemas, about 179 KB in the observed
+case — and *then* starts the MCP server, so that one line sits in the skipped
+prefix and the model was never seen. The CLI creates its session file after
+the server is up, reads from offset 0, and was therefore unaffected: the
+difference was arming order, not a code path.
+
+`state_5.sqlite` already answers the question. Its `threads` row — the same
+row the platform label is read from since 0.9.31 — has a `model` column, and
+across the twelve most recent sessions it matched the rollout's last
+`turn_context.model` every time, including a session with eight of those
+lines. The arming code now reads platform and model in one query and seeds the
+model from it; a `turn_context` encountered later still overrides it, because
+per-turn accuracy is higher there (a mid-session model switch leaves
+`threads.model` holding only the final value).
+
+Both arming sites do this. There are two — the start-up snapshot of existing
+rollouts and the flush loop's discovery of new ones — and the first fix
+covered only the second, which is to say only the case that already worked.
+`check:codex-arm` now drives the real `captureSessionStart` against a
+temporary `CODEX_HOME` so that the snapshot site is covered by a test rather
+than by inspection.
+
+Rows already stored as `unknown` are left alone. They are concentrated in the
+`codex-mcp-client` label (3,145) that predates 0.9.31's originator-based
+labelling, and the rollouts and sqlite files behind them are spread across
+machines, so no single host can reconstruct them.
+
 ## 0.9.31 — 2026-11-02
 
 ### Platform labels come from `originator`, not the thread's `source` (#29)
