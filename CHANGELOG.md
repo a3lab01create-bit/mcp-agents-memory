@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.9.33 — 2026-11-03
+
+### Only the cold-path owner drains on shutdown (#35)
+
+`drainColdPath()` runs on every MCP server shutdown, and it checked neither
+the advisory-lock singleton nor `COLD_PATH_ENABLED`. Any machine's server
+would therefore tag and embed whatever rows were pending when the editor
+quit — including rows captured on other machines.
+
+Observed: quitting Codex on a Mac picked up three pending rows, one of them
+captured on the machine that runs the cold path. The Mac has no local
+llama-server, so the `local` tagger failed and the grok fallback ran into a
+missing `XAI_API_KEY`, leaving `cold_error = "tag: XAI_API_KEY missing"` on
+all three. The real daemon retried and cleared them within six minutes, so
+nothing was lost, but it recurs on every quit — and that machine's `.env`
+already said `COLD_PATH_ENABLED=false`, which is to say 0.9.32's opt-in gate
+does not reach this path.
+
+The drain now runs only for a process that acquired the cold-path lock. The
+flag is sticky: shutdown releases the lock *before* draining, so testing
+`lockClient` would have disabled the dedicated daemon's own drain — the one
+case that should keep working. `check:coldpath-drain` points the config at an
+unreachable database, which makes the distinction exact rather than timed: with
+the guard the call returns 0 without touching the database, without it the call
+raises `ECONNREFUSED`.
+
 ## 0.9.32 — 2026-11-03
 
 ### The model label stops coming out as `unknown` on the Codex desktop app (#33, #34)
