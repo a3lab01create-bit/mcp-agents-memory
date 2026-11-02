@@ -285,6 +285,13 @@ async function maybeRunLibrarian(): Promise<void> {
 // drops and Postgres auto-releases the lock, so another instance can take over.
 const COLDPATH_ADVISORY_LOCK_KEY = 4242000017; // arbitrary stable key for this app
 let lockClient: PoolClient | null = null;
+/**
+ * 이 프로세스가 콜드패스 **주인**인가 — 락을 한 번이라도 잡았으면 true, 해제 후에도 유지한다.
+ * 🔴 `lockClient` 로 판정하면 안 된다: 종료 순서가 `stopColdPathWorker()`(= 락 해제) → `drainColdPath()`
+ *    이라서, 그 시점엔 전용 데몬도 `lockClient === null` 이다. 그걸로 막으면 **데몬의 정상 드레인이
+ *    사라진다.**
+ */
+let ownedColdPath = false;
 
 async function acquireColdPathLock(): Promise<boolean> {
   if (lockClient) return true; // already held by this process
@@ -293,6 +300,7 @@ async function acquireColdPathLock(): Promise<boolean> {
     const res = await client.query('SELECT pg_try_advisory_lock($1) AS got', [COLDPATH_ADVISORY_LOCK_KEY]);
     if (res.rows[0]?.got === true) {
       lockClient = client; // HOLD — do not release; releasing/closing frees the lock
+      ownedColdPath = true;
       return true;
     }
     client.release();
@@ -400,7 +408,22 @@ export async function runColdPathOnce(): Promise<number> {
  *
  * @returns 총 처리 row 수
  */
+/** 검사용: 이 프로세스가 콜드패스 주인인지. */
+export function ownsColdPath(): boolean {
+  return ownedColdPath;
+}
+
 export async function drainColdPath(maxTicks = 12): Promise<number> {
+  // 🔴 **주인만 드레인한다.** 이 경로는 MCP 서버 **종료 때마다**(index.ts) 불리고, 전에는
+  //    advisory lock 도 COLD_PATH_ENABLED 도 보지 않아서 **어느 기기에서든 태깅이 돌았다.**
+  //    실측 2026-11-03 00:22: 형이 맥스튜디오에서 codex 를 끄자 그 기기가 밀린 행 3개를 집어
+  //    태깅을 시도했고(몰타르에서 캡처된 행 포함), 맥엔 llama-server 가 없어 local 이 실패하고
+  //    grok 폴백에서 `XAI_API_KEY` 가 없어 `cold_error = "tag: XAI_API_KEY missing"` 이 찍혔다.
+  //    (몰타르 데몬이 5~6분 뒤 재시도해 해소 — 손실은 없었지만 매번 반복된다.)
+  //    🔴 그 기기 `.env` 엔 `COLD_PATH_ENABLED=false` 가 **이미** 적혀 있었다 — 즉 게이트를
+  //    opt-in 으로 바꾼 것(0.9.32)으로는 이 경로가 막히지 않는다. 여기서 따로 막아야 한다.
+  if (!ownedColdPath) return 0;
+
   // 진행 중 tick (정기 timer로 fire된 것) 마무리 대기
   let waitCount = 0;
   while (running && waitCount < 30) {
