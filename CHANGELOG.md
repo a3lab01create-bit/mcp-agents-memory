@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.9.31 — 2026-11-02
+
+### Platform labels come from `originator`, not the thread's `source` (#29)
+
+`state_5.sqlite` records `source='vscode'` for the Codex desktop app, the CLI
+(`codex-tui`) and ACP bridges alike, so every one of them was labelled
+`codex-desktop` — or collapsed to `codex-mcp-client` when the `sqlite3` binary
+was missing. The label now reads `threads.originator`, with `source` kept only
+as a fallback, and the lookup uses `node:sqlite` (loaded lazily via
+`createRequire`, so an older Node still starts) instead of shelling out.
+
+Observed values are not spelled consistently — `codex-tui`, `codex_exec`,
+`buzz-acp`, and `Codex Desktop` (capitalised, with a space). All four are
+mapped explicitly. This matters beyond cosmetics: `search_memory` filters on
+`agent_platform`, so a wrong label hides rows from a filtered query.
+
+### Stuck envelopes report *which* rows are stuck (#30)
+
+`buzz-ingest` counted un-cleaned envelopes by reason but never said which rows
+they were, so "the count went up" could not be turned into a diagnosis. The
+report now carries `envelopesStuckRows` (`{id, why}`) and
+`envelopesStuckOmitted`, capped **per reason** — a global cap let the largest
+reason crowd the others out of the sample entirely.
+
+### History boundary: the closing tag that is followed by this turn (#31)
+
+The envelope's history block (`<thread-context>` / `<conversation-context>`)
+ended at the **first** closing tag. Discussing envelopes in a Buzz room puts
+that literal tag inside a quoted message, so the boundary landed mid-history
+and the whole envelope was stored unclean — the tagger then overflowed its
+context and the embedding was computed from boilerplate.
+
+The boundary is now the **earliest closing tag that is immediately followed by
+a turn block**, and the decision lives in one place shared by cleaning, quote
+reading and the embedding/display paths. Measured over all 1,945 envelopes that
+have a history block, that single condition yields exactly one candidate on
+every row. Requiring the tag to start its line, or rejecting candidates inside
+a code fence, both looked equally good on production data and were both wrong:
+the former breaks grok-cli's space-joined format (genuine boundary mid-line,
+quoted one at line start — a shape with zero production rows but covered by a
+synthetic test), and the latter cost 32 rows with no discriminating power.
+
+Skipping a quoted tag moves the boundary later, which widens the dropped
+region, so that case re-checks that no real turn block hides inside it. The
+guard applies **only** when a candidate was skipped: applying it everywhere
+made two rows embed their entire envelope (4,820 B → 53,191 B), a risk this
+change did not introduce.
+
+### The cold path only runs where it is turned on (#32)
+
+`startColdPathWorker` compared `COLD_PATH_ENABLED === 'false'`, so an unset key
+**enabled** it. The memory database lives on one machine, and the cold path
+needs that database plus a local llama-server; every other install is meant to
+be a thin client. But the published `.env.example` never mentioned the key, so
+every machine that copied it came up with the cold path on, sharing one
+Postgres advisory lock. No harm had occurred — the lock, not the design, is why
+— and the lock is free for a moment on every restart of the real daemon.
+
+The gate is now opt-in: only `"true"` (case- and whitespace-tolerant, because a
+silent *off* on the one machine that must be on is the worse failure) turns it
+on, the disabled log line prints the actual value including `(unset)`, and
+`.env.example` ships the key set to `false` with the reason. The dedicated
+daemon sets it internally and is unaffected.
+
 ## 0.9.30 — 2026-10-31
 
 ### Codex capture: stop discarding user text, and unblock the envelope re-clean (#28)
