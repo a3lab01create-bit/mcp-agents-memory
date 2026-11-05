@@ -162,6 +162,34 @@ const ok = (c: boolean, m: string) => { console.log(`${c ? "✅" : "❌"} ${m}`)
      `전문이 케이스별로 잘림 없이 남는다 (${rawRows.length}건)`);
 }
 
+// ── ⑨ 🔴 실제 대기 timeout 경로 + 인자 검증 (코디 반례: 0.5ms 가 정규식을 빠져나갔다)
+{
+  // canned 응답을 늦춰 **모델 없이** 실제 대기 timeout 을 태운다
+  const r = run(["--canned", '{"project_name":"alpha","evidence_refs":[],"reason":"x"}',
+                 "--canned-delay-ms", "300", "--timeout-ms", "10"], "to.json");
+  ok(r.rc === 5, `timeout 발생 → rc=5 (실제 ${r.rc})`);
+  const L = logRows(r.out);
+  const ab = L.find((x: any) => x.kind === "aborted");
+  ok(!!ab && ab.reason === "timeout", `aborted 기록 (${JSON.stringify(ab)})`);
+  const gen = L.filter((x: any) => x.kind === "gen");
+  ok(gen.length === 1, `첫 케이스에서 멈춘다 — 이후 요청 없음 (gen 행 ${gen.length}, 케이스는 2건)`);
+  const sum = L.find((x: any) => x.kind === "gen_summary");
+  ok(sum?.aborted_on_timeout === true, `gen_summary.aborted_on_timeout=true`);
+  const meta = L.find((x: any) => x.kind === "gen_meta");
+  ok(meta?.timeout_ms === 10, `gen_meta.timeout_ms 가 기록된다 (${meta?.timeout_ms})`);
+
+  // 🔴 0.5ms — 전엔 호출 2회·rc=0·aborted=false 로 빠져나갔다. 이제 **인자 검증에서 막는다**
+  for (const bad of ["0.5", "0", "-1", "abc", "2147483648", ""]) {
+    const rb = run(["--canned", '{"project_name":"alpha","evidence_refs":[],"reason":"x"}',
+                    "--timeout-ms", bad], `bad_${bad || "empty"}.json`);
+    ok(rb.rc === 2, `--timeout-ms ${JSON.stringify(bad)} → rc=2 로 거부 (실제 ${rb.rc})`);
+  }
+  // 정상 정수는 통과
+  const rg = run(["--canned", '{"project_name":"alpha","evidence_refs":[],"reason":"x"}',
+                  "--timeout-ms", "5000"], "good_to.json");
+  ok(rg.rc === 0, `--timeout-ms 5000 → 정상 (실제 ${rg.rc})`);
+}
+
 // ── ⑥ live manifest 가드
 {
   const r = run(["--live-model"], "l.json");
