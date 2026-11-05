@@ -1,12 +1,12 @@
 /**
- * Cold Path Tagger — predefined p_tag + dynamic d_tag 추출.
+ * Cold Path Tagger — 운영 wrapper. 판정 흐름·프롬프트 조립·파싱은 `tagger_core.ts` 에 있다.
+ *
+ * 이 파일은 **DB 어댑터**다: 후보·힌트 조회, 별칭 정본 조회, 신규 이름 차단, get-or-create,
+ * 모델 호출(fallback 포함), Jev, 시스템 프롬프트를 포트로 조립해 `runTagger` 를 부른다.
+ * `tagMessage(input)` 의 시그니처와 반환 모양은 바뀌지 않는다 — 기존 동작 보존이 목표이고
+ * 동등성은 `scripts/check_tagger_core_equivalence.ts` 가 검증한다.
  *
  * Model: grok-4-1-fast-non-reasoning (default; env TAGGER_MODEL/TAGGER_PROVIDER으로 오버라이드 가능)
- * Prompt 핵심:
- *   - 기존 project_tags 후보 보고 매칭 우선 (§(1-A) explosion 방어)
- *   - role='assistant'면 "user 사실로 단정 X" 명시 (§(1-A) hallucination 방어)
- *   - 신규 p_tag 필요시 INSERT INTO project_tags ... RETURNING id
- *
  * 실패 시 throw — 호출자가 retry / cold_error 기록 처리.
  */
 
@@ -15,40 +15,34 @@ import { callRole, callSpec, ROLE_REGISTRY, type ModelSpec } from "../model_regi
 import { judgeProjectTag, shouldApplyJevJudgment } from "./jev_judge.js";
 import { getPrompt } from "../prompts/index.js";
 import { isBlockedNewTagName } from "./dtag_promoter.js";
-import { REGISTRY_MEMBER_SQL, isUndefinedColumn, parsePTagAnswer, registryCandidateLines, registryHintLine, registryVerdict } from "./project_registry.js";
+import { REGISTRY_MEMBER_SQL, isUndefinedColumn } from "./project_registry.js";
+import {
+  GENERIC_TAGGER_PROMPT,
+  runTagger,
+  type CandidateList,
+  type ChannelHint,
+  type ModelCallOptions,
+  type OperationalPorts,
+  type ProjectTagCandidate,
+  type TagInput,
+  type TagResult,
+} from "./tagger_core.js";
+
+export type { TagInput, TagResult } from "./tagger_core.js";
 
 // local 프로바이더 사용 시 실패하면 grok으로 fallback (LOCAL_GROK_FALLBACK=false 로 끄기 가능)
 const GROK_FALLBACK_SPEC: ModelSpec = { provider: 'xai', model_name: 'grok-4-1-fast-non-reasoning' };
 // 호출마다 읽는다 — retag-ptag는 실행 중에 끈다(대량 작업이 유료 grok으로 새지 않게)
 const localFallbackEnabled = (): boolean => process.env.LOCAL_GROK_FALLBACK !== 'false';
 
-export interface TagInput {
-  message: string;
-  role: 'user' | 'assistant';
-  agent_platform: string;
-  agent_model: string;
-  /** 글이 온 자리(memory.venue, 예: buzz:MarketDev). 명부 항목에 걸린 채널이면 힌트 한 줄이 붙는다 */
-  venue?: string | null;
-}
-
-export interface TagResult {
-  p_tag_id: number | null;
-  d_tag: string[];
-  /** 신규 p_tag 생성한 경우 이름 (디버깅/로그용). */
-  newly_created_p_tag_name?: string;
-}
-
 type CandidateStrategy = "oldest" | "frequent";
-type ProjectTagCandidate = { id: number; name: string; description: string | null };
-
-/** registry=true면 명부 모드(DEVLOG §24 L1): 후보는 명부 전체, 명부 밖 이름·새 이름은 받지 않는다. */
-type CandidateList = { rows: ProjectTagCandidate[]; registry: boolean };
 
 // 후보 cache: 5분 TTL. 전략 또는 limit 변경은 별도 cache key로 분리한다.
 let _candidateCache: { key: string; list: CandidateList; expires: number } | null = null;
 // 명부가 이보다 크면 잘린다 — 명부는 사람이 고르는 짧은 목록이라 넘을 일이 없어야 한다(mem0 권고 3~5, 우리 12).
 const REGISTRY_CANDIDATE_LIMIT = 60;
 const CANDIDATE_CACHE_TTL_MS = 5 * 60 * 1000;
+
 
 /**
  * Keep the deployed behavior unless an operator explicitly opts into the
@@ -146,7 +140,6 @@ export function invalidateCandidateCache(): void {
   _hintCache = null;
 }
 
-type ChannelHint = { id: number; name: string };
 let _hintCache: { map: Map<string, ChannelHint>; expires: number } | null = null;
 
 /**
@@ -171,56 +164,7 @@ async function listChannelHints(): Promise<Map<string, ChannelHint>> {
   return map;
 }
 
-// RESPEC §3 cost fix: slim 적용. 핵심 룰 (explosion / role-awareness)은 keep.
-// 토큰 ~3K → ~1.8K 목표.
-
-/** JSON Schema for tagger output — used with local llama.cpp to enforce grammar (no <think> bleed). */
-const TAGGER_SCHEMA: Record<string, unknown> = {
-  type: 'object',
-  properties: {
-    p_tag: { type: ['string', 'null'] },
-    d_tag: { type: 'array', items: { type: 'string' }, maxItems: 5 },
-  },
-  required: ['p_tag', 'd_tag'],
-  additionalProperties: false,
-};
-
-// PUBLIC GENERIC fallback. The tuned production prompt is loaded at runtime
-// from prompts.local/tagger.md (private core) and is never bundled or published.
-const GENERIC_TAGGER_PROMPT = `Tagger for a user's long-term memory across AI agents.
-
-OUTPUT (strict JSON):
-{ "p_tag": "<existing-name>" | "NEW:<slug>" | null, "d_tag": ["<kw>", ...] }
-
-p_tag: ONE project tag. Prefer matching a name from the candidate list below;
-  map obvious synonyms to an existing candidate. Use "NEW:<slug>" only when the
-  message is clearly about a project absent from the list. null when the message
-  is too short or generic to project-tag.
-
-d_tag: 0-3 short lowercase hyphenated keywords about the topic. Skip if no signal.
-
-ROLE: input includes role='user' or role='assistant'. For role='assistant',
-  tag the topic; do not treat the reply as a fact about the user.`;
 const SYSTEM_PROMPT = getPrompt("tagger", GENERIC_TAGGER_PROMPT);
-
-function buildUserPrompt(
-  input: TagInput,
-  candidates: Array<{ name: string; description: string | null }>,
-  registry = false,
-  hint?: ChannelHint
-): string {
-  // 명부 모드: 짧은 명부라 설명까지 준다(태거 안내문). 시스템 프롬프트가 NEW:를 허용해도 여기서 막는다.
-  // 힌트가 걸린 채널의 글에만 힌트 줄이 붙는다 — 다른 글의 안내문은 한 글자도 안 바뀐다.
-  if (registry) {
-    const hintLine = hint && input.venue ? `${registryHintLine(input.venue, hint)}\n` : "";
-    return `registry (the ONLY allowed p_tag values — pick exactly one name, or null if none clearly fits; never invent a name, never use NEW:):\n${registryCandidateLines(candidates)}\n${hintLine}role=${input.role}\nmessage: ${input.message}`;
-  }
-  // Slim user prompt — description (보통 길고 가변) 제거, 이름만 (~50% 토큰 절감)
-  const candList = candidates.length > 0
-    ? candidates.map((c) => c.name).join(", ")
-    : "(none)";
-  return `candidates: ${candList}\nrole=${input.role}\nmessage: ${input.message}`;
-}
 
 /**
  * project_tags에 새 row INSERT (또는 이미 있으면 가져옴).
@@ -254,169 +198,58 @@ async function getOrCreateProjectTag(name: string): Promise<number> {
 }
 
 /**
- * 명부 모드 출력 형식: p_tag는 명부 이름 또는 null만 (로컬 llama.cpp 문법으로 강제 — 새 이름·설명 따라 쓰기 원천 차단).
- * grok 대체 경로는 jsonSchema를 안 쓰므로 resolveRegistryAnswer의 판정이 여전히 최종 관문이다.
+ * 별칭 사슬 → 정본 id. **호출부마다 SQL 이 달랐던 것을 그대로 보존한다**:
+ *   maxDepth 지정(명부 모드, 원래 :279)  → depth 컬럼 + `WHERE c.depth < N`
+ *   maxDepth 생략(비명부, 원래 :389)      → depth 없음, 상한 없음
+ * 깊이 상한은 순환 탐지가 아니라 재귀를 멈추는 상한이다.
  */
-function registrySchema(candidates: ProjectTagCandidate[]): Record<string, unknown> {
-  return {
-    type: 'object',
-    properties: {
-      p_tag: { anyOf: [{ type: 'string', enum: candidates.map((c) => c.name) }, { type: 'null' }] },
-      d_tag: { type: 'array', items: { type: 'string' }, maxItems: 5 },
-    },
-    required: ['p_tag', 'd_tag'],
-    additionalProperties: false,
-  };
-}
-
-/**
- * 명부 모드의 p_tag 답 → 명부 정본 id 또는 null. 별칭 이름은 별칭 사슬을 따라간 정본이 명부에 있으면 받는다.
- */
-async function resolveRegistryAnswer(raw: unknown, candidates: ProjectTagCandidate[]): Promise<number | null> {
-  const answer = parsePTagAnswer(raw);
-  let canonicalId: number | null = null;
-  if (answer.type === "name") {
+async function resolveCanonicalId(name: string, opts?: { maxDepth?: number }): Promise<number | null> {
+  if (opts?.maxDepth != null) {
     const chain = await db.query(
       `WITH RECURSIVE chain AS (
          SELECT id, alias_of, 0 AS depth FROM project_tags WHERE name = $1
          UNION ALL
          SELECT pt.id, pt.alias_of, c.depth + 1 FROM project_tags pt JOIN chain c ON pt.id = c.alias_of
-          WHERE c.depth < 20
+          WHERE c.depth < ${opts.maxDepth}
        )
        SELECT id FROM chain WHERE alias_of IS NULL LIMIT 1`,
-      [answer.slug]
+      [name]
     );
-    canonicalId = chain.rows.length > 0 ? Number(chain.rows[0].id) : null;
+    return chain.rows.length > 0 ? Number(chain.rows[0].id) : null;
   }
-  const verdict = registryVerdict(answer, canonicalId, new Set(candidates.map((c) => c.id)));
-  if (verdict.accept == null && verdict.reason !== "no_answer") {
-    console.error(`⚠️ [Tagger] 명부 모드: "${String(raw)}" 받지 않음 (${verdict.reason}). p_tag NULL.`);
-  }
-  return verdict.accept;
+  const aliasCheck = await db.query(
+    `WITH RECURSIVE chain AS (
+       SELECT id, alias_of FROM project_tags WHERE name = $1
+       UNION ALL
+       SELECT pt.id, pt.alias_of FROM project_tags pt JOIN chain c ON pt.id = c.alias_of
+     )
+     SELECT id FROM chain WHERE alias_of IS NULL LIMIT 1`,
+    [name]
+  );
+  return aliasCheck.rows.length > 0 ? Number(aliasCheck.rows[0].id) : null;
+}
+
+/** 운영 포트 조립. systemPrompt 는 모듈 초기화 시점에 한 번 읽은 값을 그대로 준다. */
+export function operationalPorts(): OperationalPorts {
+  return {
+    systemPrompt: SYSTEM_PROMPT,
+    isLocalProvider: () => ROLE_REGISTRY.tagger.provider === 'local',
+    fallbackEnabled: localFallbackEnabled,
+    callPrimary: (opts: ModelCallOptions) => callRole('tagger', opts),
+    callFallback: (opts: ModelCallOptions) => callSpec(GROK_FALLBACK_SPEC, opts),
+    judgeJev: (i) => judgeProjectTag(i),
+    applyJev: (j) => shouldApplyJevJudgment(j as any),
+    listCandidates: listProjectTagCandidates,
+    listHints: listChannelHints,
+    resolveCanonical: resolveCanonicalId,
+    isBlockedNewName: isBlockedNewTagName,
+    getOrCreateTag: getOrCreateProjectTag,
+  };
 }
 
 /**
  * Cold Path Tagger 본체. message → {p_tag_id, d_tag}.
  */
 export async function tagMessage(input: TagInput): Promise<TagResult> {
-  const { rows: candidates, registry } = await listProjectTagCandidates();
-  const hint = registry && input.venue ? (await listChannelHints()).get(input.venue) : undefined;
-  const userPrompt = buildUserPrompt(input, candidates, registry, hint);
-
-  const isLocal = ROLE_REGISTRY.tagger.provider === 'local';
-  let raw: string;
-
-  if (isLocal) {
-    try {
-      raw = await callRole('tagger', {
-        system: SYSTEM_PROMPT,
-        user: userPrompt,
-        responseFormat: 'json',
-        jsonSchema: registry ? registrySchema(candidates) : TAGGER_SCHEMA,
-        enableThinking: false,
-        // thinking off — 태거는 단순 매핑 작업. thinking 켜면 reasoning이 모든 토큰 소비해 content 비어버림.
-        // jsonSchema → llama.cpp grammar로 <think> bleed 차단 (Qwen3 bug #20345).
-      });
-    } catch (err) {
-      if (!localFallbackEnabled()) throw err;
-      console.warn(`⚠️ [Tagger] Local model 실패, grok fallback: ${(err as Error).message?.slice(0, 80)}`);
-      raw = await callSpec(GROK_FALLBACK_SPEC, {
-        system: SYSTEM_PROMPT,
-        user: userPrompt,
-        responseFormat: 'json',
-      });
-    }
-  } else {
-    raw = await callRole('tagger', {
-      system: SYSTEM_PROMPT,
-      user: userPrompt,
-      responseFormat: 'json',
-    });
-  }
-
-  let parsed: { p_tag: string | null; d_tag: string[] };
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error(`Tagger returned invalid JSON: ${raw.slice(0, 200)}`);
-  }
-
-  // Jev is only an opinion over existing project-tag candidates. Preserve a
-  // Qwen NEW: proposal exactly: Jev cannot create a new tag, so letting it
-  // answer here would either erase the proposal or misclassify it as an old tag.
-  const qwenProposedNewTag = typeof parsed.p_tag === "string" && parsed.p_tag.startsWith("NEW:");
-  if (!qwenProposedNewTag) {
-    const jev = await judgeProjectTag({
-      message: input.message,
-      role: input.role,
-      agent_platform: input.agent_platform,
-      agent_model: input.agent_model,
-      candidates,
-    });
-    // A missing threshold is fail-closed in shouldApplyJevJudgment(), so merely
-    // setting JEV_ENABLED=true cannot give Jev final authority accidentally.
-    if (jev !== null && shouldApplyJevJudgment(jev)) {
-      parsed.p_tag = jev.choice;
-    }
-  }
-
-  let p_tag_id: number | null = null;
-  let newly_created_p_tag_name: string | undefined;
-
-  if (registry) {
-    // 명부 모드: 명부 이름(또는 그 별칭)만 받는다. 새 이름은 만들지 않는다.
-    p_tag_id = await resolveRegistryAnswer(parsed.p_tag, candidates);
-  } else if (parsed.p_tag && typeof parsed.p_tag === 'string') {
-    if (parsed.p_tag.startsWith('NEW:')) {
-      const newName = parsed.p_tag.slice(4).trim();
-      if (newName && await isBlockedNewTagName(newName)) {
-        // 사람이 결정을 기다리는(대기) 이름이나 반려한 이름은 태거도 만들지 않는다 (0.9.25 — 승인은 사람이)
-        console.error(`⚠️ [Tagger] "${newName}"은(는) 새 태그 제안에서 사람의 결정을 기다리거나 반려된 이름이라 만들지 않음. p_tag NULL.`);
-      } else if (newName) {
-        p_tag_id = await getOrCreateProjectTag(newName);
-        newly_created_p_tag_name = newName;
-      }
-    } else {
-      // P2 fix: 모델이 후보 list 외 이름 (오타/hallucination) 반환 시 새 tag
-      // 자동 생성 막기. candidate 안에 정확히 매칭되거나 alias_of로 lookup 가능한
-      // 이름이어야만 사용. 그 외는 NULL (no p_tag) 반환 — explosion 방어 강화.
-      const slug = parsed.p_tag.toLowerCase().trim();
-      const candidateSlugs = new Set(candidates.map((c) => c.name.toLowerCase()));
-      if (candidateSlugs.has(slug)) {
-        p_tag_id = await getOrCreateProjectTag(parsed.p_tag);
-      } else {
-        // alias_of chain에 있으면 OK
-        const aliasCheck = await db.query(
-          `WITH RECURSIVE chain AS (
-             SELECT id, alias_of FROM project_tags WHERE name = $1
-             UNION ALL
-             SELECT pt.id, pt.alias_of FROM project_tags pt JOIN chain c ON pt.id = c.alias_of
-           )
-           SELECT id FROM chain WHERE alias_of IS NULL LIMIT 1`,
-          [slug]
-        );
-        if (aliasCheck.rows.length > 0) {
-          p_tag_id = Number(aliasCheck.rows[0].id);
-        } else {
-          // 후보에 없는 이름 — explosion 방어. NEW: prefix가 명시되지 않은 한 새로 만들지 않음.
-          console.error(`⚠️ [Tagger] 후보 외 이름 "${parsed.p_tag}" 거부 (NEW: prefix 없음). p_tag NULL 반환.`);
-          p_tag_id = null;
-        }
-      }
-    }
-  }
-
-  const d_tag = Array.isArray(parsed.d_tag)
-    ? parsed.d_tag
-        .filter((t): t is string => typeof t === 'string')
-        .map((t) => t.toLowerCase().trim())
-        .filter((t) => t.length > 0 && t.length <= 50)
-        .slice(0, 5)
-    : [];
-
-  return {
-    p_tag_id,
-    d_tag,
-    newly_created_p_tag_name,
-  };
+  return runTagger(input, operationalPorts());
 }

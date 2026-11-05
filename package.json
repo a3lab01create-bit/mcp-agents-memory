@@ -33,7 +33,9 @@
     "check:retag": "esbuild scripts/check_ptag_retag.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/mcp-agents-memory/check_ptag_retag.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/check_ptag_retag.mjs",
     "check:coldpath-gate": "esbuild scripts/check_coldpath_gate.ts --bundle --platform=node --format=esm --packages=external --outfile=node_modules/.cache/mcp-agents-memory/check_coldpath_gate.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/check_coldpath_gate.mjs",
     "check:codex-arm": "esbuild scripts/check_codex_arm.ts --bundle --platform=node --format=esm --packages=external --outfile=node_modules/.cache/mcp-agents-memory/check_codex_arm.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/check_codex_arm.mjs",
-    "check:coldpath-drain": "esbuild scripts/check_coldpath_drain.ts --bundle --platform=node --format=esm --packages=external --outfile=node_modules/.cache/mcp-agents-memory/check_coldpath_drain.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/check_coldpath_drain.mjs"
+    "check:coldpath-drain": "esbuild scripts/check_coldpath_drain.ts --bundle --platform=node --format=esm --packages=external --outfile=node_modules/.cache/mcp-agents-memory/check_coldpath_drain.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/check_coldpath_drain.mjs",
+    "check:tagger-core": "esbuild scripts/check_tagger_core_equivalence.ts --bundle --platform=node --format=esm --packages=external --outfile=node_modules/.cache/mcp-agents-memory/check_tagger_core_equivalence.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/check_tagger_core_equivalence.mjs",
+    "check:tagger-nodb": "esbuild scripts/check_tagger_core_nodb.ts --bundle --platform=node --format=esm --packages=external --outfile=node_modules/.cache/mcp-agents-memory/check_tagger_core_nodb.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/check_tagger_core_nodb.mjs"
   },
   "keywords": [
     "mcp",
