@@ -40,6 +40,23 @@ const dumpDir = arg("dump-prompts");
 if (dumpDir) fs.mkdirSync(dumpDir, { recursive: true });
 const canned = arg("canned", '{"project_name":"","evidence_refs":[],"reason":"canned"}') as string;
 
+/**
+ * 🔴 로컬(llama.cpp)에서는 **thinking 을 끄고 grammar 로 JSON 을 강제**해야 한다.
+ *    태거가 그렇게 한다(`enableThinking:false` + `jsonSchema`). 안 끄면 Qwen3 가 reasoning 에
+ *    토큰을 다 쓰고 content 가 비거나 극단적으로 느려진다 — 첫 live 시도에서 11분 29초 동안
+ *    산출물 0 이었던 원인이다.
+ */
+const CANDIDATE_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    project_name: { type: "string" },
+    evidence_refs: { type: "array", items: { type: "string" }, maxItems: 8 },
+    reason: { type: "string" },
+  },
+  required: ["project_name", "evidence_refs", "reason"],
+  additionalProperties: false,
+};
+
 const registryBlock = fixture.candidates
   .map((c) => `- ${c.name}${c.description ? ` — ${c.description}` : ""}`).join("\n");
 
@@ -83,7 +100,24 @@ if (live) {
     // 🔴 **도구를 제공하지 않는다.** system 은 지시문이 프롬프트 안에 들어 있으므로 비워 둔다.
     // `callSpec(spec)` 이라 **CLI 의 --provider/--model 이 모델을 직접 선택한다**(TAGGER_* 일치가
     // 필요한 쪽은 callRole 을 쓰는 A/B runner 다 — 코디 교정).
-    text: await mr.callSpec(spec, { system: "", user: prompt, responseFormat: "json" }),
+    text: await mr.callSpec(spec, {
+      system: "", user: prompt, responseFormat: "json",
+      jsonSchema: CANDIDATE_SCHEMA,   // grammar 강제
+      enableThinking: false,          // 🔴 반드시 끈다 (위 주석)
+    }),
+  });
+}
+
+const timeoutMs = Number(arg("timeout-ms", "120000"));
+/**
+ * 🔴 **대기만 제한한다 — 실제 요청은 취소되지 않는다.** `callSpec` 에 AbortSignal 경로가 없어서
+ *    timeout 뒤에도 그 추론은 서버에서 계속 돈다. 그 상태로 다음 케이스를 보내면 **겹친다**(코디 지적).
+ *    ⇒ timeout 이 나면 **다음 요청을 보내지 않고 그 실행을 중단**한다(부분 산출물 + rc=5).
+ */
+function waitWithLimit<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((res, rej) => {
+    const t = setTimeout(() => rej(new Error(`timeout ${ms}ms (요청은 취소되지 않음 — 실행 중단)`)), ms);
+    p.then((v) => { clearTimeout(t); res(v); }, (e) => { clearTimeout(t); rej(e); });
   });
 }
 
@@ -98,6 +132,8 @@ log.push(JSON.stringify({
   live_model: live, provider: providerName, model: modelName,
   canned: live ? null : canned,
   usage_measured: false,
+  local_options: live ? { enableThinking: false, jsonSchema: "CANDIDATE_SCHEMA", timeout_ms: timeoutMs } : null,
+  timeout_semantics: "대기만 제한한다(요청 취소 없음). timeout 발생 시 다음 요청을 보내지 않고 중단한다 → rc=5",
   cost_note: "callSpec 이 문자열만 반환해 토큰·비용을 수집할 수 없다 — 지연(ms)만 실측. 총비용 결론 금지.",
   model_selection: "callSpec(spec) — CLI --provider/--model 이 모델을 직접 선택한다(TAGGER_* 일치는 A/B runner 쪽)",
   raw_artifact: "<out>.raw.jsonl (응답 전문, 잘림 없음)",
@@ -107,6 +143,7 @@ log.push(JSON.stringify({
 
 const candidates: Record<string, { project_name: string; evidence_refs?: string[]; reason?: string }> = {};
 let okN = 0, emptyN = 0, errN = 0, evN = 0;
+let aborted = false;
 
 /**
  * 🔴 근거 참조가 **그 케이스의 입력 안**을 가리키는지 검증한다.
@@ -133,9 +170,10 @@ for (const c of cases) {
   const t0 = Date.now();
   let raw = "", err: string | null = null;
   try {
-    raw = callModel ? (await callModel(prompt)).text : canned;
+    raw = callModel ? (await waitWithLimit(callModel(prompt), timeoutMs)).text : canned;
   } catch (e: any) { err = String(e?.message ?? e).slice(0, 300); }
   const ms = Date.now() - t0;
+  const hitTimeout = !!err && /^timeout \d+ms/.test(err);
   let parsed: any = null, perr: string | null = null;
   if (!err) { try { parsed = JSON.parse(raw); } catch { perr = "응답이 JSON 이 아니다"; } }
   let status = err ? "model_error" : perr ? "parse_error"
@@ -167,11 +205,26 @@ for (const c of cases) {
     raw_preview: raw.slice(0, 500), raw_full_in: "raw.jsonl", error: err ?? perr ?? null,
   }));
   raws.push(JSON.stringify({ case_id: c.id, prompt_sha: sha(prompt), raw }));
+  if (hitTimeout) {
+    // 🔴 이전 추론이 서버에서 계속 돌고 있다 — 다음 요청을 보내면 겹친다. 여기서 멈춘다.
+    process.stderr.write(`  ⛔ case ${c.id} timeout → 실행 중단 (이후 케이스 미실행)\n`);
+    log.push(JSON.stringify({ kind: "aborted", reason: "timeout", at_case: c.id,
+      done: okN + emptyN + evN + errN, total: cases.length }));
+    aborted = true;
+    break;
+  }
+  // 🔴 진행 출력 — 첫 시도에서 11분 동안 아무것도 안 보여 멈춘 건지 도는 건지 몰랐다
+  process.stderr.write(`  [${String(okN + emptyN + evN + errN).padStart(2)}/${cases.length}] case ${c.id} ${status} ${ms}ms\n`);
 }
 log.push(JSON.stringify({ kind: "gen_summary", ok: okN, empty: emptyN,
-  evidence_error: evN, error: errN, total: cases.length, usage_measured: false }));
+  evidence_error: evN, error: errN, total: cases.length, usage_measured: false,
+  aborted_on_timeout: aborted, completed: okN + emptyN + evN + errN }));
 fs.writeFileSync(outPath, JSON.stringify(candidates, null, 1) + "\n");
 fs.writeFileSync(logPath, log.join("\n") + "\n");
 fs.writeFileSync(rawPath, raws.join("\n") + "\n");
 console.log(`후보 ok=${okN} · 빈 후보=${emptyN} · 근거오류=${evN} · 기타오류=${errN} / ${cases.length}`);
 console.log(`→ ${outPath}  (로그 ${logPath} · 응답 전문 ${rawPath})  ※ 토큰·비용 미측정`);
+if (aborted) {
+  console.error(`⛔ timeout 으로 중단됨 — ${okN + emptyN + evN + errN}/${cases.length} 만 실행됨. 부분 산출물이다.`);
+  process.exit(5);
+}

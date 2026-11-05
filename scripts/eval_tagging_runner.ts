@@ -212,6 +212,8 @@ for (const arm of arms) {
         ms: Date.now() - t0, trace }));
       bump(arm, trace.decision_reason ?? "unknown");
       if (arm === "B" && !cand) bump(arm, "_no_candidate_but_ran");
+      // 진행 출력 — 긴 live 실행에서 멈춘 건지 도는 건지 알 수 있게
+      process.stderr.write(`  [${arm}] case ${c.id} ${trace.decision_reason ?? "?"} ${Date.now() - t0}ms\n`);
     } catch (e: any) {
       const msg = String(e?.message ?? e);
       const status = /invalid JSON/.test(msg) ? "parse_error" : "model_error";
@@ -219,6 +221,7 @@ for (const arm of arms) {
         candidate_present: arm === "B" ? !!cand : undefined,
         ms: Date.now() - t0, trace }));
       bump(arm, status);
+      process.stderr.write(`  [${arm}] case ${c.id} ${status} ${Date.now() - t0}ms\n`);
     }
   }
 }
