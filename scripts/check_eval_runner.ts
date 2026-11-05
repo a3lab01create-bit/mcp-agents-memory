@@ -12,7 +12,9 @@ import { execFileSync } from "node:child_process";
 
 const REPO = process.cwd();
 const RUNNER = path.join(REPO, "node_modules/.cache/mcp-agents-memory/eval_tagging_runner.mjs");
-if (!fs.existsSync(RUNNER)) {
+// 🔴 **항상 재빌드한다** — 번들이 남아 있으면 수정 전 runner 를 검사하게 된다(코디 지적)
+fs.mkdirSync(path.dirname(RUNNER), { recursive: true });
+{
   execFileSync(path.join(REPO, "node_modules/.bin/esbuild"),
     [path.join(REPO, "scripts/eval_tagging_runner.ts"), "--bundle", "--platform=node", "--format=esm",
      "--packages=external", `--outfile=${RUNNER}`, "--log-level=warning"], { stdio: "pipe" });
@@ -32,9 +34,22 @@ const regPath = w("registry.json", {
   allowed_canonical_ids: [1],
   hints: {},
 });
+const emptyPrompts = fs.mkdtempSync(path.join(os.tmpdir(), "noprompts-"));
+/**
+ * 🔴 **검사용 env 를 고정한다** — 부모 환경을 물려받으면 실제 프롬프트·설정이 있는 기계에서
+ *    live 검사가 모델을 실제로 부를 수 있다(코디 지적). 프롬프트 디렉터리를 빈 곳으로 고정하고
+ *    TAGGER_* 를 지우고, 모델 키도 비워 **검사 중 실제 호출 0** 을 보장한다.
+ */
+const TEST_ENV = {
+  PATH: process.env.PATH ?? "", HOME: os.tmpdir(),
+  MEMORY_PROMPTS_DIR: emptyPrompts,
+  TAGGER_PROVIDER: "", TAGGER_MODEL: "",
+  XAI_API_KEY: "", OPENAI_API_KEY: "", GOOGLE_API_KEY: "", GEMINI_API_KEY: "",
+};
 const run = (args: string[]) => {
   try {
-    const stdout = execFileSync(process.execPath, [RUNNER, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    const stdout = execFileSync(process.execPath, [RUNNER, ...args],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: TEST_ENV });
     return { rc: 0, stdout, stderr: "" };
   } catch (e: any) {
     return { rc: e.status ?? -1, stdout: String(e.stdout ?? ""), stderr: String(e.stderr ?? "") };
@@ -79,16 +94,50 @@ const ok = (cond: boolean, msg: string) => { console.log(`${cond ? "✅" : "❌"
      `C 는 '식별됨(canonical_id=99)' 과 '허용 정본 연결 아님(eligible=false)' 을 분리해 남긴다`);
 }
 
-// ── ③ live 설정 누락 — 호출 전에 멈춘다
+// ── ③ live 설정 누락 — 호출 전에 멈춘다 (기본값으로 통과하지 않는다)
 {
   const out = path.join(tmp, "live.jsonl");
   const r = run(["--cases", casesPath, "--registry", regPath, "--arms", "A", "--live-model", "--out", out]);
-  ok(r.rc !== 0, `live 설정 누락 → 0 이 아닌 종료코드 (실제 ${r.rc})`);
+  ok(r.rc === 3, `live 설정 누락 → rc=3 (실제 ${r.rc})`);
   ok(!fs.existsSync(out), `결과 파일을 쓰지 않았다 (호출 전에 멈췄다)`);
-  const said = /설정 누락|not found|required core prompt/.test(r.stderr + r.stdout);
-  ok(said, `왜 멈췄는지 기록된다`);
+  ok(/설정 누락/.test(r.stderr + r.stdout), `왜 멈췄는지 기록된다`);
+  // 🔴 코디 반례: 프롬프트만 주고 TAGGER_* 를 비우면 ROLE_REGISTRY 기본값(xai/grok)으로 통과했다
+  const realPrompts = path.join(tmp, "prompts"); fs.mkdirSync(realPrompts, { recursive: true });
+  fs.writeFileSync(path.join(realPrompts, "tagger.md"), "FAKE-BUT-NOT-GENERIC");
+  const out2 = path.join(tmp, "live2.jsonl");
+  const r2 = (() => { try {
+      const so = execFileSync(process.execPath, [RUNNER, "--cases", casesPath, "--registry", regPath,
+        "--arms", "A", "--live-model", "--out", out2], { encoding: "utf8", stdio: ["ignore","pipe","pipe"],
+        env: { ...TEST_ENV, MEMORY_PROMPTS_DIR: realPrompts } });
+      return { rc: 0, s: so };
+    } catch (e: any) { return { rc: e.status ?? -1, s: String(e.stdout ?? "") + String(e.stderr ?? "") }; } })();
+  ok(r2.rc === 3, `프롬프트만 있고 --provider/--model 미명시 → rc=3 (실제 ${r2.rc})  ← 전엔 rc=0, provider=xai`);
+  ok(!fs.existsSync(out2), `그 경우에도 결과 파일 미작성`);
+  // manifest 와 실제 설정이 다르면 역시 멈춘다
+  const out3 = path.join(tmp, "live3.jsonl");
+  const r3 = (() => { try {
+      execFileSync(process.execPath, [RUNNER, "--cases", casesPath, "--registry", regPath, "--arms", "A",
+        "--live-model", "--provider", "local", "--model", "definitely-not-configured", "--out", out3],
+        { encoding: "utf8", stdio: ["ignore","pipe","pipe"], env: { ...TEST_ENV, MEMORY_PROMPTS_DIR: realPrompts } });
+      return { rc: 0, s: "" };
+    } catch (e: any) { return { rc: e.status ?? -1, s: String(e.stdout ?? "") + String(e.stderr ?? "") }; } })();
+  ok(r3.rc !== 0, `manifest 와 실제 설정 불일치 → 0 이 아닌 종료코드 (실제 ${r3.rc})`);
+  ok(!fs.existsSync(out3), `그 경우에도 결과 파일 미작성`);
+}
+
+// ── ④ 명부 적격의 원천이 하나인가 — allowed 가 candidates 와 다르면 시작 시 실패
+{
+  const badReg = w("badreg.json", { registry_mode: true,
+    candidates: [{ id: 1, name: "alpha", description: "A" }],
+    name_to_canonical_id: { alpha: 1, legacy: 99 },
+    allowed_canonical_ids: [1, 99], hints: {} });
+  const out = path.join(tmp, "badreg.jsonl");
+  const r = run(["--cases", casesPath, "--registry", badReg, "--arms", "A,C", "--canned", '{"p_tag":"legacy","d_tag":[]}', "--out", out]);
+  ok(r.rc === 4, `allowed ≠ candidates → rc=4 로 시작 시 실패 (실제 ${r.rc})  ← 전엔 C 가 99 를 받았다`);
+  ok(!fs.existsSync(out), `그 경우 결과 파일 미작성`);
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });
+fs.rmSync(emptyPrompts, { recursive: true, force: true });
 console.log(fail === 0 ? "\n✅ 평가 runner 회귀 검사 통과" : `\n❌ ${fail}건 실패`);
 if (fail) process.exit(1);

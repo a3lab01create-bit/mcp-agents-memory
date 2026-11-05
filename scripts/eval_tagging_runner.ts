@@ -63,19 +63,33 @@ let modelAdapter: ((o: any) => Promise<string>) | null = null;
 let providerName = arg("provider") ?? null;
 let modelName = arg("model") ?? null;
 if (live) {
-  // 동적 import — 기본 경로에서는 모델 SDK 조차 로드하지 않는다
-  const mr: any = await import("../src/model_registry.js");
-  providerName = mr.ROLE_REGISTRY.tagger.provider;
-  modelName = mr.ROLE_REGISTRY.tagger.model_name;
-  // 🔴 설정이 없으면 **호출 전에** 멈춘다
+  // 🔴 `ROLE_REGISTRY` 는 TAGGER_PROVIDER/MODEL 이 없어도 **기본값(xai/grok)** 을 채운다.
+  //    따라서 "값이 있나" 검사로는 설정 누락을 못 잡는다(코디 반례: rc=0, provider=xai).
+  //    ⇒ 실행 manifest 로 **명시**를 요구하고, **실제 설정과의 일치**를 호출 전에 확인한다.
+  const declaredProvider = arg("provider");
+  const declaredModel = arg("model");
   const missing: string[] = [];
-  if (!providerName || !modelName) missing.push("ROLE_REGISTRY.tagger");
-  if (promptIsGeneric) missing.push("실제 tagger 시스템 프롬프트(prompts.local/tagger.md 또는 MEMORY_PROMPTS_DIR)");
-  if (!fixture.registry_mode && fixture.candidates.length === 0) missing.push("후보 목록");
+  if (!declaredProvider || !declaredModel) {
+    missing.push("--provider/--model 명시 (manifest). ROLE_REGISTRY 기본값으로는 통과시키지 않는다");
+  }
+  if (promptIsGeneric) {
+    missing.push("실제 tagger 시스템 프롬프트(prompts.local/tagger.md 또는 MEMORY_PROMPTS_DIR)");
+  }
+  if (fixture.candidates.length === 0) missing.push("후보 목록");
   if (missing.length) {
-    console.error(`❌ live 실행 전 설정 누락 — 호출하지 않았다: ${missing.join(" · ")}`);
+    console.error(`❌ live 실행 전 설정 누락 — 모델을 부르지 않았다: ${missing.join(" · ")}`);
     process.exit(3);
   }
+  // 여기서야 모델 모듈을 로드한다 — 위 검사는 SDK 로드 전에 끝난다
+  const mr: any = await import("../src/model_registry.js");
+  const actualProvider = mr.ROLE_REGISTRY.tagger.provider;
+  const actualModel = mr.ROLE_REGISTRY.tagger.model_name;
+  if (actualProvider !== declaredProvider || actualModel !== declaredModel) {
+    console.error(`❌ manifest 와 실제 설정이 다르다 — 모델을 부르지 않았다.`);
+    console.error(`   manifest: ${declaredProvider}/${declaredModel} · 실제: ${actualProvider}/${actualModel}`);
+    process.exit(3);
+  }
+  providerName = actualProvider; modelName = actualModel;
   modelAdapter = (o) => mr.callRole("tagger", o);
 }
 /** 실험 차이 — A 를 "현재 태거" 라고 부를 때 같이 적어야 하는 항목들. */
@@ -132,7 +146,19 @@ const bump = (arm: string, k: string) => {
   summary[arm] ??= {}; summary[arm][k] = (summary[arm][k] ?? 0) + 1;
 };
 
-const allowed = new Set(fixture.allowed_canonical_ids);
+// 🔴 적격 집합의 **원천은 candidates 하나**다. A/B(core)는 candidates 의 id 로 판정하므로
+//    C 가 별도 목록을 쓰면 팔마다 허용 범위가 갈린다(코디 지적 — 재발 반례까지 나왔다).
+const allowed = new Set(candList.rows.map((r) => r.id));
+if (Array.isArray(fixture.allowed_canonical_ids)) {
+  const given = new Set(fixture.allowed_canonical_ids);
+  const onlyFixture = [...given].filter((x) => !allowed.has(x));
+  const onlyCandidates = [...allowed].filter((x) => !given.has(x));
+  if (onlyFixture.length || onlyCandidates.length) {
+    console.error(`❌ fixture.allowed_canonical_ids 가 candidates 와 다르다 — 팔마다 허용 범위가 갈린다.`);
+    console.error(`   fixture 에만: ${JSON.stringify(onlyFixture)} · candidates 에만: ${JSON.stringify(onlyCandidates)}`);
+    process.exit(4);
+  }
+}
 /**
  * 세 팔에 **같은** 명부 적격 조건을 쓴다(코디 지적 — C 만 전체 이름 맵으로 넓게 받았다).
  * "의미 후보를 식별함"(identified_name)과 "허용 정본에 연결됨"(linked_canonical_id)을 분리해 돌려준다.
