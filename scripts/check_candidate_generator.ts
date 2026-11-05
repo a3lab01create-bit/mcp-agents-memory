@@ -60,7 +60,8 @@ const ok = (c: boolean, m: string) => { console.log(`${c ? "✅" : "❌"} ${m}`)
 
 // ── ①②③ 프롬프트 격리·앞맥락만·해시
 {
-  const r = run(["--canned", '{"project_name":"alpha","evidence_refs":["memory:11"],"reason":"테스트"}'], "a.json");
+  // 🔴 케이스별로 **그 케이스의** 근거를 돌려주는 응답으로 바꿨다 — 전엔 양쪽에 memory:11 을 주고도 통과했다
+  const r = run(["--canned", '{"project_name":"alpha","evidence_refs":[],"reason":"테스트"}'], "a.json");
   ok(r.rc === 0, `정상 실행 rc=0 (실제 ${r.rc})`);
   const rows = logRows(r.out).filter((x) => x.kind === "gen");
   ok(rows.length === 2, `케이스 2건 모두 로그에 남는다 (${rows.length})`);
@@ -115,6 +116,50 @@ const ok = (c: boolean, m: string) => { console.log(`${c ? "✅" : "❌"} ${m}`)
   const c = JSON.parse(fs.readFileSync(r.out, "utf8"));
   ok(c["11"]?.project_name === "legacy-not-in-registry",
      `명부 밖 이름도 그대로 남긴다 — 적격 판정은 runner 가 한다`);
+}
+
+// ── ⑦ 🔴 근거 참조가 그 케이스 것인지 검증한다 (코디 반례 재현)
+{
+  // 양쪽 케이스에 memory:11 을 돌려준다 → 케이스 22 에는 11 이 입력에 없다
+  const r = run(["--canned", '{"project_name":"alpha","evidence_refs":["memory:11"],"reason":"x"}'], "ev.json");
+  const c = JSON.parse(fs.readFileSync(r.out, "utf8"));
+  const rows = logRows(r.out).filter((x: any) => x.kind === "gen");
+  const r11 = rows.find((x: any) => x.case_id === 11), r22 = rows.find((x: any) => x.case_id === 22);
+  ok(r11?.status === "ok", `케이스11: memory:11 은 자기 대상 id → ok (실제 ${r11?.status})`);
+  ok(r22?.status === "evidence_error",
+     `케이스22: memory:11 은 다른 케이스 id → evidence_error (실제 ${r22?.status})  ← 전엔 ok 로 통과했다`);
+  ok(!("22" in c), `근거 오류 후보는 후보 파일에 **넣지 않는다**(B 에 정상 근거로 안 넘어간다)`);
+  ok(Array.isArray(r22?.bad_evidence_refs) && r22.bad_evidence_refs.includes("memory:11"),
+     `어떤 참조가 문제인지 기록된다 (${JSON.stringify(r22?.bad_evidence_refs)})`);
+  ok(Array.isArray(r22?.allowed_ref_ids) && r22.allowed_ref_ids.includes("22") && r22.allowed_ref_ids.includes("202"),
+     `허용 id 집합도 같이 남는다 (${JSON.stringify(r22?.allowed_ref_ids)})`);
+  ok(r22?.proposed_name === "alpha", `이름은 로그에 남아 재검토가 가능하다`);
+  // 없는 id · 다른 접두 · 배열 아님
+  const r2 = run(["--canned", '{"project_name":"alpha","evidence_refs":["memory:999999"],"reason":"x"}'], "ev2.json");
+  ok(logRows(r2.out).filter((x: any) => x.status === "evidence_error").length === 2, `없는 id → evidence_error`);
+  const r3 = run(["--canned", '{"project_name":"alpha","evidence_refs":["buzz:abc"],"reason":"x"}'], "ev3.json");
+  ok(logRows(r3.out).filter((x: any) => x.status === "evidence_error").length === 2, `memory: 아닌 접두 → evidence_error`);
+  const r4 = run(["--canned", '{"project_name":"alpha","evidence_refs":"memory:11","reason":"x"}'], "ev4.json");
+  ok(logRows(r4.out).filter((x: any) => x.status === "evidence_error").length === 2, `배열 아님 → evidence_error`);
+  // 양성대조: 각 케이스가 **자기** prior id 를 돌려주면 통과한다
+  const r5 = run(["--canned", '{"project_name":"alpha","evidence_refs":[],"reason":"x"}'], "ev5.json");
+  ok(logRows(r5.out).filter((x: any) => x.status === "ok").length === 2, `빈 근거는 허용(근거 없음은 오류가 아니다)`);
+}
+
+// ── ⑧ 토큰·비용은 **미측정**임을 명시한다 + 응답 전문 산출물
+{
+  const r = run(["--canned", '{"project_name":"alpha","evidence_refs":[],"reason":"x"}'], "u.json");
+  const meta = logRows(r.out).find((x: any) => x.kind === "gen_meta");
+  ok(meta?.usage_measured === false, `gen_meta 에 usage_measured=false 가 명시된다`);
+  ok(typeof meta?.cost_note === "string" && /총비용 결론 금지/.test(meta.cost_note), `총비용 결론 금지가 적힌다`);
+  const rows = logRows(r.out).filter((x: any) => x.kind === "gen");
+  ok(rows.every((x: any) => x.tokens === null && x.usage_measured === false), `케이스별로도 tokens=null 로 남는다`);
+  ok(rows.every((x: any) => typeof x.ms === "number"), `지연(ms)은 실측으로 남는다`);
+  const rawFile = r.out.replace(/\.json$/, "") + ".raw.jsonl";
+  ok(fs.existsSync(rawFile), `응답 전문 산출물(raw.jsonl)이 생긴다`);
+  const rawRows = fs.readFileSync(rawFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  ok(rawRows.length === 2 && rawRows.every((x: any) => typeof x.raw === "string" && x.prompt_sha),
+     `전문이 케이스별로 잘림 없이 남는다 (${rawRows.length}건)`);
 }
 
 // ── ⑥ live manifest 가드
