@@ -22,6 +22,19 @@ export interface TagInput {
   agent_model: string;
   /** 글이 온 자리(memory.venue, 예: buzz:MarketDev). 명부 항목에 걸린 채널이면 힌트 한 줄이 붙는다 */
   venue?: string | null;
+  /**
+   * 그 대화를 한 에이전트가 **제시한 후보**(평가용). 확정이 아니라 후보다.
+   * **없으면 프롬프트는 한 글자도 바뀌지 않는다** — 기존 호출부는 이 필드를 설정하지 않는다.
+   */
+  agentCandidate?: AgentCandidate | null;
+}
+
+/** 에이전트 후보 — 확정이 아니라 후보+근거다. 자기평가 점수는 일부러 받지 않는다. */
+export interface AgentCandidate {
+  project_name: string;
+  /** 근거 참조. Buzz event id / memory id 처럼 **출처 종류까지** 구분해 적는다. */
+  evidence_refs?: string[];
+  reason?: string;
 }
 
 export interface TagResult {
@@ -135,6 +148,14 @@ d_tag: 0-3 short lowercase hyphenated keywords about the topic. Skip if no signa
 ROLE: input includes role='user' or role='assistant'. For role='assistant',
   tag the topic; do not treat the reply as a fact about the user.`;
 
+/** 에이전트 후보 줄. **후보가 없으면 빈 문자열** → 프롬프트가 기존과 바이트 동일하다. */
+export function agentCandidateLine(c?: AgentCandidate | null): string {
+  if (!c || !c.project_name) return "";
+  const why = c.reason ? ` — ${c.reason}` : "";
+  const refs = c.evidence_refs?.length ? ` [evidence: ${c.evidence_refs.join(", ")}]` : "";
+  return `agent candidate (a proposal from the agent that had this conversation — NOT a decision; verify against the list): ${c.project_name}${why}${refs}\n`;
+}
+
 export function buildUserPrompt(
   input: TagInput,
   candidates: Array<{ name: string; description: string | null }>,
@@ -145,13 +166,13 @@ export function buildUserPrompt(
   // 힌트가 걸린 채널의 글에만 힌트 줄이 붙는다 — 다른 글의 안내문은 한 글자도 안 바뀐다.
   if (registry) {
     const hintLine = hint && input.venue ? `${registryHintLine(input.venue, hint)}\n` : "";
-    return `registry (the ONLY allowed p_tag values — pick exactly one name, or null if none clearly fits; never invent a name, never use NEW:):\n${registryCandidateLines(candidates)}\n${hintLine}role=${input.role}\nmessage: ${input.message}`;
+    return `registry (the ONLY allowed p_tag values — pick exactly one name, or null if none clearly fits; never invent a name, never use NEW:):\n${registryCandidateLines(candidates)}\n${hintLine}${agentCandidateLine(input.agentCandidate)}role=${input.role}\nmessage: ${input.message}`;
   }
   // Slim user prompt — description (보통 길고 가변) 제거, 이름만 (~50% 토큰 절감)
   const candList = candidates.length > 0
     ? candidates.map((c) => c.name).join(", ")
     : "(none)";
-  return `candidates: ${candList}\nrole=${input.role}\nmessage: ${input.message}`;
+  return `candidates: ${candList}\n${agentCandidateLine(input.agentCandidate)}role=${input.role}\nmessage: ${input.message}`;
 }
 
 /**
