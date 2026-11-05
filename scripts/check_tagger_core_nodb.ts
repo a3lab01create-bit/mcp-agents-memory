@@ -88,28 +88,61 @@ const evalPorts = (over: any = {}) => ({
 });
 const input = { message: "m", role: "user" as const, agent_platform: "p", agent_model: "mm" };
 
-const paths: Array<[string, any]> = [
-  ["NEW 제안", { out: '{"p_tag":"NEW:beta","d_tag":[]}' }],
-  ["NEW 금지", { out: '{"p_tag":"NEW:banned","d_tag":[]}', blocked: new Set(["banned"]) }],
-  ["p_tag null", { out: '{"p_tag":null,"d_tag":[]}' }],
-  ["잘못된 JSON", { out: "not-json" }],
-  ["모델 실패→fallback", { out: null }],
-  ["명부 모드 별칭", { out: '{"p_tag":"a-old","d_tag":[]}', cands: { rows: [{ id: 1, name: "alpha", description: "x" }], registry: true }, canon: { "a-old": 1 } }],
-  ["후보 외 이름", { out: '{"p_tag":"zzz","d_tag":[]}' }],
-  ["Jev 적용", { out: '{"p_tag":null,"d_tag":[]}', jev: { choice: "alpha", confidence: 1 }, jevApply: true, canon: { alpha: 1 } }],
+/** 사례마다 **예상 반환·예외·trace** 를 못 박는다 — 무연결만 보면 경로가 안 돌아도 PASS 된다(코디 지적). */
+type Expect = { p_tag_id?: number | null; reason?: string; persist?: string; proposed?: string;
+                throws?: RegExp; jev_applied?: boolean; fallback_attempted?: boolean;
+                fallback_used?: boolean; model_raw?: string | null; effective?: string | null };
+const paths: Array<[string, any, Expect]> = [
+  ["NEW 제안", { out: '{"p_tag":"NEW:beta","d_tag":[]}' },
+    { p_tag_id: null, reason: "new_proposal_no_persist", persist: "skipped_no_port", proposed: "beta",
+      model_raw: "NEW:beta", effective: "NEW:beta" }],
+  ["NEW 금지", { out: '{"p_tag":"NEW:banned","d_tag":[]}', blocked: new Set(["banned"]) },
+    { p_tag_id: null, reason: "blocked_by_policy", persist: "none", proposed: "banned" }],
+  ["p_tag null", { out: '{"p_tag":null,"d_tag":[]}' },
+    { p_tag_id: null, reason: "no_answer", persist: "none", model_raw: null, effective: null }],
+  ["잘못된 JSON", { out: "not-json" }, { throws: /invalid JSON/ }],
+  ["모델 실패→fallback", { out: null },
+    { p_tag_id: null, reason: "no_answer", fallback_attempted: true, fallback_used: true }],
+  ["fallback 도 실패", { out: null, fbThrows: true },
+    { throws: /fallback down/, fallback_attempted: true, fallback_used: false }],
+  ["명부 모드 별칭", { out: '{"p_tag":"a-old","d_tag":[]}',
+      cands: { rows: [{ id: 1, name: "alpha", description: "x" }], registry: true }, canon: { "a-old": 1 } },
+    { p_tag_id: 1, reason: "resolved_existing" }],
+  ["후보 외 이름", { out: '{"p_tag":"zzz","d_tag":[]}' },
+    { p_tag_id: null, reason: "rejected_not_candidate" }],
+  ["Jev 적용", { out: '{"p_tag":null,"d_tag":[]}', jev: { choice: "alpha", confidence: 1 }, jevApply: true, canon: { alpha: 1 } },
+    { p_tag_id: 1, reason: "resolved_existing", jev_applied: true, model_raw: null, effective: "alpha" }],
 ];
-for (const [name, over] of paths) {
+for (const [name, over, exp] of paths) {
   const ports: any = evalPorts(over);
   if (over.out === null) ports.callPrimary = async () => { throw new Error("model down"); };
+  if (over.fbThrows) ports.callFallback = async () => { throw new Error("fallback down"); };
   const trace: any = {};
-  try {
-    const r = await core.runTagger(input, ports, trace);
-    console.log(`   ${name.padEnd(18)} p_tag_id=${r.p_tag_id} reason=${trace.decision_reason} persist=${trace.persistence_action}` +
-                (trace.proposed_name ? ` proposed=${trace.proposed_name}` : ""));
-  } catch (e: any) {
-    console.log(`   ${name.padEnd(18)} throw: ${e.message.slice(0, 50)}`);
-    if (/TRIPWIRE/.test(e.message)) fail++;
+  const bad: string[] = [];
+  let r: any = null, thrown: Error | null = null;
+  try { r = await core.runTagger(input, ports, trace); } catch (e: any) { thrown = e; }
+  if (thrown && /TRIPWIRE/.test(thrown.message)) { bad.push("TRIPWIRE 발동"); fail++; }
+  if (exp.throws) {
+    if (!thrown) bad.push(`예외를 기대했는데 정상 반환`);
+    else if (!exp.throws.test(thrown.message)) bad.push(`예외 문구 불일치: ${thrown.message.slice(0, 50)}`);
+  } else if (thrown) {
+    bad.push(`예상 밖 예외: ${thrown.message.slice(0, 50)}`);
   }
+  const chk = (k: string, got: any, want: any) => { if (want !== undefined && got !== want) bad.push(`${k} ${JSON.stringify(got)} ≠ ${JSON.stringify(want)}`); };
+  if (!exp.throws) chk("p_tag_id", r?.p_tag_id ?? null, exp.p_tag_id);
+  chk("decision_reason", trace.decision_reason, exp.reason);
+  chk("persistence_action", trace.persistence_action, exp.persist);
+  chk("proposed_name", trace.proposed_name, exp.proposed);
+  chk("jev_applied", trace.jev_applied, exp.jev_applied);
+  chk("fallback_attempted", trace.fallback_attempted, exp.fallback_attempted);
+  chk("fallback_used", trace.fallback_used, exp.fallback_used);
+  chk("model_raw_p_tag", trace.model_raw_p_tag, exp.model_raw);
+  chk("effective_p_tag", trace.effective_p_tag, exp.effective);
+  if (bad.length) fail++;
+  console.log(`   ${bad.length ? "❌" : "✅"} ${name.padEnd(18)}` +
+    (bad.length ? ` ${bad.join(" · ")}`
+                : ` ${thrown ? `throw(${thrown.message.slice(0, 22)})` : `p_tag_id=${JSON.stringify(r?.p_tag_id ?? null)}`}` +
+                  ` reason=${trace.decision_reason ?? "-"}`));
 }
 (net.Socket.prototype as any).connect = realConnect;
 console.log(connectAttempts === 0 ? "✅ 실패 경로 전부 실행 — 소켓 연결 시도 0회" : `❌ 소켓 연결 시도 ${connectAttempts}회`);
