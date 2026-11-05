@@ -43,8 +43,9 @@ const canned = arg("canned", '{"project_name":"","evidence_refs":[],"reason":"ca
 /**
  * 🔴 로컬(llama.cpp)에서는 **thinking 을 끄고 grammar 로 JSON 을 강제**해야 한다.
  *    태거가 그렇게 한다(`enableThinking:false` + `jsonSchema`). 안 끄면 Qwen3 가 reasoning 에
- *    토큰을 다 쓰고 content 가 비거나 극단적으로 느려진다 — 첫 live 시도에서 11분 29초 동안
- *    산출물 0 이었던 원인이다.
+ *    토큰을 다 쓰고 content 가 비거나 극단적으로 느려진다.
+ *    ⚠️ 첫 live 시도는 11분 29초 동안 산출물 0 이었는데 **원인은 미확정**이다(thinking 누락과 schema
+ *    추가를 함께 고쳤고 내부 진행 기록도 없었다). 아래 설정으로 **단건 동작 확인**만 했다.
  */
 const CANDIDATE_SCHEMA: Record<string, unknown> = {
   type: "object",
@@ -108,7 +109,28 @@ if (live) {
   });
 }
 
-const timeoutMs = Number(arg("timeout-ms", "120000"));
+/** 평가 전용 timeout 오류 — **문구 정규식이 아니라 code 로 판별한다**(코디: 0.5ms 가 정규식을 빠져나갔다). */
+class EvalTimeoutError extends Error {
+  code = "ETIMEDOUT_EVAL" as const;
+  constructor(ms: number) { super(`timeout ${ms}ms (요청은 취소되지 않음 — 실행 중단)`); }
+}
+const isTimeout = (e: unknown): boolean =>
+  !!e && typeof e === "object" && (e as { code?: string }).code === "ETIMEDOUT_EVAL";
+
+const TIMER_MAX = 2147483647;  // Node setTimeout 상한
+const timeoutRaw = arg("timeout-ms", "120000") as string;
+const timeoutMs = Number(timeoutRaw);
+if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > TIMER_MAX) {
+  console.error(`❌ --timeout-ms 는 1 이상 ${TIMER_MAX} 이하의 **정수**여야 한다 (받은 값: ${JSON.stringify(timeoutRaw)})`);
+  process.exit(2);
+}
+/** 테스트용 — canned 응답을 일부러 늦춘다. 실제 대기 timeout 경로를 모델 없이 검사하려면 필요하다. */
+const cannedDelayRaw = arg("canned-delay-ms");
+const cannedDelayMs = cannedDelayRaw === undefined ? 0 : Number(cannedDelayRaw);
+if (cannedDelayRaw !== undefined && (!Number.isInteger(cannedDelayMs) || cannedDelayMs < 0 || cannedDelayMs > TIMER_MAX)) {
+  console.error(`❌ --canned-delay-ms 는 0 이상 ${TIMER_MAX} 이하의 정수여야 한다 (받은 값: ${JSON.stringify(cannedDelayRaw)})`);
+  process.exit(2);
+}
 /**
  * 🔴 **대기만 제한한다 — 실제 요청은 취소되지 않는다.** `callSpec` 에 AbortSignal 경로가 없어서
  *    timeout 뒤에도 그 추론은 서버에서 계속 돈다. 그 상태로 다음 케이스를 보내면 **겹친다**(코디 지적).
@@ -116,7 +138,7 @@ const timeoutMs = Number(arg("timeout-ms", "120000"));
  */
 function waitWithLimit<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((res, rej) => {
-    const t = setTimeout(() => rej(new Error(`timeout ${ms}ms (요청은 취소되지 않음 — 실행 중단)`)), ms);
+    const t = setTimeout(() => rej(new EvalTimeoutError(ms)), ms);
     p.then((v) => { clearTimeout(t); res(v); }, (e) => { clearTimeout(t); rej(e); });
   });
 }
@@ -133,6 +155,7 @@ log.push(JSON.stringify({
   canned: live ? null : canned,
   usage_measured: false,
   local_options: live ? { enableThinking: false, jsonSchema: "CANDIDATE_SCHEMA", timeout_ms: timeoutMs } : null,
+  timeout_ms: timeoutMs, canned_delay_ms: cannedDelayMs || null,
   timeout_semantics: "대기만 제한한다(요청 취소 없음). timeout 발생 시 다음 요청을 보내지 않고 중단한다 → rc=5",
   cost_note: "callSpec 이 문자열만 반환해 토큰·비용을 수집할 수 없다 — 지연(ms)만 실측. 총비용 결론 금지.",
   model_selection: "callSpec(spec) — CLI --provider/--model 이 모델을 직접 선택한다(TAGGER_* 일치는 A/B runner 쪽)",
@@ -168,12 +191,17 @@ for (const c of cases) {
   const prompt = buildPrompt(c);
   if (dumpDir) fs.writeFileSync(`${dumpDir}/prompt_${c.id}.txt`, prompt);
   const t0 = Date.now();
-  let raw = "", err: string | null = null;
+  let raw = "", err: string | null = null, timedOut = false;
   try {
-    raw = callModel ? (await waitWithLimit(callModel(prompt), timeoutMs)).text : canned;
-  } catch (e: any) { err = String(e?.message ?? e).slice(0, 300); }
+    const call = callModel
+      ? callModel(prompt)
+      : (cannedDelayMs > 0
+          ? new Promise<{ text: string }>((r) => setTimeout(() => r({ text: canned }), cannedDelayMs))
+          : Promise.resolve({ text: canned }));
+    raw = (await waitWithLimit(call, timeoutMs)).text;
+  } catch (e: any) { err = String(e?.message ?? e).slice(0, 300); timedOut = isTimeout(e); }
   const ms = Date.now() - t0;
-  const hitTimeout = !!err && /^timeout \d+ms/.test(err);
+  const hitTimeout = timedOut;   // 🔴 code 로 판별한다 (문구 정규식 금지)
   let parsed: any = null, perr: string | null = null;
   if (!err) { try { parsed = JSON.parse(raw); } catch { perr = "응답이 JSON 이 아니다"; } }
   let status = err ? "model_error" : perr ? "parse_error"
