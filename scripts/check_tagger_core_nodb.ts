@@ -24,8 +24,9 @@ function graph(entryRel: string): { files: Set<string>; bare: Set<string> } {
     if (!fs.existsSync(f)) continue;
     files.add(f);
     const text = fs.readFileSync(f, "utf8");
-    for (const m of text.matchAll(/from\s+"([^"]+)"/g)) {
-      const spec = m[1];
+    const specs = [...text.matchAll(/from\s+"([^"]+)"/g)].map((m) => m[1])
+      .concat([...text.matchAll(/import\(\s*"([^"]+)"\s*\)/g)].map((m) => m[1]));
+    for (const spec of specs) {
       if (spec.startsWith(".")) {
         const abs = path.resolve(path.dirname(f), spec).replace(/\.js$/, ".ts");
         stack.push(abs);
@@ -39,6 +40,7 @@ function graph(entryRel: string): { files: Set<string>; bare: Set<string> } {
 
 const coreG = graph("src/cold_path/tagger_core.ts");
 const wrapG = graph("src/cold_path/tagger.ts");
+const runnerG = graph("scripts/eval_tagging_runner.ts");  // 동적 import(--live-model) 포함
 const hitsDb = (g: { files: Set<string>; bare: Set<string> }) =>
   [...g.files].some((f) => f.endsWith(path.join("src", "db.ts"))) || g.bare.has("pg");
 
@@ -50,6 +52,9 @@ if (hitsDb(coreG)) { console.log("❌ core 가 db/pg 에 도달한다"); fail++;
 else console.log("✅ core 는 db/pg 에 도달하지 않는다");
 if (!hitsDb(wrapG)) { console.log("❌ 대조군(wrapper)이 db/pg 에 도달하지 않는다 — 검사기가 눈먼 상태다"); fail++; }
 else console.log("✅ 대조군 확인 — 검사기는 도달을 실제로 볼 수 있다");
+console.log(`runner 파일 ${runnerG.files.size}개 · db/pg 도달 ${hitsDb(runnerG)} (동적 import 포함)`);
+if (hitsDb(runnerG)) { console.log("❌ 평가 runner 가 db/pg 에 도달한다"); fail++; }
+else console.log("✅ 평가 runner 도 db/pg 에 도달하지 않는다 (--live-model 의 동적 import 까지 포함)");
 
 // ── (나) 런타임 tripwire
 console.log("\n── (나) 런타임 tripwire");
