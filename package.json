@@ -37,7 +37,9 @@
     "check:tagger-core": "esbuild scripts/check_tagger_core_equivalence.ts --bundle --platform=node --format=esm --packages=external --outfile=node_modules/.cache/mcp-agents-memory/check_tagger_core_equivalence.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/check_tagger_core_equivalence.mjs",
     "check:tagger-nodb": "esbuild scripts/check_tagger_core_nodb.ts --bundle --platform=node --format=esm --packages=external --outfile=node_modules/.cache/mcp-agents-memory/check_tagger_core_nodb.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/check_tagger_core_nodb.mjs",
     "eval:tagging": "esbuild scripts/eval_tagging_runner.ts --bundle --platform=node --format=esm --packages=external --outfile=node_modules/.cache/mcp-agents-memory/eval_tagging_runner.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/eval_tagging_runner.mjs",
-    "check:eval-runner": "esbuild scripts/check_eval_runner.ts --bundle --platform=node --format=esm --packages=external --outfile=node_modules/.cache/mcp-agents-memory/check_eval_runner.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/check_eval_runner.mjs"
+    "check:eval-runner": "esbuild scripts/check_eval_runner.ts --bundle --platform=node --format=esm --packages=external --outfile=node_modules/.cache/mcp-agents-memory/check_eval_runner.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/check_eval_runner.mjs",
+    "eval:candidates": "esbuild scripts/eval_candidate_generator.ts --bundle --platform=node --format=esm --packages=external --outfile=node_modules/.cache/mcp-agents-memory/eval_candidate_generator.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/eval_candidate_generator.mjs",
+    "check:candidates": "esbuild scripts/check_candidate_generator.ts --bundle --platform=node --format=esm --packages=external --outfile=node_modules/.cache/mcp-agents-memory/check_candidate_generator.mjs --log-level=warning && node node_modules/.cache/mcp-agents-memory/check_candidate_generator.mjs"
   },
   "keywords": [
     "mcp",
