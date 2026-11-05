@@ -59,7 +59,12 @@ function buildPrompt(c: Case): string {
   ].join("\n");
 }
 
-let callModel: ((prompt: string) => Promise<{ text: string; tokens?: number }>) | null = null;
+/**
+ * 🔴 `callSpec` 은 **문자열만** 돌려준다 → 토큰·비용은 이 경로에서 **수집할 수 없다**.
+ *    타입에 tokens 를 선언하는 것은 수집이 아니다(코디 지적). 그래서 `usage_measured:false` 를
+ *    명시하고 총비용 결론을 제한한다. 지연(ms)만 실측이다.
+ */
+let callModel: ((prompt: string) => Promise<{ text: string }>) | null = null;
 let providerName = arg("provider") ?? null, modelName = arg("model") ?? null;
 if (live) {
   // 🔴 manifest 를 **명시**받고 실제 설정과 대조한다. 기본값으로 통과시키지 않는다.
@@ -76,24 +81,52 @@ if (live) {
   }
   callModel = async (prompt) => ({
     // 🔴 **도구를 제공하지 않는다.** system 은 지시문이 프롬프트 안에 들어 있으므로 비워 둔다.
+    // `callSpec(spec)` 이라 **CLI 의 --provider/--model 이 모델을 직접 선택한다**(TAGGER_* 일치가
+    // 필요한 쪽은 callRole 을 쓰는 A/B runner 다 — 코디 교정).
     text: await mr.callSpec(spec, { system: "", user: prompt, responseFormat: "json" }),
   });
 }
 
 const logPath = outPath.replace(/\.json$/, "") + ".log.jsonl";
+const rawPath = outPath.replace(/\.json$/, "") + ".raw.jsonl";
 const log: string[] = [];
+const raws: string[] = [];
 log.push(JSON.stringify({
   kind: "gen_meta", at: new Date().toISOString(),
   cases_sha: sha(casesRaw), registry_sha: sha(regRaw), instruction_sha: sha(instr),
   cases_n: cases.length, registry_n: fixture.candidates.length,
   live_model: live, provider: providerName, model: modelName,
   canned: live ? null : canned,
+  usage_measured: false,
+  cost_note: "callSpec 이 문자열만 반환해 토큰·비용을 수집할 수 없다 — 지연(ms)만 실측. 총비용 결론 금지.",
+  model_selection: "callSpec(spec) — CLI --provider/--model 이 모델을 직접 선택한다(TAGGER_* 일치는 A/B runner 쪽)",
+  raw_artifact: "<out>.raw.jsonl (응답 전문, 잘림 없음)",
   provenance: "제공된 과거 맥락으로 재구성한 후보 — '그 대화를 한 에이전트의 당시 판단' 이 아니다",
   isolation: ["케이스마다 독립 요청", "도구 미제공", "검색·장기기억 미연결", "이전 응답·대화 이어붙이기 없음"],
 }));
 
 const candidates: Record<string, { project_name: string; evidence_refs?: string[]; reason?: string }> = {};
-let okN = 0, emptyN = 0, errN = 0;
+let okN = 0, emptyN = 0, errN = 0, evN = 0;
+
+/**
+ * 🔴 근거 참조가 **그 케이스의 입력 안**을 가리키는지 검증한다.
+ * 허용 = 대상 memory id ∪ 그 케이스 prior 의 memory id. 다른 케이스 id·없는 id 는 **근거 오류**다.
+ * (검사 자체의 응답으로 재현된 문제였다 — 케이스 11·22 가 모두 `memory:11` 을 돌려줘도 통과했다.)
+ */
+function checkRefs(c: Case, refs: unknown): { ok: true; refs: string[] } | { ok: false; bad: string[] } {
+  if (refs == null) return { ok: true, refs: [] };
+  if (!Array.isArray(refs)) return { ok: false, bad: ["<배열 아님>"] };
+  const allow = new Set<string>([String(c.id), ...(c.prior_context ?? []).map((p) => String(p.id))]);
+  const bad: string[] = [];
+  const good: string[] = [];
+  for (const r of refs) {
+    const str = String(r);
+    const m = /^([a-z_]+):(\d+)$/.exec(str.trim());
+    if (!m || m[1] !== "memory" || !allow.has(m[2])) bad.push(str);
+    else good.push(str);
+  }
+  return bad.length ? { ok: false, bad } : { ok: true, refs: good };
+}
 for (const c of cases) {
   const prompt = buildPrompt(c);
   if (dumpDir) fs.writeFileSync(`${dumpDir}/prompt_${c.id}.txt`, prompt);
@@ -105,26 +138,40 @@ for (const c of cases) {
   const ms = Date.now() - t0;
   let parsed: any = null, perr: string | null = null;
   if (!err) { try { parsed = JSON.parse(raw); } catch { perr = "응답이 JSON 이 아니다"; } }
-  const status = err ? "model_error" : perr ? "parse_error"
+  let status = err ? "model_error" : perr ? "parse_error"
     : (typeof parsed?.project_name === "string" ? (parsed.project_name ? "ok" : "empty") : "shape_error");
+  let refCheck: ReturnType<typeof checkRefs> | null = null;
+  if (status === "ok") {
+    refCheck = checkRefs(c, parsed.evidence_refs);
+    // 근거가 그 케이스 것이 아니면 **정상 후보로 넘기지 않는다**(코디). 이름은 로그에 남겨 재검토 가능.
+    if (!refCheck.ok) status = "evidence_error";
+  }
   if (status === "ok") {
     candidates[String(c.id)] = {
       project_name: parsed.project_name,
-      ...(Array.isArray(parsed.evidence_refs) ? { evidence_refs: parsed.evidence_refs.map(String) } : {}),
+      ...(refCheck && refCheck.ok && refCheck.refs.length ? { evidence_refs: refCheck.refs } : {}),
       ...(typeof parsed.reason === "string" ? { reason: parsed.reason } : {}),
     };
     okN++;
   } else if (status === "empty") emptyN++;
+  else if (status === "evidence_error") evN++;
   else errN++;
   log.push(JSON.stringify({
     kind: "gen", case_id: c.id, status, ms,
     prompt_sha: sha(prompt), prompt_len: prompt.length,
     prior_n: (c.prior_context ?? []).length,
-    raw: raw.slice(0, 500), error: err ?? perr ?? null,
+    tokens: null, usage_measured: false,
+    proposed_name: typeof parsed?.project_name === "string" ? parsed.project_name : null,
+    bad_evidence_refs: refCheck && !refCheck.ok ? refCheck.bad : null,
+    allowed_ref_ids: [String(c.id), ...(c.prior_context ?? []).map((p) => String(p.id))],
+    raw_preview: raw.slice(0, 500), raw_full_in: "raw.jsonl", error: err ?? perr ?? null,
   }));
+  raws.push(JSON.stringify({ case_id: c.id, prompt_sha: sha(prompt), raw }));
 }
-log.push(JSON.stringify({ kind: "gen_summary", ok: okN, empty: emptyN, error: errN, total: cases.length }));
+log.push(JSON.stringify({ kind: "gen_summary", ok: okN, empty: emptyN,
+  evidence_error: evN, error: errN, total: cases.length, usage_measured: false }));
 fs.writeFileSync(outPath, JSON.stringify(candidates, null, 1) + "\n");
 fs.writeFileSync(logPath, log.join("\n") + "\n");
-console.log(`후보 ok=${okN} · 빈 후보(해당 없음)=${emptyN} · 오류=${errN} / ${cases.length}`);
-console.log(`→ ${outPath}  (로그: ${logPath})`);
+fs.writeFileSync(rawPath, raws.join("\n") + "\n");
+console.log(`후보 ok=${okN} · 빈 후보=${emptyN} · 근거오류=${evN} · 기타오류=${errN} / ${cases.length}`);
+console.log(`→ ${outPath}  (로그 ${logPath} · 응답 전문 ${rawPath})  ※ 토큰·비용 미측정`);
