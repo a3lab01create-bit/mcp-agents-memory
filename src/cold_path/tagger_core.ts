@@ -89,13 +89,20 @@ export type DecisionReason =
 export interface TaggerTrace {
   assembled_prompt?: string;
   raw_model_output?: string;
-  raw_p_tag?: string | null;
+  /** 모델이 **Jev 적용 전**에 고른 값. */
+  model_raw_p_tag?: string | null;
+  /** Jev 적용 뒤 실제로 판정에 쓰인 값. Jev 미적용이면 model_raw_p_tag 와 같다. */
+  effective_p_tag?: string | null;
   parser_result?: string;
   decision_reason?: DecisionReason;
   proposed_name?: string;
   persistence_action?: "created_or_existing" | "skipped_no_port" | "none";
   jev_applied?: boolean;
+  /** fallback 을 **시도**했나. 시도 전에 기록한다 — 실패해도 true 다. */
+  fallback_attempted?: boolean;
+  /** fallback 이 **성공**했나. */
   fallback_used?: boolean;
+  fallback_error?: string;
   registry_mode?: boolean;
   candidate_count?: number;
 }
@@ -202,6 +209,7 @@ export async function runTagger(input: TagInput, ports: TaggerPorts, trace?: Tag
     trace.assembled_prompt = userPrompt;
     trace.registry_mode = registry;
     trace.candidate_count = candidates.length;
+    trace.fallback_attempted = false;
     trace.fallback_used = false;
     trace.jev_applied = false;
     trace.persistence_action = "none";
@@ -224,11 +232,18 @@ export async function runTagger(input: TagInput, ports: TaggerPorts, trace?: Tag
     } catch (err) {
       if (!ports.fallbackEnabled()) throw err;
       console.warn(`⚠️ [Tagger] Local model 실패, grok fallback: ${(err as Error).message?.slice(0, 80)}`);
-      raw = await ports.callFallback({
-        system: ports.systemPrompt,
-        user: userPrompt,
-        responseFormat: 'json',
-      });
+      // 시도 자체를 **호출 전에** 기록한다 — fallback 이 또 실패해도 "시도 안 함" 으로 남지 않게.
+      if (trace) trace.fallback_attempted = true;
+      try {
+        raw = await ports.callFallback({
+          system: ports.systemPrompt,
+          user: userPrompt,
+          responseFormat: 'json',
+        });
+      } catch (fbErr) {
+        if (trace) trace.fallback_error = (fbErr as Error).message;
+        throw fbErr;  // 운영 거동 유지 — 호출자가 retry / cold_error 를 기록한다
+      }
       if (trace) trace.fallback_used = true;
     }
   } else {
@@ -250,6 +265,8 @@ export async function runTagger(input: TagInput, ports: TaggerPorts, trace?: Tag
   // Jev is only an opinion over existing project-tag candidates. Preserve a
   // Qwen NEW: proposal exactly: Jev cannot create a new tag, so letting it
   // answer here would either erase the proposal or misclassify it as an old tag.
+  if (trace) trace.model_raw_p_tag = parsed.p_tag ?? null;
+
   const qwenProposedNewTag = typeof parsed.p_tag === "string" && parsed.p_tag.startsWith("NEW:");
   if (!qwenProposedNewTag) {
     const jev = await ports.judgeJev({
@@ -266,7 +283,7 @@ export async function runTagger(input: TagInput, ports: TaggerPorts, trace?: Tag
       if (trace) trace.jev_applied = true;
     }
   }
-  if (trace) trace.raw_p_tag = parsed.p_tag ?? null;
+  if (trace) trace.effective_p_tag = parsed.p_tag ?? null;
 
   let p_tag_id: number | null = null;
   let newly_created_p_tag_name: string | undefined;

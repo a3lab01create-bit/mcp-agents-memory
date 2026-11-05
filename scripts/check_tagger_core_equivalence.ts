@@ -69,7 +69,7 @@ fs.writeFileSync(path.join(sandbox, "src", "db.js"), `
 import { S } from "./cold_path/__stub_state.js";
 export const db = {
   async query(sql, params) {
-    S.calls.push({ fn: "db.query", sql: sql.replace(/\\s+/g, " ").trim().slice(0, 60), params });
+    S.calls.push({ fn: "db.query", sql: sql.replace(/\\s+/g, " ").trim(), params });
     const text = sql.replace(/\\s+/g, " ");
     if (/FROM project_tags WHERE kind IS NOT NULL/.test(text) || /WHERE kind IS NOT NULL AND alias_of IS NULL/.test(text)) {
       return { rows: S.candidates.registry ? S.candidates.rows : [] };
@@ -95,12 +95,15 @@ import { S } from "./cold_path/__stub_state.js";
 export const ROLE_REGISTRY = { get tagger() { return { provider: S.isLocal ? "local" : "xai", model_name: "stub" }; } };
 export async function callRole(role, opts) {
   S.calls.push({ fn: "callRole", role, system: opts.system, user: opts.user,
-                 hasSchema: !!opts.jsonSchema, enableThinking: opts.enableThinking });
+                 responseFormat: opts.responseFormat, jsonSchema: opts.jsonSchema ?? null,
+                 enableThinking: opts.enableThinking ?? null });
   if (S.modelThrows) throw new Error("stub model failure");
   return S.modelOutput;
 }
 export async function callSpec(spec, opts) {
-  S.calls.push({ fn: "callSpec", spec, system: opts.system, user: opts.user });
+  S.calls.push({ fn: "callSpec", spec, system: opts.system, user: opts.user,
+                 responseFormat: opts.responseFormat, jsonSchema: opts.jsonSchema ?? null,
+                 enableThinking: opts.enableThinking ?? null });
   return S.fallbackOutput;
 }
 export const EMBEDDING_MODEL = "stub";
@@ -111,8 +114,12 @@ export function getPrompt(_name, fallback) { return "SYS::" + fallback.slice(0, 
 `);
 fs.writeFileSync(path.join(cp, "jev_judge.js"), `
 import { S } from "./__stub_state.js";
-export async function judgeProjectTag(i) { S.calls.push({ fn: "judgeJev", role: i.role }); return S.jev; }
-export function shouldApplyJevJudgment(_j) { S.calls.push({ fn: "applyJev" }); return S.jevApply; }
+export async function judgeProjectTag(i) {
+  S.calls.push({ fn: "judgeJev", message: i.message, role: i.role, agent_platform: i.agent_platform,
+                 agent_model: i.agent_model, candidates: i.candidates });
+  return S.jev;
+}
+export function shouldApplyJevJudgment(j) { S.calls.push({ fn: "applyJev", judgment: j }); return S.jevApply; }
 `);
 fs.writeFileSync(path.join(cp, "dtag_promoter.js"), `
 import { S } from "./__stub_state.js";
@@ -139,6 +146,12 @@ const BRANCHES: Branch[] = [
   { name: "Jev 적용", setup: (S) => { S.candidates = { rows: [{ id: 5, name: "gamma", description: null }], registry: false };
       S.modelOutput = '{"p_tag":null,"d_tag":[]}'; S.jev = { choice: "gamma", confidence: 0.99 }; S.jevApply = true;
       S.canon = { gamma: 5 }; } },
+  // 🔴 maxDepth 경계: 명부 모드 별칭 조회 SQL 의 `c.depth < N` 을 호출 인자 비교로 잡는다
+  { name: "명부 깊이 경계", setup: (S) => { S.candidates = { rows: [{ id: 2, name: "delta", description: "D" }], registry: true };
+      S.modelOutput = '{"p_tag":"delta-v1","d_tag":[]}'; S.canon = { "delta-v1": 2 }; } },
+  // 기존 후보 이름 → get-or-create 경로 (조회 SQL + INSERT 인자까지 비교)
+  { name: "기존 이름 get-or-create", setup: (S) => { S.candidates = { rows: [{ id: 3, name: "epsilon", description: null }], registry: false };
+      S.modelOutput = '{"p_tag":"epsilon","d_tag":["e"]}'; S.canon = { epsilon: 3 }; } },
 ];
 
 const INPUT = { message: "테스트 메시지", role: "user" as const, agent_platform: "p", agent_model: "m", venue: "buzz:x" };
@@ -164,21 +177,38 @@ for (const b of BRANCHES) {
     try { result = await mod.tagMessage(INPUT); } catch (e: any) { err = e.message; }
     const modelCall = S.calls.find((c: any) => c.fn === "callRole" || c.fn === "callSpec");
     runs.push({ prompt: modelCall?.user ?? null, result, err,
-                order: S.calls.map((c: any) => c.fn).join(">") });
+                order: S.calls.map((c: any) => c.fn).join(">"),
+                calls: JSON.parse(JSON.stringify(S.calls)) });
   }
   const [P, N] = runs;
   const promptSame = P.prompt === N.prompt;
   const resultSame = JSON.stringify(P.result) === JSON.stringify(N.result) && P.err === N.err;
   const orderSame = P.order === N.order;
-  const ok = promptSame && resultSame && orderSame;
+  // 🔴 이름 순서만 보면 SQL·params·모델 옵션 변경을 못 본다(maxDepth 20→19 가 통과했다).
+  //    호출 기록 전문을 깊게 비교한다.
+  const callsSame = JSON.stringify(P.calls) === JSON.stringify(N.calls);
+  const ok = promptSame && resultSame && orderSame && callsSame;
   if (!ok) fails++;
-  console.log(`${ok ? "✅" : "❌"} ${b.name.padEnd(16)} 프롬프트=${promptSame ? "동일" : "다름"} 반환=${resultSame ? "동일" : "다름"} 호출순서=${orderSame ? "동일" : "다름"}`);
+  console.log(`${ok ? "✅" : "❌"} ${b.name.padEnd(18)} 프롬프트=${promptSame ? "동일" : "다름"} 반환=${resultSame ? "동일" : "다름"} 호출순서=${orderSame ? "동일" : "다름"} 호출인자=${callsSame ? "동일" : "다름"}`);
   if (!ok) {
-    console.log(`   pristine: ${JSON.stringify(P).slice(0, 300)}`);
-    console.log(`   new     : ${JSON.stringify(N).slice(0, 300)}`);
+    if (!callsSame) {
+      const a = P.calls, c = N.calls;
+      for (let i = 0; i < Math.max(a.length, c.length); i++) {
+        if (JSON.stringify(a[i]) !== JSON.stringify(c[i])) {
+          console.log(`   첫 불일치 호출 #${i}`);
+          console.log(`     pristine: ${JSON.stringify(a[i]).slice(0, 240)}`);
+          console.log(`     new     : ${JSON.stringify(c[i]).slice(0, 240)}`);
+          break;
+        }
+      }
+    }
+    if (!promptSame || !resultSame) {
+      console.log(`   pristine: ${JSON.stringify({ p: P.prompt, r: P.result, e: P.err }).slice(0, 240)}`);
+      console.log(`   new     : ${JSON.stringify({ p: N.prompt, r: N.result, e: N.err }).slice(0, 240)}`);
+    }
   }
 }
 void reset;
-console.log(fails === 0 ? `\n✅ 8/8 분기 동등 (pristine ${PRISTINE_SHA.slice(0,8)})` : `\n❌ ${fails} 분기 불일치`);
+console.log(fails === 0 ? `\n✅ ${BRANCHES.length}/${BRANCHES.length} 분기 동등 (pristine ${PRISTINE_SHA.slice(0,8)})` : `\n❌ ${fails} 분기 불일치`);
 fs.rmSync(sandbox, { recursive: true, force: true });
 if (fails) process.exit(1);
