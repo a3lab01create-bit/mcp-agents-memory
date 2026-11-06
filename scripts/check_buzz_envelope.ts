@@ -502,7 +502,27 @@ check("venue: <context> 없이 <buzz-event> 로 시작하는 봉투도 자기 �
     "Content: PLURAL-SENTINEL 두 번째",
     "</buzz-events>",
   ].join("\n");
-  assert.equal(venueFromBuzzMessage(plural), "buzz:DevRoom", "복수 봉투는 첫 이벤트의 채널");
+  assert.equal(venueFromBuzzMessage(plural), "buzz:DevRoom", "복수 봉투: 이벤트들이 같은 채널");
+
+  // 🔴 (코디 반례) 이벤트들이 **서로 다른 채널**이면 고르지 않고 null.
+  //    첫 Content 앞까지만 읽으면 둘째 이벤트 머리글에 닿지 못해 buzz:RoomA 가 묶음 전체의 자리가 된다.
+  const mixed = plural
+    .replace("Channel: DevRoom (#00000000-0000-0000-0000-000000000000)\nKind: 9\nContent: PLURAL-SENTINEL 첫 번째",
+             "Channel: RoomA (#00000000-0000-0000-0000-000000000000)\nKind: 9\nContent: PLURAL-SENTINEL 첫 번째")
+    .replace("Channel: DevRoom (#00000000-0000-0000-0000-000000000000)\nContent: PLURAL-SENTINEL 두 번째",
+             "Channel: RoomB (#00000000-0000-0000-0000-000000000001)\nContent: PLURAL-SENTINEL 두 번째");
+  assert.ok(mixed.includes("RoomA") && mixed.includes("RoomB"), "반례가 실제로 두 채널을 담았다");
+  assert.equal(venueFromBuzzMessage(mixed), null, "복수 봉투: 채널이 섞이면 null");
+  assert.equal(buzzTurnVenue(mixed), null, "캡처기가 쓰는 자리에서도 null (앞 턴을 덮지 않는다)");
+
+  // 둘째 이벤트의 머리글을 못 읽으면(Content 없음) 통째로 null — 첫 이벤트 값으로 때우지 않는다
+  const halfRead = plural.replace("Content: PLURAL-SENTINEL 두 번째", "두 번째 (Content 라벨 없음)");
+  assert.equal(venueFromBuzzMessage(halfRead), null, "복수 봉투: 한 이벤트라도 머리글을 못 읽으면 null");
+
+  // 사람 말 속에 이벤트 경계가 인용돼 있어도 틀린 자리를 쓰지 않는다 (null 로 기운다)
+  const quotedBoundary = solo(`DevRoom (#00000000-0000-0000-0000-000000000000)`,
+    "--- Event 2 (@mention) ---", "Channel: OtherRoom (#00000000-0000-0000-0000-000000000001)");
+  assert.equal(venueFromBuzzMessage(quotedBoundary), null, "인용된 이벤트 경계 → 자리를 고르지 않는다");
 
   // DM — <context> 경로가 `Scope: dm` 으로 내는 값과 같아야 한다 (실측 382행 전부 buzz:dm)
   assert.equal(venueFromBuzzMessage(solo("DM (#50669db7-8637-4739-89e2-67ce1523cd55)")), "buzz:dm");

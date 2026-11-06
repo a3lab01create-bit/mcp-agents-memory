@@ -85,8 +85,15 @@ const EVENT_ONLY_OPEN = /^<buzz-events?[\s>]/;
 const EVENT_CONTENT_LINE = /^Content: /;
 
 /**
- * 머리글을 찾는 줄 수 상한. 실측(단독 이벤트 39행, 2026-11-06): 채널 줄은 3행(단독)·4행
- * (복수 — `--- Event 1 (…) ---` 머리가 한 줄 더 붙는다), `Content:` 줄은 7·8행이다.
+ * 복수 봉투(`<buzz-events count="n">`)에서 이벤트 하나가 시작되는 줄.
+ * 사람 말 속에 이 모양이 인용돼 있으면 그 조각을 이벤트로 **잘못** 보게 되는데, 그때는 조각에
+ * `Content:` 가 없거나 채널이 어긋나 결과가 null 이 된다 — 틀린 자리를 쓰는 쪽으로는 안 기운다.
+ */
+const EVENT_BOUNDARY = /^--- Event \d+ \(.*\) ---$/;
+
+/**
+ * 이벤트 **하나**의 머리글을 찾는 줄 수 상한. 실측(단독 이벤트 39행, 2026-11-06): 채널 줄은
+ * 3행(단독)·4행(복수 — `--- Event 1 (…) ---` 머리가 한 줄 더 붙는다), `Content:` 줄은 7·8행이다.
  */
 const EVENT_HEADER_LINES = 12;
 
@@ -461,9 +468,13 @@ export function looksLikeBuzzTurn(message: string): boolean {
  * (관측 39행, 전부 `codex-mcp-client` = MCP `save_message` 경로 → `hot_path.ts` 가 자리를 읽는 자리.
  *  그중 2행은 세션에 앞선 버즈 턴이 없어 물려받을 값도 없이 venue 가 NULL 로 남았다.)
  *
- * 머리글의 `Channel: <이름> (#uuid)` 줄만 본다 — **`Content:` 줄 앞까지, 최대 12줄**. 사람 말 안에
- * 인용된 봉투의 채널 줄은 `Content:` 뒤에 오므로 구조적으로 닿지 않는다. 이름이 여러 개 보이면
- * (복수 이벤트가 채널을 섞은 경우) 고르지 않고 null.
+ * 머리글의 `Channel: <이름> (#uuid)` 줄만 본다 — 이벤트마다 **`Content:` 줄 앞까지, 최대 12줄**.
+ * 사람 말 안에 인용된 봉투의 채널 줄은 `Content:` 뒤에 오므로 구조적으로 닿지 않는다.
+ *
+ * 🔴 복수 봉투(`<buzz-events count="n">`)는 **이벤트를 하나씩 다 읽고 채널이 전부 같을 때만** 쓴다.
+ *    첫 `Content:` 앞까지만 보면 둘째 이벤트의 머리글에 영원히 닿지 못해 **첫 이벤트의 채널이
+ *    묶음 전체(와 뒤따르는 답글)의 자리가 된다** — 코디가 `RoomA`/`RoomB` 합성 반례로 잡았다.
+ *    이벤트가 하나라도 머리글을 못 읽으면(`Content:` 없음·상한 밖) 통째로 null 이다.
  *
  * `Channel:` 을 uuid 로만 적은 봉투는 **null** 이다 — 거기서 `"buzz"` 를 돌려주면 안 된다:
  * 캡처기들이 `venue = own ?? 앞턴` (jsonl_capture.ts:373) 또는 `if (own) 앞턴 = own`
@@ -476,15 +487,24 @@ export function looksLikeBuzzTurn(message: string): boolean {
  */
 function venueFromBuzzEvent(text: string): string | null {
   if (!EVENT_ONLY_OPEN.test(text)) return null;
-  const lines = text.split("\n", EVENT_HEADER_LINES).map((l) => l.replace(/\r$/, ""));
-  const end = lines.findIndex((l) => EVENT_CONTENT_LINE.test(l));
-  if (end < 0) return null; // 머리글이 안 닫힌다 → 인용된 채널 줄을 읽을 위험
+  const lines = text.split("\n").map((l) => l.replace(/\r$/, "").trimEnd());
+  // 이벤트 경계로 조각낸다. 경계가 없으면(단독 봉투) 전체가 한 이벤트,
+  // 있으면 첫 경계 앞은 묶음 머리(`<buzz-events count="n">`)라 이벤트가 아니다.
+  const starts = lines.flatMap((l, i) => (EVENT_BOUNDARY.test(l) ? [i] : []));
+  const events: string[][] = starts.length
+    ? starts.map((from, k) => lines.slice(from, starts[k + 1] ?? lines.length))
+    : [lines];
   const names = new Set<string>();
-  for (const line of lines.slice(0, end)) {
-    const m = CHANNEL_LINE.exec(line.trimEnd());
-    if (m) names.add(m[1]);
+  for (const event of events) {
+    const head = event.slice(0, EVENT_HEADER_LINES);
+    const end = head.findIndex((l) => EVENT_CONTENT_LINE.test(l));
+    if (end < 0) return null; // 머리글이 안 닫힌다 → 인용된 채널 줄을 읽을 위험
+    for (const line of head.slice(0, end)) {
+      const m = CHANNEL_LINE.exec(line);
+      if (m) names.add(m[1]);
+    }
   }
-  if (names.size !== 1) return null;
+  if (names.size !== 1) return null; // 채널을 못 읽었거나, 이벤트들이 서로 다른 채널이다
   const [name] = names;
   return name === "DM" ? "buzz:dm" : `buzz:${name}`;
 }
