@@ -519,10 +519,36 @@ check("venue: <context> 없이 <buzz-event> 로 시작하는 봉투도 자기 �
   const halfRead = plural.replace("Content: PLURAL-SENTINEL 두 번째", "두 번째 (Content 라벨 없음)");
   assert.equal(venueFromBuzzMessage(halfRead), null, "복수 봉투: 한 이벤트라도 머리글을 못 읽으면 null");
 
-  // 사람 말 속에 이벤트 경계가 인용돼 있어도 틀린 자리를 쓰지 않는다 (null 로 기운다)
+  // 사람 말 속에 이벤트 경계가 인용돼 있어도 틀린 자리를 쓰지 않는다 (인용 쪽에 Content 가 없는 경우)
   const quotedBoundary = solo(`DevRoom (#00000000-0000-0000-0000-000000000000)`,
     "--- Event 2 (@mention) ---", "Channel: OtherRoom (#00000000-0000-0000-0000-000000000001)");
-  assert.equal(venueFromBuzzMessage(quotedBoundary), null, "인용된 이벤트 경계 → 자리를 고르지 않는다");
+  assert.equal(venueFromBuzzMessage(quotedBoundary), "buzz:DevRoom",
+    "인용된 경계는 단독 봉투에서 아예 안 본다 → 진짜 머리글이 이긴다");
+
+  // 🔴 (코디 반례 2회차-1) 인용 쪽에 Content 까지 있으면 **인용된 채널이 진짜 채널을 밀어냈다**.
+  //    단독 봉투는 경계 줄을 아예 보지 않으므로 진짜 머리글이 이겨야 한다.
+  const quotedFull = solo(`RealRoom (#00000000-0000-0000-0000-000000000000)`,
+    "--- Event 2 (@mention) ---", "Channel: QuotedRoom (#00000000-0000-0000-0000-000000000001)",
+    "Content: quoted");
+  assert.ok(quotedFull.includes("QuotedRoom"), "반례가 실제로 인용 채널을 담았다");
+  assert.equal(venueFromBuzzMessage(quotedFull), "buzz:RealRoom", "인용된 채널이 진짜 채널을 밀어내지 않는다");
+  assert.equal(buzzTurnVenue(quotedFull), "buzz:RealRoom", "캡처기가 쓰는 자리에서도");
+
+  // 🔴 (코디 반례 2회차-2) 이벤트별 확인 — 둘째 이벤트의 채널을 못 읽으면 첫 이름으로 통과하면 안 된다
+  const secondUuidOnly = plural
+    .replace("Channel: DevRoom (#00000000-0000-0000-0000-000000000000)\nKind: 9\nContent: PLURAL-SENTINEL 첫 번째",
+             "Channel: RoomA (#00000000-0000-0000-0000-000000000000)\nKind: 9\nContent: PLURAL-SENTINEL 첫 번째")
+    .replace("Channel: DevRoom (#00000000-0000-0000-0000-000000000000)\nContent: PLURAL-SENTINEL 두 번째",
+             "Channel: 00000000-0000-0000-0000-000000000001\nContent: PLURAL-SENTINEL 두 번째");
+  assert.ok(secondUuidOnly.includes("RoomA"), "반례가 첫 이벤트에 이름 있는 채널을 담았다");
+  assert.equal(venueFromBuzzMessage(secondUuidOnly), null, "둘째 이벤트 채널이 uuid 뿐 → null");
+  const secondMissing = secondUuidOnly.replace("Channel: 00000000-0000-0000-0000-000000000001\n", "");
+  assert.ok(!secondMissing.includes("000000000001"), "반례가 실제로 채널 줄을 뺐다");
+  assert.equal(venueFromBuzzMessage(secondMissing), null, "둘째 이벤트에 채널 줄 없음 → null");
+
+  // 복수 봉투인데 이벤트 경계가 아예 없거나 사람 말 뒤에만 있으면 가를 수 없다 → null
+  const noBoundary = plural.split("\n").filter((l) => !l.startsWith("--- Event ")).join("\n");
+  assert.equal(venueFromBuzzMessage(noBoundary), null, "복수 봉투에 경계 없음 → null");
 
   // DM — <context> 경로가 `Scope: dm` 으로 내는 값과 같아야 한다 (실측 382행 전부 buzz:dm)
   assert.equal(venueFromBuzzMessage(solo("DM (#50669db7-8637-4739-89e2-67ce1523cd55)")), "buzz:dm");

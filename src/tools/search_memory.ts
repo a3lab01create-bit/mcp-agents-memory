@@ -115,7 +115,7 @@ date_range 인식 형식:
           "**수집·실행 경로** 한정 (예: 'claude-code', 'gemini-cli-mcp-client'). 'buzz' 는 버즈 게시 원문을 직접 수집한 행이다 — 실행 환경이 아니라 수집 경로이고, 그 행의 실행 환경은 미상이다. **대화 공간으로 좁히려면 이 칸이 아니라 venue 를 쓴다.** 생략 또는 '*' 이면 cross-platform(전 플랫폼)."
         ),
         device_scope: z.enum(['local', 'global']).optional().describe(
-          "**캡처 장비** 한정. 'global'(기본): 전 기기 검색(넓게). 'local': 현재 기기(hostname)로 한정(이어받기용, 좁게). zero-config — 서버가 hostname 자동 해석. 주의: device_name 은 그 행을 적은 프로세스의 기계이고 글을 쓴 사람의 기기가 아니다 (버즈 원문 수집 행은 NULL 이라 'local' 에 안 걸린다)."
+          "**캡처 장비** 한정. 'global'(기본): 전 기기 검색(넓게). 'local': 현재 기기(hostname)로 한정(이어받기용, 좁게). zero-config — 서버가 hostname 자동 해석. 주의: device_name 은 그 행을 적은 프로세스의 기계이고 글을 쓴 사람의 기기가 아니다. 버즈 원문 수집 행은 NULL 이라 'local' 에 안 걸린다 — 단 **pinned(강제기억) 행은 device_name 이 NULL 이어도 'local' 에 포함**된다(강제기억은 맥락 불문 노출)."
         ),
         limit: z.number().int().min(1).max(50).optional().describe(`최대 결과 수 (default ${DEFAULT_LIMIT})`),
         include_archived: z.boolean().optional().describe("archived 메모리도 포함 (default false)"),
