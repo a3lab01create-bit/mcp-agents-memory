@@ -1,5 +1,100 @@
 # Changelog
 
+## 0.9.34 — 2026-11-06
+
+### The tagger's decision flow is separable from the database, and three tagging arms were measured (#36)
+
+Comparing tagging approaches means running the tagger many times over stored
+rows, which is exactly what must not touch the production tables. Injecting a
+few functions was not enough: `tagger.ts` imports `db` statically, as does
+`dtag_promoter.ts` behind it, and `SYSTEM_PROMPT` reads `getPrompt` at module
+level — the imports run whichever functions you swap. The module had to split.
+
+`tagger_core.ts` now holds prompt assembly, the decision flow and parsing, and
+imports exactly one module (`project_registry.js`, itself import-free).
+`tagger.ts` stays the database adapter: same `tagMessage(input)` signature and
+return shape, assembling ports and calling `runTagger`. Write capability is in
+the type rather than in a runtime check — `getOrCreateTag` lives on
+`OperationalPorts`, and `EvalPorts` declares it `undefined`, so the tag-creation
+path is closed at compile time for anything running an evaluation.
+
+Two behaviours were deliberately left as they were. The alias-chain query
+differs between its two call sites (the registry path caps recursion at depth
+20, the non-registry path has no cap); `resolveCanonical(name, { maxDepth })`
+carries each site's current value instead of unifying them. And
+`newly_created_p_tag_name` is still filled whenever the NEW path runs, even
+when get-or-create returned an existing id; the create-vs-reuse distinction is
+reported only in the evaluation-only `TaggerTrace`.
+
+On top of that split, a file-based runner compares three arms: the current
+tagger alone (A), the same tagger given an agent's candidate and evidence (B),
+and the agent's candidate alone (C). Inputs are files, and every run records
+their sha256 alongside the arm list. It does not call a model by default —
+canned responses exercise the machinery, and `--live-model` is required for real
+calls, at which point the model registry is imported dynamically. The no-db
+check follows that dynamic import too, confirming the runner cannot reach
+`db.ts` or `pg`. `TagInput.agentCandidate` is optional and `agentCandidateLine()`
+returns an empty string when it is absent, so prompts on existing call paths are
+byte-identical; the equivalence check holds that.
+
+The measurement did not establish an accuracy improvement. Of 30 cases, 16 were
+scorable, and the arms scored 12, 13 and 12 — a one-case difference with the
+run-to-run variance unmeasured. What it did surface is that none of the three
+arms abstains: across eight rows whose subject is outside the registry, all
+three attached an existing project tag, and the candidate generator returned an
+empty candidate zero times in thirty despite the schema allowing it. Those eight
+rows cover three projects and arms B and C share one candidate file, so this is
+a direction to test next — abstention, evaluated together with whether raising
+it starts dropping correct projects — not a measured rate.
+
+### A conversation's venue is read from envelopes that begin with the event itself (#37)
+
+`venue` records where a conversation happened; `agent_platform` records which
+path stored it. A row saved through the MCP `save_message` tool can arrive as a
+bare Buzz turn — body starting at character one with `<buzz-event
+type="@mention">`, no `<base>` manual and no `<context>` block. The venue reader
+looked only for those two shapes, so it returned null even though the envelope's
+own header spells out `Channel: <name> (#uuid)` three lines down. Thirty-nine
+stored rows have that shape, all of them `codex-mcp-client`; thirty-seven
+inherited a venue from an earlier Buzz turn in the same session, and two had no
+earlier turn and so recorded nothing.
+
+The reader now falls back to the envelope header, but only when no `<context>`
+was found at all — a turn whose `<context>` is present but unreadable keeps its
+previous outcome. The opening tag decides how the body is read. A single
+`<buzz-event>` is one event and its event-boundary lines are never consulted,
+because quoted prose containing `--- Event 2 ---` would otherwise displace the
+real header and the channel named *in the quotation* would become the venue. A
+`<buzz-events count="n">` bundle is split on those boundaries, each event's
+channel is resolved on its own, and a venue is recorded only when every event
+agrees; an event whose header is truncated or whose channel is a bare uuid makes
+the whole bundle unreadable rather than letting the first event's name stand.
+
+Reading only named channels is the load-bearing restriction.
+`looksLikeBuzzTurn` was left untouched for the same reason: a channel-less
+`"buzz"` would be worse than nothing, because the captures treat their own
+reading as authoritative over the session's remembered channel — `venue = own ??
+previous` in one, `if (own) previous = own` in three others. The 532 rows whose
+envelope opens with `<new-message-arrived-…>` name their channel by uuid only,
+and those are precisely the rows that would have been demoted. A header naming
+the channel `DM` maps to `buzz:dm`, matching what the `<context>` path produces
+from `Scope: dm`; every one of the 382 rows with that header already carries
+that venue.
+
+Running old and new readers over 12,804 candidate rows separates into 39 rows
+that gain a value and none that lose or change one. Thirty-seven of the 39 agree
+character-for-character with what is already stored, and the remaining two are
+the rows that had nothing; those two were backfilled, venue column only.
+
+The same three columns are now described consistently. The data-model table had
+no row for `venue`, `device_name` or `external_uuid` at all, which is where the
+confusion started: `venue` is the conversation space, `agent_platform` is the
+collection-or-execution path (`buzz` meaning relay-ingested, so the execution
+environment of such a row is unknown), `device_name` is the machine that
+captured the row and not the device someone typed on. The `search_memory` tool
+descriptions say the same, including that a `local` device scope still returns
+pinned rows whose `device_name` is null.
+
 ## 0.9.33 — 2026-11-03
 
 ### Only the cold-path owner drains on shutdown (#35)
