@@ -464,6 +464,84 @@ check("venue: 정리가 거절한 봉투도 자기 채널을 읽고, 못 읽으�
   assert.equal(classifySessionVenue("리팩터 해줘", "claude-vscode"), "terminal");
 });
 
+check("venue: <context> 없이 <buzz-event> 로 시작하는 봉투도 자기 채널을 읽는다", () => {
+  // 관측된 모양(39행): 블록 바로 뒤 Event ID → Channel → Kind → From → Time → Content
+  const solo = (channel: string, ...extra: string[]) =>
+    [
+      '<buzz-event type="@mention">',
+      `Event ID: ${HEX}`,
+      `Channel: ${channel}`,
+      "Kind: 9",
+      `From: Owner (npub: npub1owner, hex: ${HEX})`,
+      "Time: 2026-10-31T09:58:25+00:00",
+      "Content: SOLO-SENTINEL 이것 좀 봐줘",
+      ...extra,
+      "</buzz-event>",
+    ].join("\n");
+
+  const UUID = "#761cc7a8-e552-475f-a247-352e60a77363";
+  assert.equal(venueFromBuzzMessage(solo(`Analyze_Dashboard (${UUID})`)), "buzz:Analyze_Dashboard");
+  assert.equal(buzzTurnVenue(solo(`Analyze_Dashboard (${UUID})`)), "buzz:Analyze_Dashboard", "캡처기가 쓰는 자리");
+
+  // (코디 조건 1) 사람 말 안에 다른 채널의 봉투가 인용돼 있어도 **대상 이벤트의 채널**을 쓴다
+  const quoted = solo(`Analyze_Dashboard (${UUID})`,
+    "인용: <buzz-event type=\"@mention\">", `Channel: OtherRoom (#00000000-0000-0000-0000-000000000000)`, "</buzz-event>");
+  assert.equal(venueFromBuzzMessage(quoted), "buzz:Analyze_Dashboard", "인용된 채널을 읽지 않는다");
+
+  // 복수 이벤트 봉투 — `--- Event 1 … ---` 머리가 한 줄 더 붙는다 (관측 7행, 전부 채널 1종)
+  const plural = [
+    '<buzz-events count="2">',
+    "--- Event 1 (@mention) ---",
+    `Event ID: ${HEX}`,
+    `Channel: DevRoom (#00000000-0000-0000-0000-000000000000)`,
+    "Kind: 9",
+    "Content: PLURAL-SENTINEL 첫 번째",
+    "--- Event 2 (@mention) ---",
+    `Event ID: ${HEX}`,
+    `Channel: DevRoom (#00000000-0000-0000-0000-000000000000)`,
+    "Content: PLURAL-SENTINEL 두 번째",
+    "</buzz-events>",
+  ].join("\n");
+  assert.equal(venueFromBuzzMessage(plural), "buzz:DevRoom", "복수 봉투는 첫 이벤트의 채널");
+
+  // DM — <context> 경로가 `Scope: dm` 으로 내는 값과 같아야 한다 (실측 382행 전부 buzz:dm)
+  assert.equal(venueFromBuzzMessage(solo("DM (#50669db7-8637-4739-89e2-67ce1523cd55)")), "buzz:dm");
+
+  // 채널을 uuid 로만 적은 봉투 → null. "buzz" 를 돌려주면 앞 턴 채널을 덮어쓴다
+  assert.equal(venueFromBuzzMessage(solo("761cc7a8-e552-475f-a247-352e60a77363")), null, "이름 없는 채널 줄");
+  // 🔴 회귀 방지: <new-message-arrived-…> 봉투는 채널을 uuid 로만 적는다 (관측 532행 전부).
+  //    여기서 "buzz" 가 나오면 jsonl_capture 의 `own ?? 앞턴` 이 buzz:<채널> 을 덮어쓴다.
+  const arrived = [
+    "<new-message-arrived-while-you-were-working>",
+    "</new-message-arrived-while-you-were-working>",
+    "",
+    '<buzz-event type="@mention">',
+    `Event ID: ${HEX}`,
+    "Channel: 34a89613-108d-4693-8599-af1aad3b7fc2",
+    "Content: ARRIVED-SENTINEL",
+    "</buzz-event>",
+  ].join("\n");
+  assert.equal(buzzTurnVenue(arrived), null, "새 메시지 봉투는 자리를 만들지 않는다");
+
+  // 머리글이 안 닫힌 봉투(Content 줄 없음) → null. 인용된 채널 줄을 읽을 위험을 피한다
+  const noContent = ['<buzz-event type="@mention">', `Event ID: ${HEX}`,
+    `Channel: DevRoom (#00000000-0000-0000-0000-000000000000)`, "</buzz-event>"].join("\n");
+  assert.equal(venueFromBuzzMessage(noContent), null, "Content 줄 없음");
+  // 머리글보다 한참 뒤에 Content 가 오는 봉투도 (상한 12줄)
+  const far = solo(`DevRoom (#00000000-0000-0000-0000-000000000000)`)
+    .replace("Kind: 9", Array(12).fill("Kind: 9").join("\n"));
+  assert.equal(venueFromBuzzMessage(far), null, "머리글 상한 밖");
+
+  // 🔴 <context> 경로는 그대로 — 자리를 못 읽으면 기존처럼 "buzz" (단독 경로로 안 내려간다)
+  assert.equal(buzzTurnVenue(CONTEXT.replace("Scope: thread", "Scope?? broken") + "\n" + EVENT), "buzz",
+    "<context> 는 찾았지만 Scope 를 못 읽음 → 기존 동작 유지");
+  assert.equal(venueFromBuzzMessage([CONTEXT, HISTORY, EVENT].join("\n")), "buzz:DevRoom", "<context> 경로 회귀 없음");
+
+  // 버즈 봉투가 아닌 글은 손대지 않는다
+  assert.equal(venueFromBuzzMessage("Channel: DevRoom (#00000000-0000-0000-0000-000000000000)\nContent: 메모"), null,
+    "이벤트 블록 없이 채널 줄만 있는 글");
+});
+
 check("venue: 큰 기록 파일을 뒤에서 거꾸로 읽어 직전 턴 채널 찾기 (청크 경계·한글)", () => {
   const f = path.join(os.tmpdir(), `venue-tail-${process.pid}.jsonl`);
   const userLine = (text: string) => JSON.stringify({ type: "user", message: { role: "user", content: text } });

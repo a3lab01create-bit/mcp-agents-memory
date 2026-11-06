@@ -66,6 +66,30 @@ const CONTEXT_OPEN = /^<context>\r?\n/;
 const BUZZ_SCOPE = /^Scope: (?:thread|channel|dm)\r?\n/;
 const BUZZ_CHANNEL = /(?:^|\n)Channel: .+ \(#[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\)\r?(?=\n|$)/;
 const CONTEXT_CLOSE = "\n</context>";
+
+/**
+ * 방 정보·이벤트 머리글의 채널 줄. **<context> 경로와 단독 이벤트 경로가 같은 상수를 쓴다** —
+ * 따로 쓰면 한쪽만 고쳐져 두 경로의 자리 값이 갈린다.
+ */
+const CHANNEL_LINE = /^Channel: (.+?) \(#[0-9a-f-]{36}\)$/;
+
+/**
+ * <context> 없이 이벤트 블록부터 시작하는 봉투 — `<buzz-event …>` / `<buzz-events count="n">`.
+ * 다른 턴 블록(`<new-message-arrived-…>`·`<what-you-were-working-on>`)은 **일부러 제외한다**:
+ * 전자는 채널을 uuid 로만 적어(관측 532행 전부) 이름을 못 읽고, 후자는 자유 서술이라
+ * 사람 말 속 `Channel:` 줄을 머리글로 오독할 수 있다.
+ */
+const EVENT_ONLY_OPEN = /^<buzz-events?[\s>]/;
+
+/** 이벤트 머리글의 끝 = 사람 말이 시작되는 줄. 여기서 멈춰야 인용된 봉투의 채널을 읽지 않는다. */
+const EVENT_CONTENT_LINE = /^Content: /;
+
+/**
+ * 머리글을 찾는 줄 수 상한. 실측(단독 이벤트 39행, 2026-11-06): 채널 줄은 3행(단독)·4행
+ * (복수 — `--- Event 1 (…) ---` 머리가 한 줄 더 붙는다), `Content:` 줄은 7·8행이다.
+ */
+const EVENT_HEADER_LINES = 12;
+
 /**
  * 이력 속 인용 한 건 — buzz-acp가 `[n] 이름 (pubkey) (시각): 본문` 으로 붙인다 (본문은 자르지 않음).
  * 이름이 없으면 `[n] pubkey (시각): 본문` (관측: hermes 2건, 09-26·09-30). 이름 없는 쪽을 먼저 본다 —
@@ -416,7 +440,7 @@ export function venueFromBuzzContext(message: string): string | null {
   if (scope !== "thread" && scope !== "channel" && scope !== "dm") return null;
   if (scope === "dm") return "buzz:dm";
   const channel = lines.find((l) => l.startsWith("Channel: "))?.trimEnd();
-  const m = channel ? /^Channel: (.+?) \(#[0-9a-f-]{36}\)$/.exec(channel) : null;
+  const m = channel ? CHANNEL_LINE.exec(channel) : null;
   return m ? `buzz:${m[1]}` : "buzz";
 }
 
@@ -432,11 +456,50 @@ export function looksLikeBuzzTurn(message: string): boolean {
   return close >= 0 && TURN_OPEN.test(text.slice(close + CONTEXT_CLOSE.length));
 }
 
-/** 버즈용: 원문 봉투(<base>…)든 정리본이든 venue를 읽는다 — 정리가 거절한 턴도. */
+/**
+ * 버즈용: `<context>` 없이 `<buzz-event …>` 로 바로 시작하는 봉투에서 자리를 읽는다.
+ * (관측 39행, 전부 `codex-mcp-client` = MCP `save_message` 경로 → `hot_path.ts` 가 자리를 읽는 자리.
+ *  그중 2행은 세션에 앞선 버즈 턴이 없어 물려받을 값도 없이 venue 가 NULL 로 남았다.)
+ *
+ * 머리글의 `Channel: <이름> (#uuid)` 줄만 본다 — **`Content:` 줄 앞까지, 최대 12줄**. 사람 말 안에
+ * 인용된 봉투의 채널 줄은 `Content:` 뒤에 오므로 구조적으로 닿지 않는다. 이름이 여러 개 보이면
+ * (복수 이벤트가 채널을 섞은 경우) 고르지 않고 null.
+ *
+ * `Channel:` 을 uuid 로만 적은 봉투는 **null** 이다 — 거기서 `"buzz"` 를 돌려주면 안 된다:
+ * 캡처기들이 `venue = own ?? 앞턴` (jsonl_capture.ts:373) 또는 `if (own) 앞턴 = own`
+ * (codex_capture.ts:559 · grok_capture.ts:248 · antigravity_capture.ts:245)로 쓰기 때문에, 채널 없는 `"buzz"` 가
+ * 물려받은 `buzz:<채널>` 을 덮어쓴다(실측 532행이 그 모양이다).
+ * 같은 이유로 `looksLikeBuzzTurn` 은 **건드리지 않는다**.
+ *
+ * 이름이 `DM` 이면 `buzz:dm` — `<context>` 경로가 `Scope: dm` 으로 내는 값과 맞춘다.
+ * 근거: `Channel: DM (#uuid)` 인 382행의 venue 가 **전부** `buzz:dm` 이다(예외 0건, 2026-11-06).
+ */
+function venueFromBuzzEvent(text: string): string | null {
+  if (!EVENT_ONLY_OPEN.test(text)) return null;
+  const lines = text.split("\n", EVENT_HEADER_LINES).map((l) => l.replace(/\r$/, ""));
+  const end = lines.findIndex((l) => EVENT_CONTENT_LINE.test(l));
+  if (end < 0) return null; // 머리글이 안 닫힌다 → 인용된 채널 줄을 읽을 위험
+  const names = new Set<string>();
+  for (const line of lines.slice(0, end)) {
+    const m = CHANNEL_LINE.exec(line.trimEnd());
+    if (m) names.add(m[1]);
+  }
+  if (names.size !== 1) return null;
+  const [name] = names;
+  return name === "DM" ? "buzz:dm" : `buzz:${name}`;
+}
+
+/**
+ * 버즈용: 원문 봉투(<base>…)든 정리본이든 venue를 읽는다 — 정리가 거절한 턴도.
+ * `<context>` 가 아예 없으면 단독 이벤트 봉투(`<buzz-event …>`)로 한 번 더 본다.
+ */
 export function venueFromBuzzMessage(message: string): string | null {
   try {
-    const loc = locateBuzzContext(message.trimStart());
-    return loc ? venueFromBuzzContext(loc.rest.slice(loc.pos)) : null;
+    const text = message.trimStart();
+    const loc = locateBuzzContext(text);
+    // 🔴 `<context>` 를 찾았는데 자리를 못 읽은 경우로는 내려오지 않는다 — 그 경로의 기존 동작
+    //    (Scope 를 못 읽으면 `buzz`)을 바꾸지 않기 위해서다.
+    return loc ? venueFromBuzzContext(loc.rest.slice(loc.pos)) : venueFromBuzzEvent(text);
   } catch {
     return null;
   }
