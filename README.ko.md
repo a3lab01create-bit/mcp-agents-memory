@@ -58,7 +58,7 @@
 | 컬럼 | 설명 |
 |---|---|
 | `user_id` | 사용자 식별 |
-| `agent_platform` | claude-code / codex / chatgpt / hermes-agent / openclaw / opencode 등 |
+| `agent_platform` | **수집·실행 경로**. 세션 캡처면 그 실행 환경(claude-code / codex-acp / hermes / grok-cli …), 버즈 게시 원문을 직접 수집한 행이면 `buzz` |
 | `agent_model` | opus-4-7 / gemini-3-pro / gpt-5.5 등 |
 | `subagent` | yes / no (1-level만 추적) |
 | `subagent_model` / `subagent_role` | sub일 때 채움. role은 free-form (lowercase normalize) |
@@ -69,7 +69,17 @@
 | `embedding` | `vector(3072)` — text-embedding-3-large |
 | `is_active` / `archived_at` | soft delete (무손실 보존) |
 | `is_pinned` | `manage_knowledge`로 강제 기억된 row, archive 면제 |
+| `venue` | **대화 공간**. `buzz:<채널>` / `buzz:dm` / `terminal`(사람과 1:1) / `slack` / `auto` / `subagent`. 알 수 없으면 NULL |
+| `device_name` | **캡처 장비** — 그 행을 적은 프로세스의 hostname(`os.hostname()`). 글을 쓴 사람의 기기가 **아니다**. 버즈 원문 수집 행은 의도적으로 NULL |
+| `external_uuid` | 중복 방지 키. 버즈 원문 수집본은 `buzz:<event id>` 접두라 **수집 경로 표식으로도 쓰인다** |
 | `created_at` / `updated_at` | |
+
+> **`venue` 와 `agent_platform` 에 둘 다 `buzz` 가 보이는 이유** — 뜻이 다른 두 칸이다.
+> 같은 버즈 채널 대화라도 **어디서 말했나**(`venue=buzz:<채널>`)와 **어느 경로로 저장됐나**가 따로다:
+> 버즈에 게시된 원문을 수집기가 직접 가져오면 `agent_platform=buzz`, 그 글을 받은 에이전트 세션
+> 로그에서 캡처되면 `agent_platform=codex-acp` 처럼 그 실행 환경이 들어간다. 그래서 한 발화가
+> 두 경로로 각각 남을 수 있고, 두 칸은 서로 대체되지 않는다.
+> ⚠️ `agent_platform=buzz` 행의 '실행 환경'은 **미상**이다 — 그 값은 실행 환경이 아니라 수집 경로다.
 
 **`user` 테이블** — Librarian이 memory에서 핵심 정보 promote
 
