@@ -18,20 +18,24 @@ embedding call) and `USER_NAME`. It then writes
 `~/.config/mcp-agents-memory/.env` (directory 700, file 600, written
 atomically), runs the migrations, creates the user row and prints a short
 health check. If the file already exists it asks before changing it, replaces
-only the keys it manages and keeps every other line. Passwords, URLs and keys
-are never echoed — typing shows `*`, at most 24 of them. Piped answers work for
-scripted installs.
+only the keys it manages and keeps every other line; a config that uses an SSH
+tunnel is left alone with a note, since setup doesn't manage tunnels. Values are
+read and quoted with the same dotenv parser the server uses, and the file is
+read back before it replaces the old one, so what gets saved is exactly what was
+checked. Passwords, URLs and keys are never echoed — typing shows `*`, at most
+24 of them. Piped answers work for scripted installs and are not echoed either.
 
 `migrate` skips `005`–`018` when neither `facts` nor `memories` exists. `019`
 creates the whole RESPEC v1 schema by itself, and databases that already went
-through the old steps have them recorded and their old tables renamed to
-`_legacy_*`, so nothing changes for existing installs.
+through the old steps have each one recorded in `migration_history`, so nothing
+changes for existing installs.
 
 Checked on a fresh pgvector database: wizard through a real terminal and through
-piped answers, a wrong password then a retry, a second run over an existing
-config (answering no, then yes), then the MCP server started from the written
-config — save, meaning-based search and the startup briefing all returned the
-new row.
+piped answers, a wrong password then a retry, a malformed URL then a retry, a
+password containing `$ ' " # \` read back unchanged, a second run over an
+existing config (answering no, then yes), an SSH-tunnel config refused, then the
+MCP server started from the written config — save, meaning-based search and the
+startup briefing all returned the new row.
 
 ## 0.9.34 — 2026-11-06
 

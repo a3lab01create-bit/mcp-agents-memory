@@ -19,8 +19,9 @@ import os from "os";
 import path from "path";
 import readline from "readline";
 import pg from "pg";
+import dotenv from "dotenv";
 import OpenAI from "openai";
-import { buildPoolConfig, configSearchPaths, db } from "./db.js";
+import { buildPoolConfig, db } from "./db.js";
 import { PACKAGE_VERSION } from "./version.js";
 
 const CONFIG_DIR = path.join(os.homedir(), ".config", "mcp-agents-memory");
@@ -35,7 +36,6 @@ const MANAGED_KEYS = [
   "DB_PASS",
   "DB_NAME",
   "DB_SSL",
-  "SSH_ENABLED",
   "OPENAI_API_KEY",
   "USER_NAME",
 ] as const;
@@ -78,12 +78,17 @@ async function ask(question: string, def?: string): Promise<string> {
   let answer: string;
   if (pipedAnswers) {
     answer = nextPiped();
-    out.write(label + answer + "\n");
+    out.write(label + "\n"); // piped answers are not echoed: a shifted answer file could put a secret here
   } else {
     answer = await new Promise<string>((resolve) => {
       const rl = readline.createInterface({ input: process.stdin, output: out });
+      let answered = false;
       rl.on("SIGINT", abort);
+      rl.on("close", () => {
+        if (!answered) abort(); // Ctrl-D / EOF
+      });
       rl.question(label, (a) => {
+        answered = true;
         rl.close();
         resolve(a);
       });
@@ -101,7 +106,7 @@ async function askSecret(question: string, opts: { keepHint?: boolean } = {}): P
   out.write(label);
   if (pipedAnswers) {
     const answer = nextPiped();
-    out.write("*".repeat(Math.min(answer.length, MASK_ECHO_MAX)) + "\n");
+    out.write("\n");
     return answer.trim();
   }
   const stdin = process.stdin;
@@ -117,6 +122,7 @@ async function askSecret(question: string, opts: { keepHint?: boolean } = {}): P
       resolve(buf.trim());
     };
     const onData = (data: Buffer) => {
+      if (data[0] === 0x1b) return; // arrow keys, Delete, … arrive as one escape sequence
       for (const ch of data.toString("utf8")) {
         if (ch === "\r" || ch === "\n") return finish();
         if (ch === "\u0003") {
@@ -159,21 +165,25 @@ function envKeyOf(line: string): string | null {
   return m ? m[1] : null;
 }
 
-function readExistingValue(lines: string[], key: string): string | undefined {
-  for (const line of lines) {
-    if (envKeyOf(line) !== key) continue;
-    let v = line.slice(line.indexOf("=") + 1).trim();
-    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
-    return v;
-  }
-  return undefined;
+/** Values exactly as the server will read them (same dotenv parser). */
+function readExistingValues(file: string): Record<string, string> {
+  if (!fs.existsSync(file)) return {};
+  return dotenv.parse(fs.readFileSync(file, "utf8"));
 }
 
-function quoteEnv(value: string): string {
-  if (/^[A-Za-z0-9_./:@%+,=-]*$/.test(value)) return value;
-  // single quotes keep $, #, spaces literal for dotenv
-  if (!value.includes("'")) return `'${value}'`;
-  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+/** Quote a value so dotenv reads back the identical string; refuse values it can't hold. */
+function quoteEnv(key: string, value: string): string {
+  if (/[\r\n]/.test(value)) throw new Error(`${key} can't contain a line break`);
+  const candidates = [
+    /^[A-Za-z0-9_./:@%+,=-]*$/.test(value) ? value : null,
+    `'${value}'`,
+    `"${value}"`,
+    `\`${value}\``,
+  ];
+  for (const c of candidates) {
+    if (c !== null && dotenv.parse(`${key}=${c}`)[key] === value) return c;
+  }
+  throw new Error(`${key} contains a mix of quote characters that a .env file can't hold`);
 }
 
 /** Writes managed keys, keeps unmanaged lines from an existing file. Atomic, mode 600. */
@@ -188,7 +198,7 @@ function writeConfig(file: string, settings: Settings): void {
   const lines: string[] = [`# mcp-agents-memory setup — written ${new Date().toISOString()}`];
   for (const key of MANAGED_KEYS) {
     const v = settings[key];
-    if (v !== undefined && v !== "") lines.push(`${key}=${quoteEnv(v)}`);
+    if (v !== undefined && v !== "") lines.push(`${key}=${quoteEnv(key, v)}`);
   }
   if (kept.length > 0) {
     lines.push("", "# (kept from the previous file)", ...kept);
@@ -197,6 +207,14 @@ function writeConfig(file: string, settings: Settings): void {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const tmp = `${file}.tmp-${process.pid}`;
   fs.writeFileSync(tmp, lines.join("\n") + "\n", { mode: 0o600 });
+  // what the server will read must be what was checked
+  const back = dotenv.parse(fs.readFileSync(tmp, "utf8"));
+  for (const key of MANAGED_KEYS) {
+    if ((back[key] ?? "") !== (settings[key] ?? "")) {
+      fs.rmSync(tmp, { force: true });
+      throw new Error(`${key} would not read back unchanged — config not written`);
+    }
+  }
   fs.renameSync(tmp, file);
   fs.chmodSync(file, 0o600);
 }
@@ -206,6 +224,7 @@ function applyToProcessEnv(settings: Settings): void {
   for (const key of MANAGED_KEYS) {
     process.env[key] = settings[key] ?? ""; // "" (not unset) so dotenv in children can't refill it
   }
+  process.env.SSH_ENABLED = ""; // setup checks a direct connection; tunnels are refused up front
   process.env.MEMORY_CONFIG_PATH = CONFIG_PATH;
 }
 
@@ -233,9 +252,11 @@ function describeTarget(s: Settings): string {
 }
 
 async function checkDatabase(settings: Settings): Promise<{ ok: true; version: string } | { ok: false; error: string }> {
+  if (!settings.DATABASE_URL && !settings.DB_HOST) return { ok: false, error: "no connection details entered" };
   applyToProcessEnv(settings);
-  const client = new pg.Client(buildPoolConfig().config);
+  let client: pg.Client | null = null;
   try {
+    client = new pg.Client(buildPoolConfig().config); // a malformed URL throws here — keep it in the retry loop
     await client.connect();
     const v = await client.query("SHOW server_version");
     const ext = await client.query("SELECT 1 FROM pg_available_extensions WHERE name = 'vector'");
@@ -246,7 +267,7 @@ async function checkDatabase(settings: Settings): Promise<{ ok: true; version: s
   } catch (err) {
     return { ok: false, error: scrub((err as Error).message || String(err)) };
   } finally {
-    await client.end().catch(() => {});
+    await client?.end().catch(() => {});
   }
 }
 
@@ -268,8 +289,8 @@ async function checkEmbeddingKey(key: string): Promise<{ ok: true; dims: number;
 // Wizard
 // ─────────────────────────────────────────────────────────────
 
-async function askDatabase(existing: string[]): Promise<Settings> {
-  const hadUrl = readExistingValue(existing, "DATABASE_URL");
+async function askDatabase(existing: Record<string, string>): Promise<Settings> {
+  const hadUrl = existing.DATABASE_URL;
   out.write("\nStep 1/3  Database (PostgreSQL with pgvector)\n");
   out.write("  1) Host, port, user, password, database name\n");
   out.write("  2) One connection URL (DATABASE_URL, e.g. from Supabase or Neon)\n");
@@ -277,12 +298,10 @@ async function askDatabase(existing: string[]): Promise<Settings> {
 
   if (mode === "2") {
     const url = await askSecret("DATABASE_URL", { keepHint: !!hadUrl });
-    const finalUrl = url || hadUrl || "";
-    if (!finalUrl) throw new Error("DATABASE_URL is required");
-    return { DATABASE_URL: finalUrl };
+    return { DATABASE_URL: url || hadUrl || "" };
   }
 
-  const prev = (k: ManagedKey) => readExistingValue(existing, k);
+  const prev = (k: ManagedKey) => existing[k];
   const host = await ask("Host", prev("DB_HOST") || "localhost");
   const port = await ask("Port", prev("DB_PORT") || "5432");
   const user = await ask("User", prev("DB_USER") || "postgres");
@@ -299,8 +318,27 @@ export async function runSetupWizard(): Promise<void> {
   out.write(`\nmcp-agents-memory setup  (v${PACKAGE_VERSION})\n`);
   out.write(`Config file: ${CONFIG_PATH}\n`);
 
-  const existing = readEnvLines(CONFIG_PATH);
-  if (existing.length > 0) {
+  // Other places the server reads first (checked before setup sets MEMORY_CONFIG_PATH itself)
+  const shadow: string[] = [];
+  const override = process.env.MEMORY_CONFIG_PATH;
+  const hasDb = (f: string) => {
+    const v = readExistingValues(f);
+    return !!(v.DATABASE_URL || v.DB_HOST);
+  };
+  if (override && path.resolve(override) !== CONFIG_PATH && fs.existsSync(override) && hasDb(override)) {
+    shadow.push(`MEMORY_CONFIG_PATH (${override})`);
+  }
+  const cwdEnv = path.resolve(process.cwd(), ".env");
+  if (cwdEnv !== CONFIG_PATH && fs.existsSync(cwdEnv) && hasDb(cwdEnv)) shadow.push(cwdEnv);
+
+  const existing = readExistingValues(CONFIG_PATH);
+  if (existing.SSH_ENABLED === "true") {
+    out.write("This config connects through an SSH tunnel (SSH_ENABLED=true), which setup doesn't manage.\n");
+    out.write("Edit the file by hand, or remove the SSH_* lines and run setup again. Nothing changed.\n");
+    process.exitCode = 1;
+    return;
+  }
+  if (fs.existsSync(CONFIG_PATH)) {
     out.write("A config file already exists here.\n");
     if (!(await confirm("Overwrite its database, key and user settings? (other lines are kept)", false))) {
       out.write("Kept the existing config. Nothing changed.\n");
@@ -330,7 +368,7 @@ export async function runSetupWizard(): Promise<void> {
 
   // Step 2 — embedding key (optional)
   out.write("\nStep 2/3  OpenAI API key (for meaning-based search; Enter to skip)\n");
-  const hadKey = readExistingValue(existing, "OPENAI_API_KEY");
+  const hadKey = existing.OPENAI_API_KEY;
   let key = await askSecret("OPENAI_API_KEY", { keepHint: !!hadKey });
   if (!key && hadKey) key = hadKey;
   let keyStatus = "skipped — keyword search only";
@@ -354,7 +392,7 @@ export async function runSetupWizard(): Promise<void> {
 
   // Step 3 — user
   out.write("\nStep 3/3  Your name in the memory\n");
-  const defaultUser = readExistingValue(existing, "USER_NAME") || os.userInfo().username || "me";
+  const defaultUser = existing.USER_NAME || os.userInfo().username || "me";
   settings.USER_NAME = await ask("USER_NAME", defaultUser);
 
   // Write
@@ -376,17 +414,13 @@ export async function runSetupWizard(): Promise<void> {
   );
   await db.close();
 
-  const shadow = configSearchPaths()
-    .slice(0, configSearchPaths().indexOf(CONFIG_PATH))
-    .filter((p) => p !== CONFIG_PATH && fs.existsSync(p) && /^(\s*export\s+)?(DATABASE_URL|DB_HOST)\s*=/m.test(fs.readFileSync(p, "utf8")));
-
   out.write("\nAll set.\n");
   out.write(`  ✔ Database   ${describeTarget(settings)} — PostgreSQL ${dbVersion}\n`);
   out.write(`  ✔ Schema     ${tables.rows[0].n}/3 core tables, ${applied.rows[0].n} migrations recorded\n`);
   out.write(`  ✔ User       ${settings.USER_NAME} (id ${userId})\n`);
   out.write(`  ${key && keyStatus.startsWith("OK") ? "✔" : "•"} Embeddings ${keyStatus}\n`);
   if (shadow.length > 0) {
-    out.write(`\n  ⚠ ${shadow.join(", ")} also has database settings and is read first.\n`);
+    out.write(`\n  ⚠ ${shadow.join(" and ")} also has database settings, and the server reads it first.\n`);
   }
   out.write("\nNext: connect your AI tools to the memory server, for example\n");
   out.write("  claude mcp add --scope user mcp-agents-memory -- mcp-agents-memory\n");
