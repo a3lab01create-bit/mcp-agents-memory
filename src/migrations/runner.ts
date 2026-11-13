@@ -43,11 +43,37 @@ function runOne(file: string): Promise<void> {
   });
 }
 
+/**
+ * 019 creates the whole RESPEC v1 schema on its own. 005–018 only upgrade the
+ * pre-RESPEC tables (`facts` / `memories`) and fail on an empty database, so
+ * they run only when one of those tables is still there. Databases that already
+ * went through them have them recorded in migration_history and renamed the old
+ * tables to _legacy_*, so skipping them there changes nothing.
+ */
+export const FRESH_SCHEMA_FIRST = "019_";
+
+export function selectMigrationFiles(files: string[], hasLegacyTables: boolean): string[] {
+  return hasLegacyTables ? files : files.filter((f) => f >= FRESH_SCHEMA_FIRST);
+}
+
+async function hasLegacyTables(): Promise<boolean> {
+  const { db } = await import("../db.js");
+  const r = await db.query(
+    "SELECT to_regclass('public.facts') IS NOT NULL OR to_regclass('public.memories') IS NOT NULL AS legacy"
+  );
+  return r.rows[0]?.legacy === true;
+}
+
 export async function runAllMigrations(): Promise<{ ran: number; files: string[] }> {
-  const files = listMigrationFiles();
-  if (files.length === 0) {
+  const all = listMigrationFiles();
+  if (all.length === 0) {
     console.log("ℹ️  No migration files found in", migrationsDir);
     return { ran: 0, files: [] };
+  }
+  const legacy = await hasLegacyTables();
+  const files = selectMigrationFiles(all, legacy);
+  if (files.length < all.length) {
+    console.log(`ℹ️  No pre-RESPEC tables — skipping ${all.length - files.length} legacy upgrade step(s).`);
   }
   console.log(`📦 Running ${files.length} migration(s) from ${migrationsDir}`);
   for (const f of files) {

@@ -393,7 +393,7 @@ async function cli() {
   if (cmd === "setup") {
     const { runSetupWizard } = await import("./setup.js");
     await runSetupWizard();
-    process.exit(0);
+    process.exit(process.exitCode ?? 0);
   }
 
   if (cmd === "buzz-ingest") {
