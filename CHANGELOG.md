@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.9.35 — 2026-11-13
+
+### `mcp-agents-memory setup` works again, and `migrate` runs on an empty database
+
+Since the RESPEC v1 rewrite, `setup` only printed "Setup wizard is being
+rewritten" and exited with an error, while `help` still promised that it writes
+the config and runs the migrations. A new install had to hand-write `.env`, and
+even then `migrate` stopped at the first file: `005_provenance` upgrades the
+pre-RESPEC `facts`/`memories` tables and fails when they don't exist.
+
+`setup` now walks through three steps. It asks how to reach PostgreSQL (host,
+port, user, password, database — or one `DATABASE_URL`) and checks the
+connection and that pgvector is available before anything is written; a failed
+check can be retried. It asks for `OPENAI_API_KEY` (optional; checked with one
+embedding call) and `USER_NAME`. It then writes
+`~/.config/mcp-agents-memory/.env` (directory 700, file 600, written
+atomically), runs the migrations, creates the user row and prints a short
+health check. If the file already exists it asks before changing it, replaces
+only the keys it manages and keeps every other line; a config that uses an SSH
+tunnel is left alone with a note, since setup doesn't manage tunnels. Values are
+read and quoted with the same dotenv parser the server uses, and the file is
+read back before it replaces the old one, so what gets saved is exactly what was
+checked. Passwords, URLs and keys are never echoed — typing shows `*`, at most
+24 of them. Piped answers work for scripted installs and are not echoed either.
+
+`migrate` skips `005`–`018` when neither `facts` nor `memories` exists. `019`
+creates the whole RESPEC v1 schema by itself, and databases that already went
+through the old steps have each one recorded in `migration_history`, so nothing
+changes for existing installs.
+
+Checked on a fresh pgvector database: wizard through a real terminal and through
+piped answers, a wrong password then a retry, a malformed URL then a retry, a
+password containing `$ ' " # \` read back unchanged, a second run over an
+existing config (answering no, then yes), an SSH-tunnel config refused, then the
+MCP server started from the written config — save, meaning-based search and the
+startup briefing all returned the new row.
+
 ## 0.9.34 — 2026-11-06
 
 ### The tagger's decision flow is separable from the database, and three tagging arms were measured (#36)
