@@ -8,7 +8,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { registerTools } from "./tools.js";
 import { startColdPathWorker, stopColdPathWorker, drainColdPath } from "./cold_path/worker.js";
 import { collectBrief, formatBriefMarkdown } from "./briefing.js";
-import { captureSessionStart, captureSessionEnd } from "./auto_save/jsonl_capture.js";
+import { captureSessionStart, captureSessionEnd, captureClientKnown } from "./auto_save/jsonl_capture.js";
+import { detectClientPlatform } from "./agent_identity.js";
 import {
   captureSessionStart as captureCodexStart,
   captureSessionEnd as captureCodexEnd,
@@ -301,6 +302,12 @@ async function runMcpServer() {
 
   registerTools(server);
 
+  // 클로드 수집: cwd 가 "/" 인 서버는 클라이언트가 클로드일 때만 전체 감시한다 (jsonl_capture.captureClientKnown).
+  // clientInfo 는 initialize 뒤에야 안다 → initialized 알림에서 넘긴다.
+  server.server.oninitialized = () => {
+    captureClientKnown(detectClientPlatform(server));
+  };
+
   installShutdownHandlers();
   startParentWatchdog();
 
@@ -419,21 +426,29 @@ async function cli() {
     const args = process.argv.slice(3);
     const dryRun = args.includes("--dry-run");
     const files = args.filter((a) => a !== "--dry-run");
-    const bad = files.filter((f) => !f.endsWith(".jsonl") || !fs.existsSync(f));
-    if (files.length === 0 || bad.length > 0) {
+    const isFile = (f: string) => { try { return fs.statSync(f).isFile(); } catch { return false; } };
+    const bad = files.filter((f) => !f.endsWith(".jsonl") || !isFile(f));
+    // 실시간 수집은 <sid>/subagents/*.jsonl 을 안 넣는다 → 다시 채우기도 같은 범위만
+    const nested = files.filter((f) => path.basename(path.dirname(path.resolve(f))) === "subagents");
+    if (files.length === 0 || bad.length > 0 || nested.length > 0) {
       console.error(files.length === 0
         ? "❌ backfill-claude: jsonl 파일 경로를 하나 이상 주세요."
-        : `❌ backfill-claude: 없는 파일이거나 .jsonl 이 아닙니다: ${bad.join(", ")}`);
+        : bad.length > 0
+          ? `❌ backfill-claude: 없는 파일이거나 .jsonl 파일이 아닙니다: ${bad.join(", ")}`
+          : `❌ backfill-claude: 하위 에이전트 기록(subagents/)은 실시간 수집도 안 넣습니다: ${nested.join(", ")}`);
       process.exit(1);
     }
     const { backfillJsonlFile } = await import("./auto_save/jsonl_capture.js");
     if (!dryRun) await db.connect();
+    let failed = 0;
     for (const f of files) {
       const r = await backfillJsonlFile(path.resolve(f), { dryRun });
+      failed += r.failed;
       console.log(JSON.stringify({ dryRun, ...r }));
     }
     if (!dryRun) await db.close();
-    process.exit(0);
+    if (failed > 0) console.error(`❌ backfill-claude: ${failed} line(s) failed to insert — see errors above; re-run after fixing (stored lines are skipped).`);
+    process.exit(failed > 0 ? 1 : 0);
   }
 
   if (cmd === "retag-ptag") {

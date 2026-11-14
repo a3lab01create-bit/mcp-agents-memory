@@ -10,13 +10,20 @@ from the server's working directory, retried for ten seconds and then gave up
 with a line in the server log, so every turn of those sessions was silently
 lost (one MacBook session lost about 33 hours of conversation).
 
-When the working directory is the filesystem root, the capture now watches
-every `~/.claude/projects/<slug>/*.jsonl` — the same recursive watch plus a
-3-second poll that the Codex capture uses. Nested transcripts
-(`<session>/subagents/*.jsonl`) and dot folders are never read. Servers started
-in any other folder still watch only that folder, so a server started by
-another client does not begin collecting every Claude conversation on the
-machine.
+When the working directory is the filesystem root and the MCP client is Claude
+Code (`claude-code`) or the desktop app (`local-agent-mode-…`), the capture now
+watches every `~/.claude/projects/<slug>/*.jsonl`: a recursive watch on macOS
+and Windows plus a 3-second poll, as in the Codex capture; on Linux, where a
+recursive watch costs one inotify watch per nested file, only the poll. The
+client is known only after MCP initialization, so a root-directory server waits
+for it; a server that another client starts in `/` stays off. Nested
+transcripts (`<session>/subagents/*.jsonl`) and dot folders are never read.
+Servers started in any other folder still watch only that folder.
+
+One unreadable transcript no longer stops the capture of every file listed
+after it — each file's flush now fails on its own and is logged once — and a
+watcher error closes the watcher and falls back to polling instead of crashing
+the server.
 
 A transcript file that was created up to 60 seconds before the capture armed is
 now read from its first line. Before, every file that already existed at arm
@@ -32,7 +39,9 @@ transcript from the start and stores only the lines that are not in the
 database yet, so it is safe to run twice. Each row keeps the line's own
 timestamp as `created_at` — a backfill stamped "now" would push week-old
 conversation to the top of the start brief — and this machine's hostname as
-`device_name`, so run it on the machine that holds the file.
+`device_name`, so run it on the machine that holds the file. Subagent
+transcripts (`subagents/*.jsonl`) are refused, matching the live capture, and
+the command exits non-zero if any line failed to insert.
 
 ### `memory_startup` warns when Claude capture is off
 

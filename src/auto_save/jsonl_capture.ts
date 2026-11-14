@@ -73,6 +73,8 @@ interface FileState {
   venueKind?: SessionVenueKind | null;
   /** 버즈 세션: 가장 최근 턴의 venue (답글은 이걸 따른다). undefined = 아직 안 찾아봄. */
   buzzVenue?: string | null;
+  /** 마지막 flush 오류 (같은 오류를 3초마다 다시 적지 않으려고). */
+  lastError?: string;
 }
 
 /**
@@ -192,11 +194,36 @@ function readCwdFromJsonl(jsonlPath: string): string | null {
 export function captureSessionStart(cwd: string): void {
   _state = { cwd, mode: "pending", startedAtMs: Date.now(), projectDir: null, files: new Map() };
   // 데스크톱 앱이 폴더 없이 연 세션은 서버를 "/" 에서 띄운다 → cwd 로는 project dir 을 못 찾는다.
+  // 전체 감시는 **클로드 클라이언트일 때만** — 누가 띄웠는지는 initialize 뒤에야 안다(captureClientKnown).
+  // 갓 생긴 파일 판정은 startedAtMs 기준이라 그 사이(수 ms)에 쓰인 첫 턴도 안 놓친다.
   if (isFilesystemRoot(cwd)) {
-    armGlobal();
+    _state.reason = "waiting for MCP client info (cwd is filesystem root)";
     return;
   }
   _tryArm(cwd, 0);
+}
+
+/** 클로드 클라이언트 이름: 터미널 claude = "claude-code", 클로드 데스크톱 앱 = "local-agent-mode-…"(맥북 실측). */
+function isClaudeClient(clientName: string | null): boolean {
+  return !!clientName && (clientName === "claude-code" || clientName.startsWith("local-agent-mode"));
+}
+
+/**
+ * MCP initialize 가 끝나 클라이언트 이름을 알게 됐을 때 (index.ts 의 oninitialized).
+ * cwd 가 루트라 기다리던 서버만 여기서 정한다: 클로드면 전체 감시, 아니면 off.
+ * 다른 클라이언트(codex 등)가 "/" 에서 띄운 서버가 기계 전체 클로드 대화를 줍지 않게 한다 —
+ * 그런 서버까지 줍게 하면 줄마다 읽는 프로세스가 늘고, 중간부터 붙은 프로세스는
+ * 같은 내용·다른 uuid 로 다시 쓰인 줄(contentSeen 이 못 막는다)을 한 번 더 넣을 수 있다.
+ */
+export function captureClientKnown(clientName: string | null): void {
+  if (!_state || _state.mode !== "pending" || !isFilesystemRoot(_state.cwd)) return;
+  if (isClaudeClient(clientName)) {
+    delete _state.reason;
+    armGlobal();
+  } else {
+    _state.mode = "off";
+    _state.reason = `cwd is filesystem root and client "${clientName ?? "?"}" is not Claude`;
+  }
 }
 
 const _MAX_ARM_RETRIES = 20; // 20 × 500ms = 10s
@@ -500,13 +527,13 @@ async function flushDeltaForFile(
   jsonlPath: string,
   fileState: FileState,
   opts: FlushOptions = {}
-): Promise<{ inserted: number; skipped: number; dedup: number }> {
-  if (!fs.existsSync(jsonlPath)) return { inserted: 0, skipped: 0, dedup: 0 };
+): Promise<{ inserted: number; skipped: number; dedup: number; failed: number }> {
+  if (!fs.existsSync(jsonlPath)) return { inserted: 0, skipped: 0, dedup: 0, failed: 0 };
 
   let stat: fs.Stats;
-  try { stat = fs.statSync(jsonlPath); } catch { return { inserted: 0, skipped: 0, dedup: 0 }; }
+  try { stat = fs.statSync(jsonlPath); } catch { return { inserted: 0, skipped: 0, dedup: 0, failed: 0 }; }
 
-  if (stat.size <= fileState.cursorBytes) return { inserted: 0, skipped: 0, dedup: 0 };
+  if (stat.size <= fileState.cursorBytes) return { inserted: 0, skipped: 0, dedup: 0, failed: 0 };
 
   const length = stat.size - fileState.cursorBytes;
   const fd = fs.openSync(jsonlPath, "r");
@@ -521,7 +548,7 @@ async function flushDeltaForFile(
 
   // 마지막 \n까지만 parse, 그 이후 partial은 다음 호출에 보류
   const lastNl = raw.lastIndexOf("\n");
-  if (lastNl === -1) return { inserted: 0, skipped: 0, dedup: 0 };
+  if (lastNl === -1) return { inserted: 0, skipped: 0, dedup: 0, failed: 0 };
 
   const parsable = raw.slice(0, lastNl);
   const advanceBy = Buffer.byteLength(parsable, "utf-8") + 1; // +1 = 그 \n
@@ -535,7 +562,7 @@ async function flushDeltaForFile(
   }
   const deltaStart = fileState.cursorBytes;
 
-  let inserted = 0, skipped = 0, dedup = 0;
+  let inserted = 0, skipped = 0, dedup = 0, failed = 0;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -582,13 +609,13 @@ async function flushDeltaForFile(
       else dedup++;
     } catch (err) {
       console.error(`⚠️ [JSONL] insert failed for ${parsed.uuid}:`, err);
-      skipped++;
+      failed++;
     }
   }
 
   // cursor 전진 (성공 INSERT 못해도 dedup이 안전망 → 무한루프 방지 위해 전진)
   fileState.cursorBytes = newCursor;
-  return { inserted, skipped, dedup };
+  return { inserted, skipped, dedup, failed };
 }
 
 /** 지금 모드의 모든 jsonl 순회 + 신규 파일 발견 시 추가, 각각 flushDeltaForFile. */
@@ -610,10 +637,21 @@ async function flushAllFiles(): Promise<{ inserted: number; skipped: number; ded
       );
     }
 
-    const r = await flushDeltaForFile(jsonlPath, fileState);
-    totalI += r.inserted;
-    totalS += r.skipped;
-    totalD += r.dedup;
+    // 🔴 파일 하나의 오류(읽기 권한 없음 등)가 뒤 파일 전부를 막지 않게 파일마다 따로 잡는다.
+    //    전체 감시 모드에서는 한 파일이 기계 전체 수집을 세울 수 있다. 같은 오류는 한 번만 적는다.
+    try {
+      const r = await flushDeltaForFile(jsonlPath, fileState);
+      totalI += r.inserted;
+      totalS += r.skipped + r.failed;
+      totalD += r.dedup;
+      if (fileState.lastError) delete fileState.lastError;
+    } catch (err) {
+      const msg = (err as Error)?.message ?? String(err);
+      if (fileState.lastError !== msg) {
+        fileState.lastError = msg;
+        console.error(`⚠️ [JSONL] flush failed for ${jsonlPath} — 이 파일만 건너뜀: ${msg}`);
+      }
+    }
   }
 
   return { inserted: totalI, skipped: totalS, dedup: totalD };
@@ -656,19 +694,26 @@ function armDirWatcher(): void {
   if (_watcher || _pollTimer) return; // 이미 arm됨
 
   if (_state.mode === "global") {
-    try {
-      _watcher = fs.watch(PROJECTS_ROOT, { recursive: true }, (_eventType, filename) => {
-        // filename = PROJECTS_ROOT 기준 상대 경로. <slug>/<sid>.jsonl 만 (subagents 등 하위 폴더 제외).
-        if (filename && !isProjectJsonlEvent(filename.toString())) return;
-        scheduleFlush();
-      });
-      console.error(`📝 [JSONL] dir watcher armed (global, recursive)`);
-    } catch (err) {
-      console.error("⚠️ [JSONL] fs.watch recursive failed — polling only:", err);
+    // 🔴 리눅스의 recursive watch 는 Node 가 하위 폴더·파일마다 inotify watch 를 하나씩 건다
+    //    (subagents·tool-results 까지) → 사용자당 한도를 서버 수만큼 나눠 먹고, 새 폴더를 못 걸면
+    //    'error' 를 낸다. 데스크톱 앱이 없는 리눅스에선 폴링만으로 충분하다. macOS(FSEvents)·윈도우만 건다.
+    if (process.platform === "darwin" || process.platform === "win32") {
+      try {
+        _watcher = fs.watch(PROJECTS_ROOT, { recursive: true }, (_eventType, filename) => {
+          // filename = PROJECTS_ROOT 기준 상대 경로. <slug>/<sid>.jsonl 만 (subagents 등 하위 폴더 제외).
+          if (filename && !isProjectJsonlEvent(filename.toString())) return;
+          scheduleFlush();
+        });
+        _watcher.on("error", onWatcherError);
+        console.error(`📝 [JSONL] dir watcher armed (global, recursive)`);
+      } catch (err) {
+        console.error("⚠️ [JSONL] fs.watch recursive failed — polling only:", err);
+      }
+    } else {
+      console.error(`📝 [JSONL] global capture on ${process.platform}: polling only (${GLOBAL_POLL_INTERVAL_MS}ms)`);
     }
     // OS 버퍼링·새 slug 폴더 등 이벤트 누락 보완 (codex_capture 와 같은 방식)
-    _pollTimer = setInterval(() => { void flushWithMutex(); }, GLOBAL_POLL_INTERVAL_MS);
-    _pollTimer.unref?.();
+    startPolling();
     return;
   }
 
@@ -680,10 +725,30 @@ function armDirWatcher(): void {
       if (filename && !filename.endsWith(".jsonl")) return;
       scheduleFlush();
     });
+    _watcher.on("error", onWatcherError);
     console.error(`📝 [JSONL] dir watcher armed`);
   } catch (err) {
     console.error("⚠️ [JSONL] fs.watch dir failed (shutdown-only flush 폴백):", err);
   }
+}
+
+function startPolling(): void {
+  if (_pollTimer) return;
+  _pollTimer = setInterval(() => { void flushWithMutex(); }, GLOBAL_POLL_INTERVAL_MS);
+  _pollTimer.unref?.();
+}
+
+/**
+ * watcher 'error' — 리스너가 없으면 Node 가 예외로 던져 **서버 프로세스가 죽는다**
+ * (재현: recursive watch 아래 권한 없는 폴더 생성 → EACCES, exit 1). 닫고 폴링으로 넘어간다.
+ */
+function onWatcherError(err: unknown): void {
+  console.error("⚠️ [JSONL] fs.watch error — watcher closed, polling instead:", (err as Error)?.message ?? err);
+  if (_watcher) {
+    try { _watcher.close(); } catch {}
+    _watcher = null;
+  }
+  if (_state && (_state.mode === "dir" || _state.mode === "global")) startPolling();
 }
 
 function disarmDirWatcher(): void {
@@ -734,7 +799,10 @@ export interface BackfillResult {
   sessionId: string;
   inserted: number;
   dedup: number;
+  /** 읽을 수 없는 줄 (메타·도구 줄 등 — 정상) */
   skipped: number;
+  /** INSERT 가 실패한 줄 (DB 문제) — 0 이 아니면 CLI 가 실패로 끝낸다 */
+  failed: number;
 }
 
 /**

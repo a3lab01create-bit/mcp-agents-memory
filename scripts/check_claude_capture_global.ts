@@ -4,7 +4,8 @@
  * 배경: 클로드 데스크톱 앱이 폴더 없이("this computer") 연 세션은 메모리 서버를 "/" 에서 띄운다.
  * cwd 로 ~/.claude/projects/<slug> 를 짐작하던 수집기가 10초 재시도 뒤 조용히 포기해서
  * 그 대화가 통째로 빠졌다(맥북 c561dd53). 고친 뒤 동작:
- *   - cwd 가 루트면 ~/.claude/projects/<slug>/*.jsonl 전부를 본다 (하위 폴더·점 폴더 제외)
+ *   - cwd 가 루트 + 클로드 클라이언트면 ~/.claude/projects/<slug>/*.jsonl 전부를 본다 (하위 폴더·점 폴더 제외)
+ *   - 루트 cwd 라도 다른 클라이언트면 off, 읽을 수 없는 파일 하나가 나머지를 막지 않는다
  *   - arm 직전(기본 60초 안)에 생긴 파일은 처음부터 읽는다
  *   - 그 밖의 cwd 는 예전대로 그 폴더 하나만
  *   - backfill-claude: 처음부터 다시 읽고, created_at 은 줄의 timestamp, 두 번 돌려도 중복 없음
@@ -79,15 +80,22 @@ try {
   const oldTs = "2026-11-09T00:00:00.000Z";
   const oldFile = write("-old-proj/sess-old.jsonl", line("user", "u-old-1", "옛 세션 첫 줄", oldTs));
   process.env.MEMORY_JSONL_FRESH_MS = "0"; // 방금 만든 파일도 "옛 파일"로 취급
+  await sleep(20); // 🔴 birthtimeMs 는 소수 ms, Date.now() 는 정수 → 같은 ms 안이면 "갓 생긴" 쪽으로 기운다 (리뷰 실측 3.4%)
   cap.captureSessionStart("/");
-  assert.equal(cap.getCaptureStatus().mode, "global", "cwd 가 루트면 전체 감시");
+  assert.equal(cap.getCaptureStatus().mode, "pending", "루트 cwd 는 클라이언트를 알 때까지 기다린다");
+  cap.captureClientKnown("claude-code");
+  assert.equal(cap.getCaptureStatus().mode, "global", "cwd 가 루트 + 클로드 클라이언트면 전체 감시");
 
   write("-old-proj/sess-old.jsonl", line("user", "u-old-2", "옛 세션에 새로 붙은 줄"), true);
   write("-brand-new-proj/sess-new.jsonl", line("user", "u-new-1", "새 폴더 새 세션 첫 줄") + line("assistant", "u-new-2", "답"));
   write("-brand-new-proj/sess-new/subagents/agent-x.jsonl", line("user", "u-sub-1", "하위 에이전트 줄"));
   write(".omc/top.jsonl", line("user", "u-dot-1", "점 폴더 줄"));
+  // 읽을 수 없는 파일 하나가 뒤 파일들을 막으면 안 된다 (전체 감시에선 기계 전체 수집이 선다)
+  const locked = write("-0000-locked/sess-locked.jsonl", line("user", "u-locked-1", "권한 없는 파일"));
+  fs.chmodSync(locked, 0o000);
+  write("-zzz-after-locked/sess-after.jsonl", line("user", "u-after-1", "잠긴 파일 다음 세션"));
 
-  let s = await waitFor(["u-old-2", "u-new-1", "u-new-2"]);
+  let s = await waitFor(["u-old-2", "u-new-1", "u-new-2", "u-after-1"]);
   await sleep(3500); // 폴링 한 바퀴 더 — 들어오면 안 되는 줄이 늦게 들어오는지
   s = await stored();
   assert.ok(s.has("u-old-2"), "옛 세션에 새로 붙은 줄은 들어와야 한다");
@@ -96,7 +104,22 @@ try {
   assert.ok(!s.has("u-old-1"), "arm 전에 이미 있던 옛 줄은 다시 넣지 않는다");
   assert.ok(!s.has("u-sub-1"), "<sid>/subagents/*.jsonl 은 읽지 않는다");
   assert.ok(!s.has("u-dot-1"), "점으로 시작하는 폴더는 읽지 않는다");
+  assert.ok(s.has("u-after-1"), "읽을 수 없는 파일이 있어도 다른 파일은 계속 들어와야 한다");
+  assert.ok(!s.has("u-locked-1"));
+  fs.chmodSync(locked, 0o600);
+  fs.rmSync(path.dirname(locked), { recursive: true });
   await cap.captureSessionEnd();
+  cap.resetCaptureState();
+
+  // ── 1b. 루트 cwd 인데 클로드가 아닌 클라이언트 → 줍지 않는다 (범위) ──
+  cap.captureSessionStart("/");
+  cap.captureClientKnown("codex-mcp-client");
+  const nc = cap.getCaptureStatus();
+  assert.equal(nc.mode, "off", "다른 클라이언트가 '/' 에서 띄운 서버는 클로드 대화를 줍지 않는다");
+  assert.match(nc.reason ?? "", /not Claude/);
+  write("-noclaude-proj/sess-nc.jsonl", line("user", "u-nc-1", "다른 클라이언트 서버가 주우면 안 되는 줄"));
+  await sleep(3500);
+  assert.ok(!(await stored()).has("u-nc-1"));
   cap.resetCaptureState();
 
   // ── 2. backfill: 처음부터, created_at = 줄 timestamp, 두 번째는 전부 중복 ──
@@ -114,6 +137,7 @@ try {
   delete process.env.MEMORY_JSONL_FRESH_MS;
   write("-fresh-proj/sess-fresh.jsonl", line("user", "u-fresh-1", "서버보다 먼저 쓰인 첫 턴"));
   cap.captureSessionStart("/");
+  cap.captureClientKnown("local-agent-mode-mcp-agents-memory"); // 데스크톱 앱 clientInfo
   s = await waitFor(["u-fresh-1"], 5000);
   assert.ok(s.has("u-fresh-1"), "서버보다 먼저 생긴 세션 파일의 첫 턴이 빠지면 안 된다");
   await cap.captureSessionEnd();
@@ -125,6 +149,7 @@ try {
   fs.mkdirSync(work);
   const slug = work.replace(/[^a-zA-Z0-9]/g, "-");
   write(`${slug}/sess-dir.jsonl`, line("user", "u-dir-0", "이 폴더 옛 줄"));
+  await sleep(20); // 1번과 같은 이유
   cap.captureSessionStart(work);
   assert.equal(cap.getCaptureStatus().mode, "dir");
   write(`${slug}/sess-dir.jsonl`, line("user", "u-dir-1", "이 폴더 새 줄"), true);
