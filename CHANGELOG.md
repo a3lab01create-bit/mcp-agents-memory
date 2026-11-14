@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.9.36 — 2026-11-14
+
+### Claude conversations are captured even when the server starts in "/"
+
+The Claude desktop app starts MCP servers in `/` for sessions opened without a
+folder ("this computer"). The Claude Code capture guessed the transcript folder
+from the server's working directory, retried for ten seconds and then gave up
+with a line in the server log, so every turn of those sessions was silently
+lost (one MacBook session lost about 33 hours of conversation).
+
+When the working directory is the filesystem root, the capture now watches
+every `~/.claude/projects/<slug>/*.jsonl` — the same recursive watch plus a
+3-second poll that the Codex capture uses. Nested transcripts
+(`<session>/subagents/*.jsonl`) and dot folders are never read. Servers started
+in any other folder still watch only that folder, so a server started by
+another client does not begin collecting every Claude conversation on the
+machine.
+
+A transcript file that was created up to 60 seconds before the capture armed is
+now read from its first line. Before, every file that already existed at arm
+time started at its end, so a session file written before the server started
+(or during the ten-second retry) lost its first turns. Re-reading is harmless:
+rows are keyed by `external_uuid`. Filesystems that report no birth time keep
+the old behaviour.
+
+### `backfill-claude` stores conversation the capture missed
+
+`mcp-agents-memory backfill-claude [--dry-run] <session.jsonl> [...]` reads a
+transcript from the start and stores only the lines that are not in the
+database yet, so it is safe to run twice. Each row keeps the line's own
+timestamp as `created_at` — a backfill stamped "now" would push week-old
+conversation to the top of the start brief — and this machine's hostname as
+`device_name`, so run it on the machine that holds the file.
+
+### `memory_startup` warns when Claude capture is off
+
+A capture failure used to appear only in the server log. When the client is
+Claude Code (`claude-code`) or the desktop app (`local-agent-mode-…`) and the
+capture is off, `memory_startup` now starts with a warning that names the
+working directory and the reason and points to `manage_knowledge` and
+`backfill-claude`. Servers started by other clients, and captures that are still
+arming or running, stay quiet.
+
+### Editing a memory sends it back to the tagger
+
+`manage_knowledge` `update` cleared the project tag, keywords and embedding but
+left `tag_processed` set. The cold path only tags rows where it is false, so an
+edited memory got a new embedding and never got its tags back. `update` now
+resets `tag_processed` as well, matching the two Buzz re-clean paths that
+already did.
+
 ## 0.9.35 — 2026-11-13
 
 ### `mcp-agents-memory setup` works again, and `migrate` runs on an empty database
