@@ -355,6 +355,25 @@ export interface CaptureStatus {
   reason?: string;
 }
 
+/**
+ * memory_startup 맨 위에 붙일 경고. 클로드 클라이언트인데 수집이 꺼졌을 때만 문장을 돌려준다.
+ *
+ * 왜: 예전엔 수집 실패가 서버 로그(console.error)에만 남아서, 사람도 AI 도 대화가 빠지는 줄 몰랐다
+ * (맥북 33시간 공백). 다른 클라이언트(codex 등)가 띄운 서버는 클로드 폴더가 없는 게 정상이라 조용히 둔다.
+ * clientInfo 이름: 터미널 claude = "claude-code", 클로드 데스크톱 앱 = "local-agent-mode-…"(맥북 실측).
+ */
+export function formatCaptureWarning(clientName: string | null, status: CaptureStatus): string | null {
+  if (!clientName) return null;
+  const isClaude = clientName === "claude-code" || clientName.startsWith("local-agent-mode");
+  if (!isClaude || status.mode !== "off") return null;
+  return (
+    `> ⚠️ **이 세션의 Claude 대화는 자동 수집되지 않고 있습니다** — ` +
+    `서버 작업 폴더 "${status.cwd ?? "?"}"${status.reason ? ` (${status.reason})` : ""}. ` +
+    `꼭 남길 내용은 manage_knowledge 로 직접 저장하세요. ` +
+    `지난 대화는 그 기기에서 \`mcp-agents-memory backfill-claude <세션.jsonl>\` 로 다시 채울 수 있습니다.`
+  );
+}
+
 /** 지금 클로드 대화 수집이 어떤 상태인가 (memory_startup 이 "수집 안 되는 중" 경고에 쓴다). */
 export function getCaptureStatus(): CaptureStatus {
   if (!_state) return { mode: "off", cwd: null, projectDir: null, files: 0, reason: "not started" };

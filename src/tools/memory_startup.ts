@@ -11,6 +11,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { collectBrief, formatBriefMarkdown } from "../briefing.js";
 import { detectClientPlatform } from "../agent_identity.js";
+import { formatCaptureWarning, getCaptureStatus } from "../auto_save/jsonl_capture.js";
 
 export function registerMemoryStartup(server: McpServer): void {
   server.registerTool(
@@ -48,8 +49,10 @@ agent_platform_filter=false.`,
         currentPlatform,
       });
       const md = formatBriefMarkdown(brief);
+      // 클로드 대화 수집이 꺼져 있으면 맨 위에 경고 (예전엔 서버 로그에만 남아 아무도 몰랐다)
+      const warning = formatCaptureWarning(detectClientPlatform(server), getCaptureStatus());
       return {
-        content: [{ type: 'text' as const, text: md }],
+        content: [{ type: 'text' as const, text: warning ? `${warning}\n\n${md}` : md }],
       };
     }
   );

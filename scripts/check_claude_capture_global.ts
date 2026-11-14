@@ -144,9 +144,27 @@ try {
   const st = cap.getCaptureStatus();
   assert.equal(st.mode, "off", "재시도가 끝나면 off");
   assert.match(st.reason ?? "", /project dir not found/);
+
+  // ── 6. memory_startup 경고: 클로드 클라이언트 + off 일 때만 ──
+  assert.match(cap.formatCaptureWarning("claude-code", st) ?? "", /자동 수집되지 않고/, "터미널 claude + off → 경고");
+  assert.match(cap.formatCaptureWarning("local-agent-mode-mcp-agents-memory", st) ?? "", /no-such-dir/, "데스크톱 앱 + off → 경고(작업 폴더 표시)");
+  assert.equal(cap.formatCaptureWarning("codex-mcp-client", st), null, "다른 클라이언트가 띄운 서버는 클로드 폴더가 없는 게 정상 → 조용히");
+  assert.equal(cap.formatCaptureWarning("claude-code", { ...st, mode: "global" }), null, "수집 중이면 경고 없음");
+  assert.equal(cap.formatCaptureWarning("claude-code", { ...st, mode: "pending" }), null, "붙는 중(10초 안)엔 경고 없음");
+  assert.equal(cap.formatCaptureWarning(null, st), null);
+
+  // 실제 memory_startup 핸들러 응답 맨 위에 붙는지 (가짜 서버 — clientInfo 만 흉내)
+  const { registerMemoryStartup } = await import("../src/tools/memory_startup.ts");
+  let startup: ((args: any) => Promise<any>) | null = null;
+  registerMemoryStartup({
+    registerTool(name: string, _s: unknown, fn: (args: any) => Promise<any>) { if (name === "memory_startup") startup = fn; },
+    server: { getClientVersion: () => ({ name: "claude-code", version: "check" }) },
+  } as any);
+  const res = await startup!({});
+  assert.match(res.content[0].text, /^> ⚠️ \*\*이 세션의 Claude 대화는 자동 수집되지 않고/, "memory_startup 응답 맨 위에 경고");
   cap.resetCaptureState();
 
-  console.log(`✅ check:claude-capture — 루트 cwd 전체 감시·갓 생긴 파일·범위·backfill·off 상태 (db=${dbName})`);
+  console.log(`✅ check:claude-capture — 루트 cwd 전체 감시·갓 생긴 파일·범위·backfill·off 상태·startup 경고 (db=${dbName})`);
 } finally {
   cap.resetCaptureState();
   await db.query(`DELETE FROM memory WHERE agent_platform = 'claude-code'`);
