@@ -28,6 +28,19 @@
  * Claude Code 한정: ~/.claude/projects/<slug>/<session_id>.jsonl convention 사용.
  * Gemini CLI / Codex 등은 본 path 작동 안 함 — save_message tool로 대체.
  *
+ * **10초 뒤에 포기하지 않는다 (2026-11-14)**
+ *   Claude Code 는 slug 폴더와 jsonl 을 첫 메시지를 보낼 때 만든다. 서버는 세션을 열 때 떠서
+ *   예전엔 10초만 찾고 포기했다 → 세션을 열고 10초 넘게 있다가 첫 메시지를 보내면 그 세션
+ *   대화가 통째로 빠졌다 (맥북 데스크톱 앱 c561dd53·9ab44f5c, #129343). 이제 slug 폴더가
+ *   생길 때까지 ~/.claude/projects 를 지켜보며 기다린다.
+ *   (cwd "/" 서버는 클로드 데스크톱 앱의 앱 전체용 연결이다 — 세션 대화는 세션마다 뜨는 서버가
+ *   제 작업 폴더로 수집한다. "/" 라서 못 찾는 게 원인이라던 #127222 는 반만 맞았다.)
+ *
+ * **arm 직전에 생긴 파일은 처음부터 (2026-11-14)**
+ *   예전엔 arm 시점에 이미 있던 파일을 전부 cursor=size 로 잡아서, 서버보다 먼저(또는 재시도
+ *   10초 사이에) 생긴 세션 파일의 앞부분이 영구 누락됐다. 이제 arm 시작 60초 전 이후에 **생긴**
+ *   (birthtime) 파일은 0 부터 읽는다. 겹쳐 읽혀도 external_uuid ON CONFLICT 가 막는다.
+ *
  * Partial line 안전: fs.watch가 line 중간에 fire될 수 있어 마지막 \n까지만
  * parse + cursor 전진. \n 없는 trailing은 다음 flush에 흡수.
  */
@@ -43,6 +56,8 @@ const CLIENT_PLATFORM = "claude-code"; // 본 모듈은 Claude Code 전용
 const DEVICE_NAME = os.hostname();
 const PROJECTS_ROOT = path.join(os.homedir(), ".claude", "projects");
 const FLUSH_DEBOUNCE_MS = 200; // fs.watch 다중 fire coalescing
+/** arm 시작 이 시간 전 이후에 생긴 파일은 0 부터 읽는다. 검사에서만 MEMORY_JSONL_FRESH_MS 로 바꾼다. */
+const FRESH_FILE_MS = 60_000;
 
 interface FileState {
   /** 다음 read 시작 byte offset. 초기값 = arm 시점 size (또는 신규 파일이면 0).
@@ -56,10 +71,25 @@ interface FileState {
   venueKind?: SessionVenueKind | null;
   /** 버즈 세션: 가장 최근 턴의 venue (답글은 이걸 따른다). undefined = 아직 안 찾아봄. */
   buzzVenue?: string | null;
+  /** 마지막 flush 오류 (같은 오류를 3초마다 다시 적지 않으려고). */
+  lastError?: string;
 }
+
+/**
+ * 수집 상태.
+ *   pending = project dir 찾는 중 (처음 10초 빠른 재시도, 그 뒤엔 생길 때까지 기다림 — reason)
+ *   dir     = cwd 의 project dir 을 본다
+ *   off     = 시작 안 함
+ */
+export type CaptureMode = "pending" | "dir" | "off";
 
 interface DirState {
   cwd: string;
+  mode: CaptureMode;
+  /** pending 일 때 무엇을 기다리는지. */
+  reason?: string;
+  /** captureSessionStart 시각 — 갓 생긴 파일 판정 기준. */
+  startedAtMs: number;
   projectDir: string | null;
   /** jsonlPath → FileState. arm 시점에 존재한 파일 + 이후 발견된 신규 파일. */
   files: Map<string, FileState>;
@@ -69,6 +99,7 @@ let _state: DirState | null = null;
 
 // --- watcher / mutex state ---
 let _watcher: fs.FSWatcher | null = null;
+let _pollTimer: NodeJS.Timeout | null = null;
 let _flushInProgress = false;
 let _flushPending = false;
 let _flushDebounceTimer: NodeJS.Timeout | null = null;
@@ -151,20 +182,86 @@ function readCwdFromJsonl(jsonlPath: string): string | null {
 }
 
 /**
- * server 시작 시 호출. projectDir 안 모든 jsonl size 스냅샷 + dir watcher arm.
- * 옛 entries backfill 안 함 (cursor = 시작 시점 size).
+ * server 시작 시 호출. projectDir 안 모든 jsonl 스냅샷 + dir watcher arm.
+ * 옛 entries backfill 안 함 (오래된 파일 cursor = 시작 시점 size, 갓 생긴 파일은 0 — initialCursor).
  *
- * 타이밍 안전: Claude Code가 MCP 시작 후 project dir / JSONL을 조금 뒤에 생성하는
- * 경우 대비 → 500ms 간격으로 최대 20회(10초) retry.
+ * 타이밍: Claude Code 는 slug 폴더와 jsonl 을 **첫 메시지를 보낼 때** 만든다. 서버는 세션을 열 때
+ * 뜬다. 그래서 처음 10초는 500ms 마다 찾고(fallback 스캔 포함), 그 뒤엔 포기하지 않고
+ * ~/.claude/projects 를 지켜보며 slug 폴더가 생길 때까지 기다린다 (waitForProjectDir).
  */
 export function captureSessionStart(cwd: string): void {
-  _state = { cwd, projectDir: null, files: new Map() };
+  _state = { cwd, mode: "pending", startedAtMs: Date.now(), projectDir: null, files: new Map() };
   _tryArm(cwd, 0);
 }
 
-const _MAX_ARM_RETRIES = 20; // 20 × 500ms = 10s
+const _MAX_ARM_RETRIES = 20; // 20 × 500ms = 10s 빠른 재시도. 그 뒤엔 기다리기.
+const WAIT_POLL_MS = 3000;   // 기다리는 동안 slug 폴더 확인 주기 (watch 누락 보완)
+const POLL_FALLBACK_MS = 3000; // dir watcher 가 오류로 닫혔을 때 폴링 주기
+
+function isFilesystemRoot(cwd: string): boolean {
+  const resolved = path.resolve(cwd);
+  return resolved === path.parse(resolved).root;
+}
+
+/** 클로드 클라이언트 이름: 터미널 claude = "claude-code", 클로드 데스크톱 앱 = "local-agent-mode-…"(맥북 실측). */
+function isClaudeClient(clientName: string | null): boolean {
+  return !!clientName && (clientName === "claude-code" || clientName.startsWith("local-agent-mode"));
+}
+
+/** 검사에서만 바꾼다 (MEMORY_JSONL_FRESH_MS). 잘못된 값이면 기본값. */
+function freshWindowMs(): number {
+  const raw = process.env.MEMORY_JSONL_FRESH_MS;
+  const n = raw === undefined ? NaN : Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : FRESH_FILE_MS;
+}
+
+/**
+ * arm 시점에 이미 있던 파일의 시작 cursor.
+ * 서버 시작 직전(기본 60초 안) 이후에 **생긴** 파일은 0 — 서버가 붙기 전에 쓰인 첫 턴을 살린다
+ * (기다리다가 slug 폴더를 찾은 경우가 대표적: 그 순간 이미 첫 메시지 줄이 들어 있다).
+ * 그보다 오래된 파일은 예전대로 끝(size)부터 — 옛 대화를 통째로 다시 넣지 않는다.
+ * birthtime 을 못 주는 파일시스템(0)이면 예전 동작.
+ */
+function initialCursor(stat: fs.Stats, startedAtMs: number): number {
+  const born = stat.birthtimeMs;
+  return born > 0 && born >= startedAtMs - freshWindowMs() ? 0 : stat.size;
+}
+
+/** dir 안의 <sid>.jsonl 만 (하위 폴더 <sid>/subagents 등은 안 본다). */
+function listJsonlIn(dir: string): string[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((e) => e.isFile() && e.name.endsWith(".jsonl"))
+    .map((e) => path.join(dir, e.name));
+}
+
+/** 지금 볼 파일 목록. */
+function listTrackedJsonl(): string[] {
+  if (_state?.mode === "dir" && _state.projectDir) return listJsonlIn(_state.projectDir);
+  return [];
+}
+
+function snapshotFiles(paths: string[]): void {
+  if (!_state) return;
+  for (const jsonlPath of paths) {
+    let stat: fs.Stats;
+    try { stat = fs.statSync(jsonlPath); } catch { continue; }
+    const sessionId = path.basename(jsonlPath).replace(/\.jsonl$/, "");
+    _state.files.set(jsonlPath, {
+      cursorBytes: initialCursor(stat, _state.startedAtMs),
+      sessionId,
+      contentSeen: new Set(),
+    });
+  }
+}
 
 function _tryArm(cwd: string, attempt: number): void {
+  if (!_state || _state.cwd !== cwd || _state.mode !== "pending") return; // 끊겼거나 이미 붙음
   const projectDir = findProjectDir(cwd);
 
   if (!projectDir) {
@@ -175,43 +272,141 @@ function _tryArm(cwd: string, attempt: number): void {
         _tryArm(cwd, attempt + 1);
       }, 500);
     } else {
-      // 10초 후에도 못 찾으면 진단 로그 남기고 포기
-      console.error(
-        `⚠️ [JSONL] project dir not found after ${_MAX_ARM_RETRIES} retries — capture 건너뜀.\n` +
-        `   cwd="${cwd}"\n` +
-        `   PROJECTS_ROOT="${PROJECTS_ROOT}"\n` +
-        `   expected slug="${cwdToSlug(cwd)}"`
-      );
+      waitForProjectDir(cwd);
     }
     return;
   }
 
-  if (!_state || _state.cwd !== cwd) return; // race: session ended
+  armDir(projectDir, attempt > 0 ? `found on retry #${attempt}` : null);
+}
+
+function armDir(projectDir: string, note: string | null): void {
+  if (!_state || _state.mode !== "pending") return;
+  stopWaiting();
   _state.projectDir = projectDir;
+  _state.mode = "dir";
+  delete _state.reason;
 
-  // 기존 jsonl 모두 snapshot
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(projectDir, { withFileTypes: true });
-  } catch {
-    return;
-  }
+  // 기존 jsonl 모두 snapshot (갓 생긴 파일은 0 부터 — initialCursor)
+  snapshotFiles(listJsonlIn(projectDir));
+  const fromStart = [..._state.files.values()].filter((f) => f.cursorBytes === 0).length;
 
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
-    const jsonlPath = path.join(projectDir, entry.name);
-    let stat: fs.Stats;
-    try { stat = fs.statSync(jsonlPath); } catch { continue; }
-    const sessionId = entry.name.replace(/\.jsonl$/, "");
-    _state.files.set(jsonlPath, { cursorBytes: stat.size, sessionId, contentSeen: new Set() });
-  }
-
-  if (attempt > 0) {
-    console.error(`📝 [JSONL] project dir found on retry #${attempt}: ${path.basename(projectDir)}/`);
-  }
-  console.error(`📝 [JSONL] capture armed: ${_state.files.size} jsonl(s) in ${path.basename(projectDir)}/`);
+  if (note) console.error(`📝 [JSONL] project dir ${note}: ${path.basename(projectDir)}/`);
+  console.error(
+    `📝 [JSONL] capture armed: ${_state.files.size} jsonl(s) in ${path.basename(projectDir)}/` +
+    (fromStart ? `, ${fromStart} fresh file(s) read from start` : "")
+  );
 
   armDirWatcher();
+  // 갓 생긴 파일은 0 부터 → 다음 이벤트를 기다리지 않고 한 번 바로 읽는다
+  if (fromStart) scheduleFlush();
+}
+
+// --- slug 폴더 기다리기 (2026-11-14) ---
+let _waitWatcher: fs.FSWatcher | null = null;
+let _waitTimer: NodeJS.Timeout | null = null;
+
+/** slug 폴더가 지금 있으면 그 경로 (기다리는 동안엔 fallback 스캔 없이 이것만 — 싸다). */
+function slugDirIfExists(cwd: string): string | null {
+  const slugPath = path.join(PROJECTS_ROOT, cwdToSlug(cwd));
+  try {
+    return fs.statSync(slugPath).isDirectory() ? slugPath : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 빠른 재시도(10초) 안에 못 찾았을 때. 예전엔 여기서 포기했다 →
+ * 세션을 열고 10초 넘게 있다가 첫 메시지를 보내면 그 세션 대화가 통째로 빠졌다
+ * (맥북 실측: 서버 시작 → jsonl 생성 12.7초 · 23초, #129343). 이제 slug 폴더가 생길 때까지 기다린다.
+ * ~/.claude/projects 하나만 non-recursive 로 지켜보고(이벤트 1개 경로), 누락 대비 3초마다 stat 한 번.
+ */
+function waitForProjectDir(cwd: string): void {
+  if (!_state || _state.cwd !== cwd || _state.mode !== "pending") return;
+  const slug = cwdToSlug(cwd);
+  _state.reason = `waiting for ${path.join(PROJECTS_ROOT, slug)} (Claude Code creates it on the first message)`;
+  console.error(
+    `📝 [JSONL] project dir not there yet — waiting (Claude Code creates it on the first message).\n` +
+    `   cwd="${cwd}"\n` +
+    `   expected slug="${slug}" under ${PROJECTS_ROOT}`
+  );
+  const check = () => {
+    if (!_state || _state.cwd !== cwd || _state.mode !== "pending") { stopWaiting(); return; }
+    const dir = slugDirIfExists(cwd);
+    if (dir) armDir(dir, "appeared while waiting");
+  };
+  try {
+    _waitWatcher = fs.watch(PROJECTS_ROOT, (_evt, name) => {
+      if (!name || name.toString() === slug) check();
+    });
+    _waitWatcher.on("error", () => {
+      try { _waitWatcher?.close(); } catch {}
+      _waitWatcher = null; // 폴링만으로 계속
+    });
+  } catch {
+    // ~/.claude/projects 자체가 아직 없음 (이 기기에서 클로드를 처음 씀) — 폴링만
+  }
+  _waitTimer = setInterval(check, WAIT_POLL_MS);
+  _waitTimer.unref?.();
+}
+
+function stopWaiting(): void {
+  if (_waitTimer) { clearInterval(_waitTimer); _waitTimer = null; }
+  if (_waitWatcher) { try { _waitWatcher.close(); } catch {} _waitWatcher = null; }
+}
+
+/**
+ * memory_startup 직전에 한 번 더 확인 — 기다리는 중이면 slug 폴더를 지금 바로 본다.
+ * memory_startup 은 사람이 첫 메시지를 보낸 뒤에야 불리므로, 그때는 이 세션 폴더가 이미 있어야 한다.
+ */
+export function recheckCapture(): CaptureStatus {
+  if (_state && _state.mode === "pending") {
+    const dir = slugDirIfExists(_state.cwd);
+    if (dir) armDir(dir, "found on recheck");
+  }
+  return getCaptureStatus();
+}
+
+export interface CaptureStatus {
+  mode: CaptureMode;
+  cwd: string | null;
+  projectDir: string | null;
+  files: number;
+  reason?: string;
+}
+
+/**
+ * memory_startup 맨 위에 붙일 경고. 클로드 클라이언트인데 이 세션 폴더를 못 붙었을 때만.
+ *
+ * 왜: 예전엔 수집 실패가 서버 로그(console.error)에만 남아서, 사람도 AI 도 대화가 빠지는 줄 몰랐다
+ * (맥북 33시간 공백). memory_startup 은 첫 메시지 뒤에 불리므로 그때도 pending 이면 진짜 문제다
+ * (slug 규칙이 다르거나 세션 폴더가 옮겨졌거나). 조용히 두는 경우:
+ *   - 다른 클라이언트(codex 등)가 띄운 서버 — 클로드 폴더가 없는 게 정상
+ *   - cwd 가 "/" — 클로드 데스크톱 앱의 앱 전체용 연결. 세션 대화는 세션 서버가 따로 수집한다(#129343)
+ */
+export function formatCaptureWarning(clientName: string | null, status: CaptureStatus): string | null {
+  if (!isClaudeClient(clientName)) return null;
+  if (status.mode === "dir") return null;
+  if (status.cwd && isFilesystemRoot(status.cwd)) return null;
+  return (
+    `> ⚠️ **이 세션의 Claude 대화는 자동 수집되지 않고 있습니다** — ` +
+    `서버 작업 폴더 "${status.cwd ?? "?"}"${status.reason ? ` (${status.reason})` : ""}. ` +
+    `꼭 남길 내용은 manage_knowledge 로 직접 저장하세요. ` +
+    `지난 대화는 그 기기에서 \`mcp-agents-memory backfill-claude <세션.jsonl>\` 로 다시 채울 수 있습니다.`
+  );
+}
+
+/** 지금 클로드 대화 수집이 어떤 상태인가 (memory_startup 이 "수집 안 되는 중" 경고에 쓴다). */
+export function getCaptureStatus(): CaptureStatus {
+  if (!_state) return { mode: "off", cwd: null, projectDir: null, files: 0, reason: "not started" };
+  return {
+    mode: _state.mode,
+    cwd: _state.cwd,
+    projectDir: _state.projectDir,
+    files: _state.files.size,
+    ...(_state.reason ? { reason: _state.reason } : {}),
+  };
 }
 
 export interface ParsedEntry {
@@ -224,6 +419,8 @@ export interface ParsedEntry {
   subagent_role?: string;
   /** Claude Code가 줄마다 남기는 실행 방식 (cli = 대화형, sdk-cli / sdk-ts = 프로그램 실행). */
   entrypoint?: string;
+  /** 줄이 쓰인 시각 (ISO). 다시 채우기(backfill)에서만 created_at 으로 쓴다. */
+  timestamp?: string;
 }
 
 /** Claude Code JSONL entry → ParsedEntry. parse 실패 / type 무효 시 null. */
@@ -272,6 +469,7 @@ export function parseEntry(line: string): ParsedEntry | null {
     message: messageText,
     agent_model,
     entrypoint: typeof entry.entrypoint === "string" ? entry.entrypoint : undefined,
+    timestamp: typeof entry.timestamp === "string" ? entry.timestamp : undefined,
   };
 }
 
@@ -303,20 +501,35 @@ const userTextOf = (line: string): string | null => {
   return parsed?.role === "user" ? parsed.message : null;
 };
 
+interface FlushOptions {
+  /** 다시 채우기: 줄의 timestamp 를 created_at 으로 (없거나 이상하면 NOW). 실시간 수집은 안 씀. */
+  createdAtFromEntry?: boolean;
+  /** 다시 채우기 미리보기: INSERT 없이 세기만. inserted = 넣을 줄 수 (DB 에 이미 있는지는 모름). */
+  dryRun?: boolean;
+}
+
+/** jsonl timestamp → created_at 으로 쓸 값. 파싱 안 되면 null (NOW 로 들어간다). */
+function entryCreatedAt(ts: string | undefined): Date | null {
+  if (!ts) return null;
+  const ms = Date.parse(ts);
+  return Number.isFinite(ms) ? new Date(ms) : null;
+}
+
 /**
  * 한 jsonl 파일의 cursor부터 마지막 완성 line까지 읽고 INSERT, cursor 전진.
  * \n 없는 trailing partial은 보류, 다음 호출에 흡수.
  */
 async function flushDeltaForFile(
   jsonlPath: string,
-  fileState: FileState
-): Promise<{ inserted: number; skipped: number; dedup: number }> {
-  if (!fs.existsSync(jsonlPath)) return { inserted: 0, skipped: 0, dedup: 0 };
+  fileState: FileState,
+  opts: FlushOptions = {}
+): Promise<{ inserted: number; skipped: number; dedup: number; failed: number }> {
+  if (!fs.existsSync(jsonlPath)) return { inserted: 0, skipped: 0, dedup: 0, failed: 0 };
 
   let stat: fs.Stats;
-  try { stat = fs.statSync(jsonlPath); } catch { return { inserted: 0, skipped: 0, dedup: 0 }; }
+  try { stat = fs.statSync(jsonlPath); } catch { return { inserted: 0, skipped: 0, dedup: 0, failed: 0 }; }
 
-  if (stat.size <= fileState.cursorBytes) return { inserted: 0, skipped: 0, dedup: 0 };
+  if (stat.size <= fileState.cursorBytes) return { inserted: 0, skipped: 0, dedup: 0, failed: 0 };
 
   const length = stat.size - fileState.cursorBytes;
   const fd = fs.openSync(jsonlPath, "r");
@@ -331,21 +544,21 @@ async function flushDeltaForFile(
 
   // 마지막 \n까지만 parse, 그 이후 partial은 다음 호출에 보류
   const lastNl = raw.lastIndexOf("\n");
-  if (lastNl === -1) return { inserted: 0, skipped: 0, dedup: 0 };
+  if (lastNl === -1) return { inserted: 0, skipped: 0, dedup: 0, failed: 0 };
 
   const parsable = raw.slice(0, lastNl);
   const advanceBy = Buffer.byteLength(parsable, "utf-8") + 1; // +1 = 그 \n
   const newCursor = fileState.cursorBytes + advanceBy;
 
   const lines = parsable.split("\n");
-  const userId = await getDefaultUserId();
+  const userId = opts.dryRun ? 0 : await getDefaultUserId();
 
   if (fileState.venueKind === undefined) {
     try { fileState.venueKind = sessionVenueKind(jsonlPath); } catch { fileState.venueKind = null; }
   }
   const deltaStart = fileState.cursorBytes;
 
-  let inserted = 0, skipped = 0, dedup = 0;
+  let inserted = 0, skipped = 0, dedup = 0, failed = 0;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -374,6 +587,8 @@ async function flushDeltaForFile(
     }
     // user role: agent_model = null (사람이 친 거, N/A). assistant: 모델 명 (없으면 'unknown').
     const agentModel = parsed.role === 'user' ? null : (parsed.agent_model ?? 'unknown');
+    if (opts.dryRun) { inserted++; continue; }
+    const createdAt = opts.createdAtFromEntry ? entryCreatedAt(parsed.timestamp) : null;
     try {
       const result = await insertRawMemory({
         user_id: userId,
@@ -384,52 +599,53 @@ async function flushDeltaForFile(
         external_uuid: externalUuid,
         device_name: DEVICE_NAME,
         venue,
+        ...(createdAt ? { created_at: createdAt } : {}),
       });
       if (result.inserted) inserted++;
       else dedup++;
     } catch (err) {
       console.error(`⚠️ [JSONL] insert failed for ${parsed.uuid}:`, err);
-      skipped++;
+      failed++;
     }
   }
 
   // cursor 전진 (성공 INSERT 못해도 dedup이 안전망 → 무한루프 방지 위해 전진)
   fileState.cursorBytes = newCursor;
-  return { inserted, skipped, dedup };
+  return { inserted, skipped, dedup, failed };
 }
 
-/** dir 안 모든 jsonl 순회 + 신규 파일 발견 시 추가, 각각 flushDeltaForFile. */
+/** 지금 모드의 모든 jsonl 순회 + 신규 파일 발견 시 추가, 각각 flushDeltaForFile. */
 async function flushAllFiles(): Promise<{ inserted: number; skipped: number; dedup: number }> {
-  if (!_state || !_state.projectDir) return { inserted: 0, skipped: 0, dedup: 0 };
-  const projectDir = _state.projectDir;
-  if (!fs.existsSync(projectDir)) return { inserted: 0, skipped: 0, dedup: 0 };
-
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(projectDir, { withFileTypes: true });
-  } catch {
-    return { inserted: 0, skipped: 0, dedup: 0 };
-  }
+  if (!_state || _state.mode !== "dir") return { inserted: 0, skipped: 0, dedup: 0 };
 
   let totalI = 0, totalS = 0, totalD = 0;
 
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
-    const jsonlPath = path.join(projectDir, entry.name);
-
+  for (const jsonlPath of listTrackedJsonl()) {
+    const name = path.basename(jsonlPath);
     let fileState = _state.files.get(jsonlPath);
     if (!fileState) {
       // arm 이후 신규 jsonl — cursor 0부터 전체 캡처
-      const sessionId = entry.name.replace(/\.jsonl$/, "");
+      const sessionId = name.replace(/\.jsonl$/, "");
       fileState = { cursorBytes: 0, sessionId, contentSeen: new Set() };
       _state.files.set(jsonlPath, fileState);
-      console.error(`📝 [JSONL] new session detected: ${entry.name}`);
+      console.error(`📝 [JSONL] new session detected: ${name}`);
     }
 
-    const r = await flushDeltaForFile(jsonlPath, fileState);
-    totalI += r.inserted;
-    totalS += r.skipped;
-    totalD += r.dedup;
+    // 🔴 파일 하나의 오류(읽기 권한 없음 등)가 뒤 파일 전부를 막지 않게 파일마다 따로 잡는다.
+    //    전체 감시 모드에서는 한 파일이 기계 전체 수집을 세울 수 있다. 같은 오류는 한 번만 적는다.
+    try {
+      const r = await flushDeltaForFile(jsonlPath, fileState);
+      totalI += r.inserted;
+      totalS += r.skipped + r.failed;
+      totalD += r.dedup;
+      if (fileState.lastError) delete fileState.lastError;
+    } catch (err) {
+      const msg = (err as Error)?.message ?? String(err);
+      if (fileState.lastError !== msg) {
+        fileState.lastError = msg;
+        console.error(`⚠️ [JSONL] flush failed for ${jsonlPath} — 이 파일만 건너뜀: ${msg}`);
+      }
+    }
   }
 
   return { inserted: totalI, skipped: totalS, dedup: totalD };
@@ -468,8 +684,10 @@ function scheduleFlush(): void {
 }
 
 function armDirWatcher(): void {
-  if (!_state || !_state.projectDir) return;
-  if (_watcher) return; // 이미 arm됨
+  if (!_state) return;
+  if (_watcher || _pollTimer) return; // 이미 arm됨
+
+  if (!_state.projectDir) return;
   try {
     _watcher = fs.watch(_state.projectDir, (_eventType, filename) => {
       // change: 파일 grow / rename: 파일 생성·삭제·이동. 어느쪽이든 flush 트리거.
@@ -477,16 +695,42 @@ function armDirWatcher(): void {
       if (filename && !filename.endsWith(".jsonl")) return;
       scheduleFlush();
     });
+    _watcher.on("error", onWatcherError);
     console.error(`📝 [JSONL] dir watcher armed`);
   } catch (err) {
-    console.error("⚠️ [JSONL] fs.watch dir failed (shutdown-only flush 폴백):", err);
+    console.error("⚠️ [JSONL] fs.watch dir failed — polling instead:", err);
+    startPolling();
   }
 }
 
+function startPolling(): void {
+  if (_pollTimer) return;
+  _pollTimer = setInterval(() => { void flushWithMutex(); }, POLL_FALLBACK_MS);
+  _pollTimer.unref?.();
+}
+
+/**
+ * watcher 'error' — 리스너가 없으면 Node 가 예외로 던져 **서버 프로세스가 죽는다**
+ * (리뷰어 재현: recursive watch 아래 권한 없는 폴더 → EACCES, exit 1). 닫고 폴링으로 넘어간다.
+ */
+function onWatcherError(err: unknown): void {
+  console.error("⚠️ [JSONL] fs.watch error — watcher closed, polling instead:", (err as Error)?.message ?? err);
+  if (_watcher) {
+    try { _watcher.close(); } catch {}
+    _watcher = null;
+  }
+  if (_state && _state.mode === "dir") startPolling();
+}
+
 function disarmDirWatcher(): void {
+  stopWaiting();
   if (_flushDebounceTimer) {
     clearTimeout(_flushDebounceTimer);
     _flushDebounceTimer = null;
+  }
+  if (_pollTimer) {
+    clearInterval(_pollTimer);
+    _pollTimer = null;
   }
   if (_watcher) {
     try { _watcher.close(); } catch {}
@@ -506,7 +750,7 @@ export async function captureSessionEnd(): Promise<{ inserted: number; skipped: 
     await new Promise((r) => setTimeout(r, 50));
   }
 
-  if (!_state || !_state.projectDir) {
+  if (!_state || _state.mode !== "dir") {
     return { inserted: 0, skipped: 0, error: "session not armed" };
   }
 
@@ -520,6 +764,36 @@ export async function captureSessionEnd(): Promise<{ inserted: number; skipped: 
   } finally {
     _flushInProgress = false;
   }
+}
+
+export interface BackfillResult {
+  file: string;
+  sessionId: string;
+  inserted: number;
+  dedup: number;
+  /** 읽을 수 없는 줄 (메타·도구 줄 등 — 정상) */
+  skipped: number;
+  /** INSERT 가 실패한 줄 (DB 문제) — 0 이 아니면 CLI 가 실패로 끝낸다 */
+  failed: number;
+}
+
+/**
+ * 빠진 대화 다시 채우기 — jsonl 하나를 **처음부터** 읽어 넣는다 (CLI `backfill-claude`).
+ *
+ * - 같은 줄이 이미 들어가 있으면 external_uuid ON CONFLICT 로 건너뛴다 → 여러 번 돌려도 안전.
+ * - created_at 은 줄의 timestamp (실제 대화 시각). 지금 시각으로 넣으면 지난 대화가 시작 브리핑
+ *   맨 위에 "최근 대화"로 올라온다.
+ * - device_name 은 이 명령을 돌리는 기계 이름 → **그 파일이 있는 기계에서** 돌려야 맞다.
+ * - 실시간 수집 상태(_state)와 무관하다 — 서버 안 띄우고 혼자 돈다.
+ */
+export async function backfillJsonlFile(
+  jsonlPath: string,
+  opts: { dryRun?: boolean } = {}
+): Promise<BackfillResult> {
+  const sessionId = path.basename(jsonlPath).replace(/\.jsonl$/, "");
+  const fileState: FileState = { cursorBytes: 0, sessionId, contentSeen: new Set() };
+  const r = await flushDeltaForFile(jsonlPath, fileState, { createdAtFromEntry: true, dryRun: opts.dryRun });
+  return { file: jsonlPath, sessionId, ...r };
 }
 
 /** state reset (test용 / restart). */

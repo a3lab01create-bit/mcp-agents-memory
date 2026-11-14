@@ -142,12 +142,16 @@ target='sub_profile' 사용 시:
           return err("content is required for memory update");
         }
         // message 변경 → Cold Path가 재태깅+재임베딩
+        // 🔴 tag_processed = FALSE 가 있어야 콜드패스가 다시 태깅한다 (worker.ts 는 NOT tag_processed 만 집는다).
+        //    migration 020 때 이 자리만 빠져서, 고친 글은 태그가 지워진 채 영영 다시 안 붙었다 (2026-11-12 #127217 실측).
+        //    buzz_ingest.ts 의 같은 초기화 두 곳은 이미 켠다.
         const result = await db.query(
           `UPDATE memory
               SET message = $1,
                   embedding = NULL,
                   p_tag_id = NULL,
                   d_tag = '{}',
+                  tag_processed = FALSE,
                   cold_error = NULL,
                   updated_at = NOW()
             WHERE id = $2 AND user_id = $3
