@@ -12,8 +12,11 @@ import { looksLikeBuzzTurn, venueFromBuzzMessage } from "./buzz_envelope.js";
 
 export type SessionVenueKind = "buzz" | "terminal" | "slack" | "auto";
 
-/** 사람이 직접 대화하는 클라이언트의 entrypoint. */
-const INTERACTIVE_ENTRYPOINTS = new Set(["cli", "claude-vscode"]);
+/**
+ * 사람이 직접 대화하는 클라이언트의 entrypoint.
+ * "claude-desktop" = 클로드 데스크톱 앱의 Code 세션 (맥북 jsonl 실측 2026-11-14, #129343 — c561dd53 에 438줄).
+ */
+const INTERACTIVE_ENTRYPOINTS = new Set(["cli", "claude-vscode", "claude-desktop"]);
 
 export function classifySessionVenue(firstUserText: string, entrypoint?: string): SessionVenueKind | null {
   if (buzzTurnVenue(firstUserText)) return "buzz";

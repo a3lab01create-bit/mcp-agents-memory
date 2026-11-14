@@ -8,8 +8,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { registerTools } from "./tools.js";
 import { startColdPathWorker, stopColdPathWorker, drainColdPath } from "./cold_path/worker.js";
 import { collectBrief, formatBriefMarkdown } from "./briefing.js";
-import { captureSessionStart, captureSessionEnd, captureClientKnown } from "./auto_save/jsonl_capture.js";
-import { detectClientPlatform } from "./agent_identity.js";
+import { captureSessionStart, captureSessionEnd } from "./auto_save/jsonl_capture.js";
 import {
   captureSessionStart as captureCodexStart,
   captureSessionEnd as captureCodexEnd,
@@ -301,12 +300,6 @@ async function runMcpServer() {
   };
 
   registerTools(server);
-
-  // 클로드 수집: cwd 가 "/" 인 서버는 클라이언트가 클로드일 때만 전체 감시한다 (jsonl_capture.captureClientKnown).
-  // clientInfo 는 initialize 뒤에야 안다 → initialized 알림에서 넘긴다.
-  server.server.oninitialized = () => {
-    captureClientKnown(detectClientPlatform(server));
-  };
 
   installShutdownHandlers();
   startParentWatchdog();

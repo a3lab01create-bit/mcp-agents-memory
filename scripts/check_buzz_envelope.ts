@@ -462,6 +462,7 @@ check("venue: 정리가 거절한 봉투도 자기 채널을 읽고, 못 읽으�
   assert.equal(buzzTurnVenue("<context>\nUser prefers dark mode\n</context>\n그냥 메모"), null, "버즈 턴 모양 아님");
   assert.equal(venueFromBuzzContext(CONTEXT.replace("0000)", "0000)  ") + "\n" + EVENT), "buzz:DevRoom", "채널 줄 끝 공백");
   assert.equal(classifySessionVenue("리팩터 해줘", "claude-vscode"), "terminal");
+  assert.equal(classifySessionVenue("이 차트 좀 봐줘", "claude-desktop"), "terminal", "클로드 데스크톱 앱 Code 세션도 사람과 1:1 (#129343)");
 });
 
 check("venue: <context> 없이 <buzz-event> 로 시작하는 봉투도 자기 채널을 읽는다", () => {

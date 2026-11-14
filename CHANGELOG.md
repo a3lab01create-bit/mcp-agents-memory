@@ -2,35 +2,36 @@
 
 ## 0.9.36 — 2026-11-14
 
-### Claude conversations are captured even when the server starts in "/"
+### Claude sessions whose folder appears late are captured
 
-The Claude desktop app starts MCP servers in `/` for sessions opened without a
-folder ("this computer"). The Claude Code capture guessed the transcript folder
-from the server's working directory, retried for ten seconds and then gave up
-with a line in the server log, so every turn of those sessions was silently
-lost (one MacBook session lost about 33 hours of conversation).
+Claude Code creates `~/.claude/projects/<slug>/` and the session transcript
+when the first message is sent, but the session's MCP server starts when the
+session is opened. The capture looked for the folder for ten seconds and then
+gave up with a line in the server log, so a session opened and left for more
+than ten seconds before the first message lost every turn. On a MacBook the
+desktop app's sessions showed gaps of 12.7 and 23 seconds; one session lost
+about 33 hours of conversation.
 
-When the working directory is the filesystem root and the MCP client is Claude
-Code (`claude-code`) or the desktop app (`local-agent-mode-…`), the capture now
-watches every `~/.claude/projects/<slug>/*.jsonl`: a recursive watch on macOS
-and Windows plus a 3-second poll, as in the Codex capture; on Linux, where a
-recursive watch costs one inotify watch per nested file, only the poll. The
-client is known only after MCP initialization, so a root-directory server waits
-for it; a server that another client starts in `/` stays off. Nested
-transcripts (`<session>/subagents/*.jsonl`) and dot folders are never read.
-Servers started in any other folder still watch only that folder.
+After the ten-second fast retry the capture now keeps waiting: it watches
+`~/.claude/projects` itself (not recursively) and checks for the folder every
+3 seconds, and attaches when it appears. A server whose working directory is
+`/` is the desktop app's app-wide connector, not a session server; it keeps
+waiting harmlessly and its sessions are captured by their own servers.
+
+A transcript file that was created up to 60 seconds before the server started,
+or any time after, is now read from its first line when the capture attaches.
+Before, every file that already existed at arm time started at its end, so the
+first turns of a folder found late were lost. Re-reading is harmless: rows are
+keyed by `external_uuid`. Filesystems that report no birth time keep the old
+behaviour.
 
 One unreadable transcript no longer stops the capture of every file listed
 after it — each file's flush now fails on its own and is logged once — and a
 watcher error closes the watcher and falls back to polling instead of crashing
 the server.
 
-A transcript file that was created up to 60 seconds before the capture armed is
-now read from its first line. Before, every file that already existed at arm
-time started at its end, so a session file written before the server started
-(or during the ten-second retry) lost its first turns. Re-reading is harmless:
-rows are keyed by `external_uuid`. Filesystems that report no birth time keep
-the old behaviour.
+Desktop-app sessions (`entrypoint: "claude-desktop"`) are now stored with venue
+`terminal` like other one-to-one sessions, instead of `auto`.
 
 ### `backfill-claude` stores conversation the capture missed
 
@@ -43,14 +44,15 @@ conversation to the top of the start brief — and this machine's hostname as
 transcripts (`subagents/*.jsonl`) are refused, matching the live capture, and
 the command exits non-zero if any line failed to insert.
 
-### `memory_startup` warns when Claude capture is off
+### `memory_startup` warns when Claude capture has not attached
 
-A capture failure used to appear only in the server log. When the client is
-Claude Code (`claude-code`) or the desktop app (`local-agent-mode-…`) and the
-capture is off, `memory_startup` now starts with a warning that names the
-working directory and the reason and points to `manage_knowledge` and
-`backfill-claude`. Servers started by other clients, and captures that are still
-arming or running, stay quiet.
+A capture failure used to appear only in the server log. `memory_startup` runs
+after the first message, when the session's folder must already exist, so it
+checks once more and, if the client is Claude Code (`claude-code`) or the
+desktop app (`local-agent-mode-…`) and the capture still has not attached,
+starts its answer with a warning that names the working directory and what it
+is waiting for and points to `manage_knowledge` and `backfill-claude`. Servers
+started by other clients and the desktop app's `/` connector stay quiet.
 
 ### Editing a memory sends it back to the tagger
 
