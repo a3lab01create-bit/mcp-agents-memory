@@ -36,6 +36,7 @@ import {
 } from "./auto_save/opencode_capture.js";
 import { PACKAGE_VERSION } from "./version.js";
 import fs from "fs";
+import path from "path";
 
 const BRIEF_DB_TIMEOUT_MS = 5000;
 // 조립된 instructions(STATIC + brief) 최대 char. 클라이언트(Claude Code 등)가
@@ -242,6 +243,12 @@ Usage:
                                     raw_message), and fixes Buzz envelopes an older server stored uncleaned; --no-reclean skips both. Needs BUZZ_RELAY_URL, BUZZ_PRIVATE_KEY and BUZZ_INGEST_OWNER
                                     (the memory owner's pubkeys, comma-separated) in the environment of this command only —
                                     not in the shared .env; optional BUZZ_CLI.
+  mcp-agents-memory backfill-claude [--dry-run] <session.jsonl> [...]
+                                    Re-read Claude Code transcripts from the start and store any lines the live capture
+                                    missed (e.g. desktop-app sessions opened without a folder before 0.9.36). Lines already
+                                    stored are skipped by their external_uuid, so re-running is safe. Rows keep the line's
+                                    own timestamp as created_at and this machine's hostname as device_name — run it on the
+                                    machine that holds the files. --dry-run only counts parsable lines.
   mcp-agents-memory retag-ptag [--count | --dry-run | --rollback] [--only stale|untagged | --venue buzz:<channel>] [--untagged-days N]
                                [--before ISO] [--max N] [--minutes N] [--concurrency N] [--sample] [--seed S]
                                [--log PATH] [--allow-fallback] [--hold-new <registry tag>[,...]] [--since ISO (with --rollback)]
@@ -404,6 +411,28 @@ async function cli() {
     const report = await runBuzzIngest(opts);
     console.log(JSON.stringify({ dryRun: opts.dryRun ?? false, ...report }));
     await db.close();
+    process.exit(0);
+  }
+
+  if (cmd === "backfill-claude") {
+    // 빠진 클로드 대화 다시 채우기 — jsonl 을 처음부터 읽어 없는 줄만 넣는다 (external_uuid 로 중복 건너뜀)
+    const args = process.argv.slice(3);
+    const dryRun = args.includes("--dry-run");
+    const files = args.filter((a) => a !== "--dry-run");
+    const bad = files.filter((f) => !f.endsWith(".jsonl") || !fs.existsSync(f));
+    if (files.length === 0 || bad.length > 0) {
+      console.error(files.length === 0
+        ? "❌ backfill-claude: jsonl 파일 경로를 하나 이상 주세요."
+        : `❌ backfill-claude: 없는 파일이거나 .jsonl 이 아닙니다: ${bad.join(", ")}`);
+      process.exit(1);
+    }
+    const { backfillJsonlFile } = await import("./auto_save/jsonl_capture.js");
+    if (!dryRun) await db.connect();
+    for (const f of files) {
+      const r = await backfillJsonlFile(path.resolve(f), { dryRun });
+      console.log(JSON.stringify({ dryRun, ...r }));
+    }
+    if (!dryRun) await db.close();
     process.exit(0);
   }
 
