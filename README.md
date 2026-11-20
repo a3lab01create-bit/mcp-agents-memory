@@ -251,6 +251,45 @@ args = []
 
 > Install globally with `npm i -g mcp-agents-memory`, or point `command` at a local `build/index.js`.
 
+### Optional hook installation
+
+After configuring memory with `mcp-agents-memory setup`, run:
+
+```bash
+mcp-agents-memory hook install
+# Explicit non-interactive example (does not grant Codex hook trust):
+mcp-agents-memory hook install --client codex --yes
+# Inspect planned changes without writing:
+mcp-agents-memory hook install --client claude --dry-run
+```
+
+Interactive setup offers the same step after its database checks. Each detected CLI is opt-in
+(default **no**). Piped setup keeps its existing answer format and only prints the install command.
+Installing the npm package alone never edits client settings.
+
+- **Claude:** merges into `~/.claude/settings.json` (`CLAUDE_CONFIG_DIR` is respected).
+- **Codex:** merges into `$CODEX_HOME/hooks.json`, default `~/.codex/hooks.json`. The result is
+  **trust pending**: review the definition with `/hooks` in Codex before it runs.
+- **Antigravity:** merges the memory group into `~/.gemini/config/hooks.json`.
+- **Grok:** adds a marked MCP tool-use guidance block to `~/.grok/AGENTS.md` (`GROK_HOME` is respected).
+  This is **not automatic context injection**; connect the memory MCP server separately. Grok can
+  also load Claude hooks, so inspect its compatibility settings before registering duplicate hooks.
+
+Use `--claude-home`, `--codex-home`, `--agy-home`, or `--grok-home` to select another settings directory;
+`--agy-home` means the directory containing `hooks.json`. Multiple `--client` flags are supported.
+Hooks pin the resolved memory configuration file. Set `MEMORY_CONFIG_PATH` explicitly when needed.
+Use a global installation or persistent checkout, not an `npx` cache, for durable hook commands.
+
+Reinstalling updates only the memory-owned handlers. Other settings and hooks are retained; the
+installer refuses malformed JSON or a symlink settings file. Before replacing an existing file,
+it saves its exact bytes with mode `600` under `${XDG_STATE_HOME:-~/.local/state}/mcp-agents-memory/hook-backups/`
+and keeps the latest two copies per target. The install result prints the backup path. To undo an
+installation, restore that backup, or remove the handlers marked `mcp-agents-memory:<client>:<event>`
+(the Grok block has begin/end markers).
+
+A configured file is not proof of injection. Open a new client session and check the hook log;
+Codex additionally requires trust. Installation never bypasses a client's trust controls.
+
 ### Claude Code hooks (optional)
 
 Two hooks make Claude Code use the memory without the model having to call a tool:
