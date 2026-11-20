@@ -251,9 +251,20 @@ args = []
 
 > Install globally with `npm i -g mcp-agents-memory`, or point `command` at a local `build/index.js`.
 
-### Claude Code hooks (optional)
+### Memory hooks — Claude Code · Codex · Antigravity (optional)
 
-Two hooks make Claude Code use the memory without the model having to call a tool:
+Two hooks make the client use the memory without the model having to call a tool. The same engine serves
+every client; `--client claude|codex|agy` (default `claude`) only changes where the message is read from
+and the JSON that is printed:
+
+| Client | Start brief event | Per-message event | Output |
+|---|---|---|---|
+| Claude Code (`claude`) | `SessionStart` | `UserPromptSubmit` | `hookSpecificOutput.additionalContext`, up to 9,500 chars |
+| Codex CLI (`codex`) | `SessionStart` | `UserPromptSubmit` | same JSON, capped at 3,000 chars (`MEMORY_HOOK_CODEX_MAX_CHARS`) — Codex shows only a preview above ~2,500 tokens |
+| Antigravity (`agy`) | `SessionStart` | `PreInvocation` (first model call of a turn only) | `{"injectSteps":[{"systemMessage":{...}}]}`, `{}` when there is nothing to add |
+
+Grok (1.0.89) has the same event names but does not inject hook output into the model context, so it gets
+MCP tool-use guidance instead (see "Optional hook installation" below).
 
 - `hook session-start` (SessionStart) puts the full start brief at the top of each session. The MCP
   `instructions` field is cut by the client at about 2,000 characters; hook output may be up to 10,000.
@@ -262,7 +273,8 @@ Two hooks make Claude Code use the memory without the model having to call a too
   replies ("ok") and machine messages, ignores the last 30 minutes (the current conversation), and needs
   `OPENAI_API_KEY` for the embedding.
 
-Print the block to merge into `~/.claude/settings.json` (the command never edits the file):
+Use `mcp-agents-memory hook install` (below) to merge the hooks for each client, or print the Claude block
+to merge by hand (the command never edits the file):
 
 ```bash
 mcp-agents-memory hook print-config
