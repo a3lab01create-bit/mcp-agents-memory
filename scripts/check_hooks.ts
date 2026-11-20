@@ -67,13 +67,16 @@ const snippet = JSON.parse(hookConfigSnippet("/opt/my tools/it's/index.js", "/ho
 const ss = snippet.hooks.SessionStart[0].hooks[0];
 const ups = snippet.hooks.UserPromptSubmit[0].hooks[0];
 assert.equal(ss.type, "command");
-assert.match(ss.command, /hook session-start$/);
-assert.match(ups.command, /hook prompt$/);
+assert.match(ss.command, /hook session-start \|\| true$/, "훅 코드 밖 실패(모듈 불러오기)도 exit 0 으로");
+assert.match(ups.command, /hook prompt \|\| true$/);
 assert.ok(ups.command.startsWith("MEMORY_CONFIG_PATH='/home/u/.config/mcp-agents-memory/.env' "),
   "프로젝트 .env 가 다른 DB 를 가리켜도 같은 설정을 쓰게 경로를 박는다");
 assert.ok(ups.command.includes(`'/opt/my tools/it'\\''s/index.js'`), "공백·작은따옴표 경로도 셸에서 안 깨진다");
 assert.ok(ups.timeout >= 5 && ss.timeout >= 5);
 assert.ok(!JSON.parse(hookConfigSnippet("/x/index.js", null)).hooks.UserPromptSubmit[0].hooks[0].command.includes("MEMORY_CONFIG_PATH"));
+const relCmd = JSON.parse(hookConfigSnippet("rel/index.js", "./c.env")).hooks.UserPromptSubmit[0].hooks[0].command;
+assert.ok(relCmd.includes(`MEMORY_CONFIG_PATH='${path.resolve("c.env")}'`) && relCmd.includes(`'${path.resolve("rel/index.js")}'`),
+  "상대경로는 print-config 시점 기준 절대경로로 박는다 (코디 리뷰 #41-1)");
 
 // ── 5. 프로세스 계약 (빌드된 서버로) ──
 const entry = path.resolve("build/index.js");
@@ -115,6 +118,53 @@ const hang = runHook("prompt", promptIn, { MEMORY_CONFIG_PATH: hangEnv, MEMORY_H
 assert.equal(hang.status, 0, "DB 가 대답을 안 해도 exit 0");
 assert.equal(hang.stdout, "");
 assert.ok(hang.ms < 5_000, `deadline 에 끊겨야 한다 (실제 ${hang.ms}ms)`);
+
+// 코디 리뷰 #41-1: 상대경로 설정으로 print-config → 다른 폴더에서 그 명령을 돌려도 처음 설정을 쓴다
+const dirA = path.join(tmp, "A"), dirB = path.join(tmp, "B");
+fs.mkdirSync(dirA); fs.mkdirSync(dirB);
+fs.writeFileSync(path.join(dirA, "c.env"), "DATABASE_URL=postgres://x:y@127.0.0.1:1/a\nOPENAI_API_KEY=sk-invalid\n");
+fs.writeFileSync(path.join(dirB, "c.env"), "DATABASE_URL=postgres://x:y@127.0.0.1:2/b\nOPENAI_API_KEY=sk-invalid\n");
+const minimalEnv = (extraEnv: Record<string, string>) => ({ PATH: process.env.PATH ?? "", HOME: tmp, ...extraEnv });
+const pc = spawnSync(process.execPath, [entry, "hook", "print-config"], {
+  encoding: "utf8", cwd: dirA, env: minimalEnv({ MEMORY_CONFIG_PATH: "./c.env" }),
+});
+assert.equal(pc.status, 0);
+const genCmd: string = JSON.parse(pc.stdout).hooks.UserPromptSubmit[0].hooks[0].command;
+const relLog = path.join(tmp, "rel.log");
+const gen = spawnSync("sh", ["-c", genCmd], {
+  input: promptIn, encoding: "utf8", cwd: dirB, env: minimalEnv({ MEMORY_HOOK_LOG: relLog }),
+});
+assert.equal(gen.status, 0);
+assert.equal(gen.stdout, "");
+const relText = fs.readFileSync(relLog, "utf8");
+assert.ok(relText.includes("127.0.0.1:1") && !relText.includes("127.0.0.1:2"),
+  `다른 폴더에서도 print-config 때의 설정(A, port 1)을 써야 한다 (log: ${relText.trim()})`);
+
+// 코디 리뷰 #41-2: 설정 파일을 못 읽으면 db.ts import 에서 죽어 exit 1 이던 것
+if (process.getuid?.() !== 0) {
+  const locked = path.join(tmp, "locked.env");
+  fs.writeFileSync(locked, "DATABASE_URL=postgres://x:y@127.0.0.1:1/none\n");
+  fs.chmodSync(locked, 0o000);
+  for (const [sub, extraEnv] of [
+    ["prompt", {}], ["session-start", {}], ["prompt", { MEMORY_HOOKS_OFF: "1" }],
+  ] as const) {
+    const r = runHook(sub, promptIn, { MEMORY_CONFIG_PATH: locked, ...extraEnv });
+    assert.equal(r.status, 0, `읽을 수 없는 설정 + ${sub} ${JSON.stringify(extraEnv)}: exit 0`);
+    assert.equal(r.stdout, "");
+  }
+  fs.chmodSync(locked, 0o600);
+} else {
+  console.log("(root 로 돌아서 읽기 권한 검사는 건너뜀)");
+}
+
+// 마지막 방어선: 서버 파일 자체가 없어 node 가 죽어도 생성 명령은 exit 0 · stdout 비어 있음
+const missingCmd: string = JSON.parse(hookConfigSnippet(path.join(tmp, "missing", "index.js"), null))
+  .hooks.UserPromptSubmit[0].hooks[0].command;
+const guarded = spawnSync("sh", ["-c", missingCmd], { input: promptIn, encoding: "utf8", cwd: tmp, env: minimalEnv({}) });
+assert.equal(guarded.status, 0, "`|| true` 가 있으면 exit 0");
+assert.equal(guarded.stdout, "");
+const unguarded = spawnSync("sh", ["-c", missingCmd.replace(/ \|\| true$/, "")], { input: promptIn, encoding: "utf8", cwd: tmp, env: minimalEnv({}) });
+assert.notEqual(unguarded.status, 0, "음성대조: `|| true` 를 빼면 실패가 그대로 드러난다");
 
 const log = fs.readFileSync(logFile, "utf8");
 const outcomes = log.trim().split("\n").map((l) => JSON.parse(l).outcome);

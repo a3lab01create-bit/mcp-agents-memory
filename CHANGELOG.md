@@ -39,8 +39,18 @@ which the JSONL capture already skips; a real session run through
 are not saved back into memory.
 
 `hook print-config` prints the `hooks` block to merge into
-`~/.claude/settings.json` with `MEMORY_CONFIG_PATH` pinned (a project `.env`
-with its own `DATABASE_URL` would otherwise win). It never edits the file.
+`~/.claude/settings.json` with `MEMORY_CONFIG_PATH` pinned as an absolute path
+(a relative path would be read from each session's working directory, and a
+project `.env` with its own `DATABASE_URL` would otherwise win). Each command
+ends in `|| true`, so a failure before the hook code runs — a missing build,
+a module that cannot load — still exits 0. It never edits the file.
+
+An unreadable config file (for example no read permission) no longer throws
+while `db.ts` is being imported. That threw before any command's own error
+handling, so the hooks exited 1 and even `MEMORY_HOOKS_OFF=1` could not stop
+it; the MCP server and other commands crashed at start-up. The error is now
+logged once and the process carries on without falling back to another config
+file, so database use fails later with "Database not configured".
 
 ### Claude Desktop sessions are labelled `claude-desktop`
 

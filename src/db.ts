@@ -45,7 +45,14 @@ export function loadEnv(): string | null {
   return null;
 }
 
-loadEnv();
+// import 시점에 설정 파일을 못 읽어도(권한 없음 등) 여기서 프로세스를 죽이지 않는다.
+// `hook …` 은 늘 exit 0 이어야 하는데 이 줄은 훅 코드보다 먼저 돈다. 다른 설정 파일로 넘어가지는
+// 않는다(지정한 파일을 건너뛰고 엉뚱한 DB 에 붙는 것보다 낫다) — DB 를 쓸 때 "not configured" 로 드러난다.
+try {
+  loadEnv();
+} catch (err) {
+  console.error(`⚠️ 설정 파일을 읽지 못했다: ${err instanceof Error ? err.message : String(err)}`);
+}
 
 // ─────────────────────────────────────────────────────────────
 // Pool config

@@ -268,8 +268,9 @@ Print the block to merge into `~/.claude/settings.json` (the command never edits
 mcp-agents-memory hook print-config
 ```
 
-The printed commands pin `MEMORY_CONFIG_PATH`, so a project's own `.env` cannot point the hooks at another
-database. Both hooks always exit 0, print one JSON object or nothing, and give up silently after 3.5 s
+The printed commands pin `MEMORY_CONFIG_PATH` as an absolute path, so neither the session's working directory
+nor a project's own `.env` can point the hooks at another database, and end in `|| true` so that even a
+failure before the hook code runs cannot block a message. Both hooks always exit 0, print one JSON object or nothing, and give up silently after 3.5 s
 (prompt) / 6 s (session start); each call appends one line without message text to
 `~/.local/state/mcp-agents-memory/hooks.log`. The injected text is stored by Claude Code as transcript
 attachments, which the capture skips, so it is not saved back into memory.

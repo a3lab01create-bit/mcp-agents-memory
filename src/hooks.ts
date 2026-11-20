@@ -229,11 +229,15 @@ function finish(out: string): void {
   process.stdout.write(out, () => process.exit(0));
 }
 
-/** `hook print-config` — ~/.claude/settings.json 의 "hooks" 에 넣을 조각. 설정 파일은 직접 안 건드린다. */
+/**
+ * `hook print-config` — ~/.claude/settings.json 의 "hooks" 에 넣을 조각. 설정 파일은 직접 안 건드린다.
+ * 경로는 절대경로로 박는다(훅은 세션의 작업 폴더에서 돈다). 끝의 `|| true` 는 마지막 방어선:
+ * 모듈을 불러오다 죽는 것처럼 훅 코드 밖에서 난 실패도 exit 0 으로 만든다(2 는 사용자의 말을 막는다).
+ */
 export function hookConfigSnippet(entryScript: string, configPath: string | null): string {
   const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-  const envPrefix = configPath ? `MEMORY_CONFIG_PATH=${q(configPath)} ` : "";
-  const cmd = (sub: string) => `${envPrefix}${q(process.execPath)} ${q(entryScript)} hook ${sub}`;
+  const envPrefix = configPath ? `MEMORY_CONFIG_PATH=${q(path.resolve(configPath))} ` : "";
+  const cmd = (sub: string) => `${envPrefix}${q(process.execPath)} ${q(path.resolve(entryScript))} hook ${sub} || true`;
   return JSON.stringify({
     hooks: {
       SessionStart: [{ hooks: [{ type: "command", command: cmd("session-start"), timeout: 15 }] }],
