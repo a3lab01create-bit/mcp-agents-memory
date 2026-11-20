@@ -249,6 +249,16 @@ Usage:
                                     stored are skipped by their external_uuid, so re-running is safe. Rows keep the line's
                                     own timestamp as created_at and this machine's hostname as device_name — run it on the
                                     machine that holds the files. --dry-run only counts parsable lines.
+  mcp-agents-memory hook <session-start | prompt | print-config>
+                                    Claude Code hooks. session-start puts the full start brief at the top of a session
+                                    (the MCP instructions field is cut at ~2KB; hook output gets up to 10,000 chars).
+                                    prompt adds up to 3 similar past records each time you send a message (needs
+                                    OPENAI_API_KEY for the embedding). Both always exit 0, print one JSON object or
+                                    nothing, and give up silently after a deadline (3.5s prompt / 6s session-start).
+                                    One line per call goes to ~/.local/state/mcp-agents-memory/hooks.log (no message
+                                    text). print-config prints the "hooks" block to merge into ~/.claude/settings.json
+                                    — it never edits the file. Off switch: MEMORY_HOOKS_OFF=1. Tuning:
+                                    MEMORY_RECALL_MIN_SIMILARITY (0.5), MEMORY_RECALL_LIMIT (3).
   mcp-agents-memory retag-ptag [--count | --dry-run | --rollback] [--only stale|untagged | --venue buzz:<channel>] [--untagged-days N]
                                [--before ISO] [--max N] [--minutes N] [--concurrency N] [--sample] [--seed S]
                                [--log PATH] [--allow-fallback] [--hold-new <registry tag>[,...]] [--since ISO (with --rollback)]
@@ -442,6 +452,13 @@ async function cli() {
     if (!dryRun) await db.close();
     if (failed > 0) console.error(`❌ backfill-claude: ${failed} line(s) failed to insert — see errors above; re-run after fixing (stored lines are skipped).`);
     process.exit(failed > 0 ? 1 : 0);
+  }
+
+  if (cmd === "hook") {
+    // Claude Code 훅 — 시작 브리핑 / 말할 때 기억 넣기. 늘 exit 0, stdout 은 JSON 한 덩어리 또는 빈 문자열.
+    const { runHookCli } = await import("./hooks.js");
+    await runHookCli(process.argv[3]);
+    return;
   }
 
   if (cmd === "retag-ptag") {

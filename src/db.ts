@@ -45,7 +45,19 @@ export function loadEnv(): string | null {
   return null;
 }
 
-loadEnv();
+/**
+ * import 시점 설정 읽기 실패(권한 없음 등). `mcp-agents-memory hook …` 만 이걸 들고 계속 간다 —
+ * 훅은 늘 exit 0 이어야 하는데 이 줄이 훅 코드보다 먼저 돈다. 훅은 이 값이 있으면 DB 에 붙기 전에 끝낸다.
+ */
+export let envLoadError: Error | null = null;
+try {
+  loadEnv();
+} catch (err) {
+  // 훅 말고는(서버·migrate·스크립트) 예전처럼 여기서 멈춘다. 이어 가면 환경변수에 남은 DATABASE_URL 로
+  // 엉뚱한 DB 에 쓸 수 있다(코디 재현: 읽을 수 없는 설정 + 상속 DATABASE_URL → migrate 가 그 DB 에 적용).
+  if (process.argv[2] !== "hook") throw err;
+  envLoadError = err instanceof Error ? err : new Error(String(err));
+}
 
 // ─────────────────────────────────────────────────────────────
 // Pool config
