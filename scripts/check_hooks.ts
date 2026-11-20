@@ -152,6 +152,29 @@ if (process.getuid?.() !== 0) {
     assert.equal(r.status, 0, `읽을 수 없는 설정 + ${sub} ${JSON.stringify(extraEnv)}: exit 0`);
     assert.equal(r.stdout, "");
   }
+  // 코디 재검토: 읽을 수 없는 설정 + 환경변수에 남은 DATABASE_URL → 훅은 그 DB 에 붙지 않고 끝난다
+  const inherited = "postgres://x:y@127.0.0.1:3/inherited";
+  const inhLog = path.join(tmp, "inherited.log");
+  const inh = runHook("prompt", promptIn, { MEMORY_CONFIG_PATH: locked, DATABASE_URL: inherited, MEMORY_HOOK_LOG: inhLog });
+  assert.equal(inh.status, 0);
+  assert.equal(inh.stdout, "");
+  const inhText = fs.readFileSync(inhLog, "utf8");
+  assert.ok(/"outcome":"error"/.test(inhText) && /config: /.test(inhText) && !inhText.includes("127.0.0.1:3"),
+    `설정 오류로 DB 연결 전에 끝나야 한다 (log: ${inhText.trim()})`);
+  // 훅이 아닌 명령(migrate)은 예전처럼 import 에서 멈춘다 — 상속 DATABASE_URL 로 마이그레이션하면 안 된다
+  const mig = spawnSync(process.execPath, [entry, "migrate"], {
+    encoding: "utf8", timeout: 20_000, cwd: tmp,
+    env: { PATH: process.env.PATH ?? "", HOME: tmp, MEMORY_CONFIG_PATH: locked, DATABASE_URL: inherited },
+  });
+  assert.notEqual(mig.status, 0, "migrate 는 실패로 끝나야 한다");
+  assert.ok(/EACCES|permission denied/i.test(mig.stderr) && !mig.stderr.includes("127.0.0.1:3"),
+    `migrate 는 DB 에 붙기 전에(설정 읽기에서) 멈춰야 한다 (stderr 끝: ${mig.stderr.slice(-300)})`);
+  // print-config 는 사람이 치는 명령 — 실패를 그대로 알린다
+  const pcLocked = spawnSync(process.execPath, [entry, "hook", "print-config"], {
+    encoding: "utf8", cwd: tmp, env: { PATH: process.env.PATH ?? "", HOME: tmp, MEMORY_CONFIG_PATH: locked },
+  });
+  assert.equal(pcLocked.status, 1);
+  assert.equal(pcLocked.stdout, "", "읽을 수 없는 설정으로는 조각을 만들지 않는다");
   fs.chmodSync(locked, 0o600);
 } else {
   console.log("(root 로 돌아서 읽기 권한 검사는 건너뜀)");

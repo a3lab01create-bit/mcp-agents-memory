@@ -19,7 +19,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { db, loadEnv } from "./db.js";
+import { db, envLoadError, loadEnv } from "./db.js";
 import { collectBrief, formatBriefMarkdown } from "./briefing.js";
 import { embedMessage, vectorToHalfvecSql } from "./cold_path/embedder.js";
 import { buzzDisplayText } from "./auto_save/buzz_envelope.js";
@@ -252,6 +252,12 @@ export async function runHookCli(sub: string | undefined): Promise<void> {
   console.info = (...a: unknown[]) => console.error(...a);
 
   if (sub === "print-config") {
+    if (envLoadError) {
+      // 사람이 직접 치는 명령 — 훅과 달리 실패를 그대로 알린다
+      console.error(`❌ 설정 파일을 읽지 못했다: ${envLoadError.message}`);
+      process.exitCode = 1;
+      return;
+    }
     const entry = path.resolve(process.argv[1] ?? "");
     const configPath = loadEnv();
     if (!configPath) {
@@ -269,6 +275,11 @@ export async function runHookCli(sub: string | undefined): Promise<void> {
   }
   if (process.env.MEMORY_HOOKS_OFF === "1") {
     logLine({ event, outcome: "off" });
+    process.exit(0);
+  }
+  if (envLoadError) {
+    // 지정한 설정을 못 읽었다 → DB 에 붙지 않는다(환경변수에 남은 DATABASE_URL 로 엉뚱한 DB 에 붙지 않게)
+    logLine({ event, outcome: "error", ms: Date.now() - started, error: `config: ${envLoadError.message}`.slice(0, 200) });
     process.exit(0);
   }
 

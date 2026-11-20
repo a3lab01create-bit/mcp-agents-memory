@@ -45,12 +45,15 @@ project `.env` with its own `DATABASE_URL` would otherwise win). Each command
 ends in `|| true`, so a failure before the hook code runs — a missing build,
 a module that cannot load — still exits 0. It never edits the file.
 
-An unreadable config file (for example no read permission) no longer throws
-while `db.ts` is being imported. That threw before any command's own error
-handling, so the hooks exited 1 and even `MEMORY_HOOKS_OFF=1` could not stop
-it; the MCP server and other commands crashed at start-up. The error is now
-logged once and the process carries on without falling back to another config
-file, so database use fails later with "Database not configured".
+An unreadable config file (for example no read permission) used to throw
+while `db.ts` was being imported — before any of the hook's own error handling,
+so the hooks exited 1 and even `MEMORY_HOOKS_OFF=1` could not stop them. Only
+`mcp-agents-memory hook …` now survives that: it records the error, and both
+hook events end with no output and exit 0 before touching any database — also
+when the environment still carries a `DATABASE_URL`, which would otherwise be
+used. Every other command (the MCP server, `migrate`, scripts) keeps stopping
+at import as before, so an inherited `DATABASE_URL` is never written to by
+mistake. `hook print-config` reports the error and exits 1.
 
 ### Claude Desktop sessions are labelled `claude-desktop`
 
