@@ -129,9 +129,49 @@ export function capContext(text: string, max = HOOK_CONTEXT_MAX_CHARS): string {
   return text.slice(0, Math.max(0, max - tail.length)) + tail;
 }
 
-function hookOutput(eventName: "SessionStart" | "UserPromptSubmit", context: string): string {
-  if (!context) return "";
-  return JSON.stringify({ hookSpecificOutput: { hookEventName: eventName, additionalContext: context } });
+/** 넣을 게 없을 때 stdout. agy 는 빈 JSON({})을 준다(Supermemory 안티그래비티 플러그인과 같은 모양). */
+export function emptyHookOutput(client: HookClient): string {
+  return client === "agy" ? "{}" : "";
+}
+
+/**
+ * 도구별 출력 모양.
+ * - claude·codex: {"hookSpecificOutput":{"hookEventName":…,"additionalContext":…}} (코덱스 0.171.0 실물 확인, 코디)
+ * - agy: {"injectSteps":[{"systemMessage":{"systemMessage":…}}]} (agy 1.5.13 실물 확인 — 모델이 읽음)
+ */
+export function formatHookOutput(client: HookClient, event: HookEvent, context: string): string {
+  if (!context) return emptyHookOutput(client);
+  if (client === "agy") return JSON.stringify({ injectSteps: [{ systemMessage: { systemMessage: context } }] });
+  const hookEventName = event === "session-start" ? "SessionStart" : "UserPromptSubmit";
+  return JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext: context } });
+}
+
+/**
+ * 도구별 글자 상한. 클로드는 10,000자 넘으면 미리보기만(→ 9,500). 코덱스는 기본 약 2,500토큰을 넘으면
+ * 파일+미리보기(코디 실측) — 한글은 글자당 토큰이 많아서 3,000자로 잡는다(MEMORY_HOOK_CODEX_MAX_CHARS).
+ * agy 는 문서에 상한이 없어 클로드와 같게 둔다.
+ */
+export function clientMaxChars(client: HookClient): number {
+  if (client === "codex") return Math.max(500, Math.floor(numEnv("MEMORY_HOOK_CODEX_MAX_CHARS", 3000)));
+  return HOOK_CONTEXT_MAX_CHARS;
+}
+
+/** 도구 입력에서 사용자가 친 말. agy 는 PreInvocation 이 모델 호출마다 돌므로 턴의 첫 호출(0)만 쓴다. */
+export function hookPromptText(client: HookClient, input: any): { text: string; skip?: string } {
+  if (client === "agy") {
+    const n = input?.invocationNum;
+    if (Number.isInteger(n) && n > 0) return { text: "", skip: "later-invocation" };
+    return { text: typeof input?.lastUserInput === "string" ? input.lastUserInput : "" };
+  }
+  return { text: typeof input?.prompt === "string" ? input.prompt : "" };
+}
+
+/** `--client <이름>` (없으면 claude — 0.9.37 로 넣은 설정 호환). 모르는 이름이면 null. */
+export function parseHookClient(args: readonly string[]): HookClient | null {
+  const i = args.indexOf("--client");
+  if (i < 0) return "claude";
+  const v = args[i + 1];
+  return (HOOK_CLIENTS as readonly string[]).includes(v ?? "") ? (v as HookClient) : null;
 }
 
 /** 훅이 도는 쪽 플랫폼. Claude Code 는 훅 프로세스에도 자기 환경변수를 물려준다. */
@@ -141,23 +181,32 @@ function hookPlatform(): string | null {
   return null;
 }
 
-async function sessionStartContext(): Promise<{ context: string; info: Record<string, unknown> }> {
+/** 브리핑의 "현재 플랫폼". 코덱스는 수집 경로마다 이름이 달라(codex-cli·codex-desktop…) 전체로 본다. */
+function clientPlatform(client: HookClient): string | null {
+  if (client === "agy") return "antigravity-cli";
+  if (client === "codex") return null;
+  return hookPlatform();
+}
+
+async function sessionStartContext(client: HookClient): Promise<{ context: string; info: Record<string, unknown> }> {
   await db.connect();
-  const brief = await collectBrief({ currentPlatform: hookPlatform() });
+  const max = clientMaxChars(client);
+  const brief = await collectBrief({ currentPlatform: clientPlatform(client) });
   let md = formatBriefMarkdown(brief);
   let mode = "full";
-  if (md.length > HOOK_CONTEXT_MAX_CHARS) {
-    // 강제기억이 많으면 full 이 BRIEF_MAX_CHARS 를 넘을 수 있다 → inject 모드로 예산 안에 맞춘다
-    md = formatBriefMarkdown(brief, { mode: "inject", maxChars: HOOK_CONTEXT_MAX_CHARS - 200 });
+  if (md.length > max) {
+    // 강제기억이 많거나 상한이 작으면(코덱스) inject 모드로 예산 안에 맞춘다
+    md = formatBriefMarkdown(brief, { mode: "inject", maxChars: Math.max(0, max - 200) });
     mode = "inject";
   }
-  const context = capContext(`mcp-agents-memory 시작 브리핑 (지난 대화 기록에서 자동으로 모은 것)\n\n${md}`);
+  const context = capContext(`mcp-agents-memory 시작 브리핑 (지난 대화 기록에서 자동으로 모은 것)\n\n${md}`, max);
   return { context, info: { mode, chars: context.length } };
 }
 
-async function promptContext(input: any): Promise<{ context: string; info: Record<string, unknown> }> {
+async function promptContext(input: any, client: HookClient): Promise<{ context: string; info: Record<string, unknown> }> {
   const s = recallSettings();
-  const raw = typeof input?.prompt === "string" ? input.prompt : "";
+  const { text: raw, skip: clientSkip } = hookPromptText(client, input);
+  if (clientSkip) return { context: "", info: { skipped: clientSkip } };
   const cleaned = cleanPromptForRecall(raw);
   const skip = recallSkipReason(cleaned, s);
   if (skip) return { context: "", info: { skipped: skip } };
@@ -191,7 +240,7 @@ async function promptContext(input: any): Promise<{ context: string; info: Recor
   }));
   const rows = pickRecallRows(candidates, s);
   return {
-    context: formatRecall(rows, s),
+    context: capContext(formatRecall(rows, s), clientMaxChars(client)),
     info: {
       candidates: candidates.length,
       rows: rows.length,
@@ -287,8 +336,17 @@ export function hookCommand(
   return `${envPrefix}${q(node)} ${q(path.resolve(opts.entry))} hook ${event} --client ${client} || true`;
 }
 
-export async function runHookCli(sub: string | undefined): Promise<void> {
-  // 훅 stdout 은 Claude Code 가 맥락으로 읽는다 → 어떤 모듈의 console.log 도 stdout 을 더럽히지 못하게
+/** 넣을 게 없는 끝(꺼짐·오류·시간 넘김). agy 면 {} 를 동기로 쓰고 끝낸다(process.exit 전에 확실히 나가게). */
+function exitQuiet(client: HookClient): never {
+  const out = emptyHookOutput(client);
+  if (out) {
+    try { fs.writeSync(1, out); } catch { /* stdout 이 닫혔어도 exit 0 */ }
+  }
+  process.exit(0);
+}
+
+export async function runHookCli(sub: string | undefined, args: readonly string[] = []): Promise<void> {
+  // 훅 stdout 은 도구가 맥락으로 읽는다 → 어떤 모듈의 console.log 도 stdout 을 더럽히지 못하게
   console.log = (...a: unknown[]) => console.error(...a);
   console.info = (...a: unknown[]) => console.error(...a);
 
@@ -308,42 +366,49 @@ export async function runHookCli(sub: string | undefined): Promise<void> {
     return;
   }
 
-  const event = sub === "session-start" ? "SessionStart" : sub === "prompt" ? "UserPromptSubmit" : null;
   const started = Date.now();
-  if (!event) {
-    console.error(`❌ hook: unknown subcommand "${sub ?? ""}" (session-start | prompt | print-config)`);
+  const client = parseHookClient(args);
+  const event: HookEvent | null = sub === "session-start" || sub === "prompt" ? sub : null;
+  if (!client) {
+    console.error(`❌ hook: unknown --client (${HOOK_CLIENTS.join(" | ")})`);
+    logLine({ event: sub, outcome: "error", error: "unknown client" });
     process.exit(0);
   }
+  if (!event) {
+    console.error(`❌ hook: unknown subcommand "${sub ?? ""}" (session-start | prompt | print-config)`);
+    exitQuiet(client);
+  }
+  const logEvent = event === "session-start" ? "SessionStart" : "UserPromptSubmit";
   if (process.env.MEMORY_HOOKS_OFF === "1") {
-    logLine({ event, outcome: "off" });
-    process.exit(0);
+    logLine({ event: logEvent, client, outcome: "off" });
+    exitQuiet(client);
   }
   if (envLoadError) {
     // 지정한 설정을 못 읽었다 → DB 에 붙지 않는다(환경변수에 남은 DATABASE_URL 로 엉뚱한 DB 에 붙지 않게)
-    logLine({ event, outcome: "error", ms: Date.now() - started, error: `config: ${envLoadError.message}`.slice(0, 200) });
-    process.exit(0);
+    logLine({ event: logEvent, client, outcome: "error", ms: Date.now() - started, error: `config: ${envLoadError.message}`.slice(0, 200) });
+    exitQuiet(client);
   }
 
-  const deadlineMs = event === "SessionStart"
+  const deadlineMs = event === "session-start"
     ? numEnv("MEMORY_HOOK_SESSION_DEADLINE_MS", 6000)
     : numEnv("MEMORY_HOOK_PROMPT_DEADLINE_MS", 3500);
   setTimeout(() => {
-    logLine({ event, outcome: "timeout", ms: Date.now() - started });
-    process.exit(0);
+    logLine({ event: logEvent, client, outcome: "timeout", ms: Date.now() - started });
+    exitQuiet(client);
   }, deadlineMs);
 
   try {
     const rawIn = await readStdin();
     let input: any = {};
     try { input = rawIn.trim() ? JSON.parse(rawIn) : {}; } catch { input = {}; }
-    const { context, info } = event === "SessionStart"
-      ? await sessionStartContext()
-      : await promptContext(input);
-    const out = hookOutput(event, context);
-    logLine({ event, outcome: out ? "injected" : "none", ms: Date.now() - started, source: input?.source, ...info });
+    const { context, info } = event === "session-start"
+      ? await sessionStartContext(client)
+      : await promptContext(input, client);
+    const out = formatHookOutput(client, event, context);
+    logLine({ event: logEvent, client, outcome: context ? "injected" : "none", ms: Date.now() - started, source: input?.source, ...info });
     finish(out);
   } catch (err) {
-    logLine({ event, outcome: "error", ms: Date.now() - started, error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200) });
-    process.exit(0);
+    logLine({ event: logEvent, client, outcome: "error", ms: Date.now() - started, error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200) });
+    exitQuiet(client);
   }
 }
