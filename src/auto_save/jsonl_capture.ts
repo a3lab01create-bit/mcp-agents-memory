@@ -203,9 +203,9 @@ function isFilesystemRoot(cwd: string): boolean {
   return resolved === path.parse(resolved).root;
 }
 
-/** 클로드 클라이언트 이름: 터미널 claude = "claude-code", 클로드 데스크톱 앱 = "local-agent-mode-…"(맥북 실측). */
+/** 클로드 클라이언트 이름: 정규화된 platform과 데스크톱의 원래 clientInfo.name을 모두 받는다. */
 function isClaudeClient(clientName: string | null): boolean {
-  return !!clientName && (clientName === "claude-code" || clientName.startsWith("local-agent-mode"));
+  return !!clientName && (clientName === "claude-code" || clientName === "claude-desktop" || clientName.startsWith("local-agent-mode"));
 }
 
 /** 검사에서만 바꾼다 (MEMORY_JSONL_FRESH_MS). 잘못된 값이면 기본값. */
