@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import type { InstallOptions, InstallClient } from "../src/hook_install.js";
 
@@ -173,6 +174,40 @@ try {
   await promptHookInstall(async (question, defaultValue) => { questions.push(question); return defaultValue!; }, () => {}, { ...homes, env: { PATH: bin } });
   assert.equal(questions.length, 2);
   assert.equal(fs.existsSync(homes.home!), false);
+  // Desktop-only Claude installations still appear without a CLI executable.
+  for (const custom of [false, true]) {
+    const desktop = fixture(`desktop-only-${custom}`);
+    if (custom) desktop.env!.CLAUDE_CONFIG_DIR = path.join(tmp, "desktop-custom-config");
+    assert.deepEqual(detectClients(desktop), []);
+    const dir = clientHome("claude", desktop);
+    put(dir, "not a directory");
+    assert.deepEqual(detectClients(desktop), [], "regular file is not a settings directory");
+    fs.unlinkSync(dir);
+    fs.mkdirSync(dir);
+    assert.deepEqual(detectClients(desktop), ["claude"]);
+    const prompts: string[] = [];
+    await promptHookInstall(async (q, def) => { prompts.push(q); return def!; }, () => {}, desktop);
+    assert.equal(prompts.length, 1);
+    assert.match(prompts[0], /claude/);
+    assert.deepEqual(fs.readdirSync(dir), [], "discovery and default opt-out write nothing");
+  }
+  // A leftover or active lock is retained and explained, never removed automatically.
+  const locked = fixture("locked"), lockedTarget = installTarget("claude", locked);
+  put(lockedTarget, '{"keep":true}');
+  const lockKey = crypto.createHash("sha256").update(lockedTarget).digest("hex").slice(0, 20);
+  const lockFile = path.join(locked.stateDir!, "hook-backups", `${lockKey}.lock`);
+  put(lockFile, "existing lock");
+  assert.throws(() => installClient("claude", locked), (err: Error) => {
+    assert.ok(err.message.includes(lockFile));
+    assert.match(err.message, /confirm no installer is running/);
+    assert.match(err.message, /remove this leftover lock file, then retry/);
+    return true;
+  });
+  assert.equal(fs.readFileSync(lockFile, "utf8"), "existing lock");
+  assert.equal(fs.readFileSync(lockedTarget, "utf8"), '{"keep":true}');
+  assert.deepEqual(fs.readdirSync(path.dirname(lockFile)), [`${lockKey}.lock`]);
+  fs.unlinkSync(lockFile);
+  assert.equal(installClient("claude", locked).changed, true, "retry after manual stale lock removal works");
   for (const client of ["claude", "codex", "agy", "grok"] as InstallClient[]) {
     const opts = { ...fixture(`dry-${client}`), dryRun: true };
     assert.equal(installClient(client, opts).changed, true);

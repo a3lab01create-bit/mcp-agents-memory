@@ -59,13 +59,18 @@ export function installTarget(client: InstallClient, opts: InstallOptions): stri
   return path.join(clientHome(client, opts), client === "claude" ? "settings.json" : client === "grok" ? "AGENTS.md" : "hooks.json");
 }
 
-/** Detect executables without running them or loading client credentials/config. */
+/** Detect executables or Claude's settings directory without loading credentials/config. */
 export function detectClients(opts: InstallOptions): InstallClient[] {
   const home = baseHome(opts), env = opts.env ?? process.env;
   const dirs = [...(env.PATH ?? "").split(path.delimiter).filter(Boolean), path.join(home, ".local", "bin"), path.join(home, ".grok", "bin")];
-  return INSTALL_CLIENTS.filter(client => dirs.some(dir => {
-    try { const f = path.join(dir, client); fs.accessSync(f, fs.constants.X_OK); return fs.statSync(f).isFile(); } catch { return false; }
-  }));
+  return INSTALL_CLIENTS.filter(client => {
+    if (client === "claude") {
+      try { if (fs.statSync(clientHome(client, opts)).isDirectory()) return true; } catch { /* No settings directory. */ }
+    }
+    return dirs.some(dir => {
+      try { const f = path.join(dir, client); fs.accessSync(f, fs.constants.X_OK); return fs.statSync(f).isFile(); } catch { return false; }
+    });
+  });
 }
 
 function readFile(file: string): string | null {
@@ -153,7 +158,14 @@ function writeSettings(file: string, before: string | null, after: string, opts:
   fs.chmodSync(backupDir, 0o700);
   const key = crypto.createHash("sha256").update(file).digest("hex").slice(0, 20);
   const lock = path.join(backupDir, `${key}.lock`);
-  const lockFd = fs.openSync(lock, "wx", 0o600);
+  let lockFd: number;
+  try { lockFd = fs.openSync(lock, "wx", 0o600); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(`Hook installation lock already exists: ${lock}. Wait for any other installer to finish. If it was interrupted, confirm no installer is running, remove this leftover lock file, then retry.`);
+    }
+    throw err;
+  }
   const temp = `${file}.mam-${crypto.randomUUID()}.tmp`;
   let backup: string | undefined;
   try {
