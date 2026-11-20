@@ -63,6 +63,7 @@ let _loggedClientInfo = false;
 /**
  * MCP clientInfo.name → agent_platform. 대부분 name 그대로지만, OpenCode는 흔한 이름 "cli"로
  * 접속하므로 opencode.db 버전 대조가 맞을 때만 "opencode"로 정규화한다.
+ * Claude Desktop의 "local-agent-mode…" 이름은 "claude-desktop"으로 정규화한다.
  * memory_startup(current platform)과 resolveAgentIdentity가 같은 판정을 쓰도록 공용화.
  * handshake 전이거나 name이 없으면 null.
  */
@@ -70,7 +71,9 @@ export function detectClientPlatform(server: McpServer): string | null {
   try {
     const cv = server.server.getClientVersion();
     if (!cv?.name) return null;
-    const platform = isOpencodeClientInfo(cv.name, cv.version) ? "opencode" : cv.name;
+    const platform = cv.name.startsWith("local-agent-mode")
+      ? "claude-desktop"
+      : isOpencodeClientInfo(cv.name, cv.version) ? "opencode" : cv.name;
     if (!_loggedClientInfo) {
       _loggedClientInfo = true;
       console.error(`📝 [client] clientInfo=${cv.name}@${cv.version ?? "?"} → agent_platform=${platform}`);
