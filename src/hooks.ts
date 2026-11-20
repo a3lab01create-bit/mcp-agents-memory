@@ -234,16 +234,57 @@ function finish(out: string): void {
  * 경로는 절대경로로 박는다(훅은 세션의 작업 폴더에서 돈다). 끝의 `|| true` 는 마지막 방어선:
  * 모듈을 불러오다 죽는 것처럼 훅 코드 밖에서 난 실패도 exit 0 으로 만든다(2 는 사용자의 말을 막는다).
  */
-export function hookConfigSnippet(entryScript: string, configPath: string | null): string {
-  const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-  const envPrefix = configPath ? `MEMORY_CONFIG_PATH=${q(path.resolve(configPath))} ` : "";
-  const cmd = (sub: string) => `${envPrefix}${q(process.execPath)} ${q(path.resolve(entryScript))} hook ${sub} || true`;
+export function hookConfigSnippet(entryScript: string, configPath: string | null, node?: string): string {
+  const cmd = (event: HookEvent) => hookCommand("claude", event, { entry: entryScript, configPath, node });
   return JSON.stringify({
     hooks: {
       SessionStart: [{ hooks: [{ type: "command", command: cmd("session-start"), timeout: 15 }] }],
       UserPromptSubmit: [{ hooks: [{ type: "command", command: cmd("prompt"), timeout: 10 }] }],
     },
   }, null, 2);
+}
+
+/** 훅을 받는 도구. 입력을 읽는 곳과 출력 모양이 도구마다 다르다. */
+export type HookClient = "claude" | "codex" | "agy";
+export type HookEvent = "session-start" | "prompt";
+export const HOOK_CLIENTS: readonly HookClient[] = ["claude", "codex", "agy"];
+
+function realpathOrNull(p: string): string | null {
+  try { return fs.realpathSync(p); } catch { return null; }
+}
+
+/**
+ * 훅 명령에 박을 node 경로. brew 의 버전 경로(<prefix>/Cellar/node/26.0.0/bin/node)는 node 를 올리면
+ * 사라져 훅이 조용히 멈춘다(맥북 쿠우 지적) → 같은 파일을 가리키는 안 바뀌는 링크로 바꾼다.
+ * 우선 <prefix>/opt/<formula>/bin/node(그 formula 를 따라감), 다음 <prefix>/bin/node. 실제 파일이 같을 때만.
+ * nvm(~/.nvm/versions/…) 같은 다른 버전 경로는 바꿀 안정 경로가 없어 그대로 둔다.
+ */
+export function stableNodePath(execPath: string = process.execPath): string {
+  const m = /^(.*)\/Cellar\/(node(?:@[0-9.]+)?)\/[^/]+\/bin\/node$/.exec(execPath);
+  if (!m) return execPath;
+  const [, prefix, formula] = m;
+  const real = realpathOrNull(execPath);
+  if (!real) return execPath;
+  for (const cand of [path.join(prefix, "opt", formula, "bin", "node"), path.join(prefix, "bin", "node")]) {
+    if (realpathOrNull(cand) === real) return cand;
+  }
+  return execPath;
+}
+
+/**
+ * 도구 설정 파일에 넣을 훅 명령 한 줄(설치기·print-config 공용).
+ * 경로는 절대경로로 박는다(훅은 세션의 작업 폴더에서 돈다). 끝의 `|| true` 는 마지막 방어선:
+ * 모듈을 불러오다 죽는 것처럼 훅 코드 밖에서 난 실패도 exit 0 으로 만든다(2 는 사용자의 말을 막는다).
+ */
+export function hookCommand(
+  client: HookClient,
+  event: HookEvent,
+  opts: { entry: string; configPath: string | null; node?: string },
+): string {
+  const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+  const envPrefix = opts.configPath ? `MEMORY_CONFIG_PATH=${q(path.resolve(opts.configPath))} ` : "";
+  const node = opts.node ?? stableNodePath();
+  return `${envPrefix}${q(node)} ${q(path.resolve(opts.entry))} hook ${event} --client ${client} || true`;
 }
 
 export async function runHookCli(sub: string | undefined): Promise<void> {

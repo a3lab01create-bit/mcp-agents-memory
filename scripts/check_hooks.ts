@@ -16,7 +16,9 @@ import {
   capContext,
   cleanPromptForRecall,
   formatRecall,
+  hookCommand,
   hookConfigSnippet,
+  stableNodePath,
   pickRecallRows,
   recallSkipReason,
   type RecallRow,
@@ -63,12 +65,12 @@ assert.ok(HOOK_CONTEXT_MAX_CHARS < 10_000);
 assert.equal(capContext("짧은 글"), "짧은 글");
 
 // ── 4. print-config 조각 ──
-const snippet = JSON.parse(hookConfigSnippet("/opt/my tools/it's/index.js", "/home/u/.config/mcp-agents-memory/.env"));
+const snippet = JSON.parse(hookConfigSnippet("/opt/my tools/it's/index.js", "/home/u/.config/mcp-agents-memory/.env", "/usr/bin/node"));
 const ss = snippet.hooks.SessionStart[0].hooks[0];
 const ups = snippet.hooks.UserPromptSubmit[0].hooks[0];
 assert.equal(ss.type, "command");
-assert.match(ss.command, /hook session-start \|\| true$/, "훅 코드 밖 실패(모듈 불러오기)도 exit 0 으로");
-assert.match(ups.command, /hook prompt \|\| true$/);
+assert.match(ss.command, /hook session-start --client claude \|\| true$/, "훅 코드 밖 실패(모듈 불러오기)도 exit 0 으로");
+assert.match(ups.command, /hook prompt --client claude \|\| true$/);
 assert.ok(ups.command.startsWith("MEMORY_CONFIG_PATH='/home/u/.config/mcp-agents-memory/.env' "),
   "프로젝트 .env 가 다른 DB 를 가리켜도 같은 설정을 쓰게 경로를 박는다");
 assert.ok(ups.command.includes(`'/opt/my tools/it'\\''s/index.js'`), "공백·작은따옴표 경로도 셸에서 안 깨진다");
@@ -77,6 +79,28 @@ assert.ok(!JSON.parse(hookConfigSnippet("/x/index.js", null)).hooks.UserPromptSu
 const relCmd = JSON.parse(hookConfigSnippet("rel/index.js", "./c.env")).hooks.UserPromptSubmit[0].hooks[0].command;
 assert.ok(relCmd.includes(`MEMORY_CONFIG_PATH='${path.resolve("c.env")}'`) && relCmd.includes(`'${path.resolve("rel/index.js")}'`),
   "상대경로는 print-config 시점 기준 절대경로로 박는다 (코디 리뷰 #41-1)");
+
+// ── 4b. 안 바뀌는 node 경로 (맥북 쿠우 지적: brew 버전 경로는 node 를 올리면 사라진다) ──
+{
+  const fake = fs.mkdtempSync(path.join(os.tmpdir(), "mam-node-"));
+  const cellarNode = path.join(fake, "Cellar", "node", "26.0.0", "bin", "node");
+  fs.mkdirSync(path.dirname(cellarNode), { recursive: true });
+  fs.writeFileSync(cellarNode, "");
+  fs.mkdirSync(path.join(fake, "opt"), { recursive: true });
+  fs.symlinkSync(path.join(fake, "Cellar", "node", "26.0.0"), path.join(fake, "opt", "node"));
+  assert.equal(stableNodePath(cellarNode), path.join(fake, "opt", "node", "bin", "node"),
+    "brew Cellar 경로는 같은 파일을 가리키는 opt 링크로 바꾼다");
+  fs.rmSync(path.join(fake, "opt", "node"));
+  fs.mkdirSync(path.join(fake, "Cellar", "node", "27.0.0", "bin"), { recursive: true });
+  fs.writeFileSync(path.join(fake, "Cellar", "node", "27.0.0", "bin", "node"), "");
+  fs.symlinkSync(path.join(fake, "Cellar", "node", "27.0.0"), path.join(fake, "opt", "node"));
+  assert.equal(stableNodePath(cellarNode), cellarNode, "링크가 다른 파일을 가리키면 바꾸지 않는다");
+  assert.equal(stableNodePath("/home/u/.nvm/versions/node/v24.15.0/bin/node"), "/home/u/.nvm/versions/node/v24.15.0/bin/node",
+    "brew 가 아니면 그대로");
+  fs.rmSync(fake, { recursive: true, force: true });
+  const codexCmd = hookCommand("codex", "prompt", { entry: "/x/index.js", configPath: "/c/.env", node: "/usr/bin/node" });
+  assert.equal(codexCmd, "MEMORY_CONFIG_PATH='/c/.env' '/usr/bin/node' '/x/index.js' hook prompt --client codex || true");
+}
 
 // ── 5. 프로세스 계약 (빌드된 서버로) ──
 const entry = path.resolve("build/index.js");
