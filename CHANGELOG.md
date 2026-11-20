@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.9.37 — 2026-11-20
+
+### Claude Code hooks: full start brief and recall on every message
+
+New `mcp-agents-memory hook <session-start | prompt | print-config>`.
+
+`hook session-start` (SessionStart) puts the full start brief at the top of a
+session. Until now the brief only travelled in the MCP `instructions` field,
+which Claude Code cuts at about 2,000 characters; the full brief on the
+production database is about 6,000 characters, and hook output may be up to
+10,000. If pinned memories push it past that, the hook falls back to the
+budgeted inject format and then hard-caps at 9,500 characters, because Claude
+Code replaces longer hook output with a 2,000-character preview.
+
+`hook prompt` (UserPromptSubmit) embeds each message you send and adds at most
+three similar past records, labelled as automatic search results that may be
+unrelated. It skips slash commands, replies shorter than 8 characters, machine
+messages (task notifications and other wrappers), records shorter than 40
+characters or starting with `<`, and records from the last 30 minutes. A cosine
+similarity floor of 0.5 decides whether anything is added: in an 11-prompt
+probe relevant hits scored 0.50–0.66 and unrelated prompts at most 0.42–0.47,
+but junk also scored up to 0.66 for keyword-heavy questions, so the floor and
+count are env-tunable (`MEMORY_RECALL_MIN_SIMILARITY`, `MEMORY_RECALL_LIMIT`)
+and the hook log records each call's top similarity for tuning. End to end on
+the database host a call takes 325–644 ms (median 345 ms, 10 runs).
+
+Both hooks always exit 0 (exit 2 would block the user's message), print exactly
+one JSON object or nothing (every `console.log` is redirected to stderr), and
+give up silently after 3.5 s / 6 s via `process.exit`. Each call appends one
+line to `~/.local/state/mcp-agents-memory/hooks.log` — event, outcome, time,
+row ids, top similarity — and never the message text. `MEMORY_HOOKS_OFF=1`
+turns them off.
+
+Claude Code stores injected hook context as `attachment` transcript entries,
+which the JSONL capture already skips; a real session run through
+`parseEntry` produced only the user and assistant turns, so recalled records
+are not saved back into memory.
+
+`hook print-config` prints the `hooks` block to merge into
+`~/.claude/settings.json` with `MEMORY_CONFIG_PATH` pinned (a project `.env`
+with its own `DATABASE_URL` would otherwise win). It never edits the file.
+
+### Claude Desktop sessions are labelled `claude-desktop`
+
+The desktop app connects with MCP client names starting with
+`local-agent-mode`, which were stored verbatim as `agent_platform` (for example
+`local-agent-mode-mcp-agents-memory`). They are now normalized to
+`claude-desktop`; the "capture is not attached" warning accepts both the
+normalized and the raw name. Existing rows keep their old label (6 rows on the
+production database at release).
+
 ## 0.9.36 — 2026-11-14
 
 ### Claude sessions whose folder appears late are captured

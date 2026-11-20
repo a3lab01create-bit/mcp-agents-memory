@@ -251,6 +251,38 @@ args = []
 
 > Install globally with `npm i -g mcp-agents-memory`, or point `command` at a local `build/index.js`.
 
+### Claude Code hooks (optional)
+
+Two hooks make Claude Code use the memory without the model having to call a tool:
+
+- `hook session-start` (SessionStart) puts the full start brief at the top of each session. The MCP
+  `instructions` field is cut by the client at about 2,000 characters; hook output may be up to 10,000.
+- `hook prompt` (UserPromptSubmit) looks up past records similar to each message you send and adds at most
+  three of them, marked as automatic search results that may be unrelated. It skips slash commands, short
+  replies ("ok") and machine messages, ignores the last 30 minutes (the current conversation), and needs
+  `OPENAI_API_KEY` for the embedding.
+
+Print the block to merge into `~/.claude/settings.json` (the command never edits the file):
+
+```bash
+mcp-agents-memory hook print-config
+```
+
+The printed commands pin `MEMORY_CONFIG_PATH`, so a project's own `.env` cannot point the hooks at another
+database. Both hooks always exit 0, print one JSON object or nothing, and give up silently after 3.5 s
+(prompt) / 6 s (session start); each call appends one line without message text to
+`~/.local/state/mcp-agents-memory/hooks.log`. The injected text is stored by Claude Code as transcript
+attachments, which the capture skips, so it is not saved back into memory.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MEMORY_HOOKS_OFF` | — | `1` turns both hooks into no-ops |
+| `MEMORY_RECALL_MIN_SIMILARITY` | `0.5` | cosine similarity below which a record is not added |
+| `MEMORY_RECALL_LIMIT` | `3` | records added per message (max 10) |
+| `MEMORY_RECALL_RECENT_MINUTES` | `30` | records newer than this are ignored |
+| `MEMORY_RECALL_MIN_PROMPT_CHARS` / `MEMORY_RECALL_MIN_MEMORY_CHARS` | `8` / `40` | shorter messages / records are skipped |
+| `MEMORY_HOOK_PROMPT_DEADLINE_MS` / `MEMORY_HOOK_SESSION_DEADLINE_MS` | `3500` / `6000` | give-up time |
+
 ---
 
 ## Guiding principle
