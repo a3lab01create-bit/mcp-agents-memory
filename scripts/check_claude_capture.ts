@@ -171,6 +171,11 @@ try {
   cap.captureSessionStart(nowhere);
   assert.match(await startupText("claude-code"), /^> ⚠️ \*\*이 세션의 Claude 대화는 자동 수집되지 않고/,
     "클로드 클라이언트 + 세션 폴더 없음 → memory_startup 응답 맨 위에 경고");
+  const desktopBrief = await startupText("local-agent-mode-mcp-agents-memory");
+  assert.match(desktopBrief, /^> ⚠️ \*\*이 세션의 Claude 대화는 자동 수집되지 않고/,
+    "데스크톱 이름 정규화 뒤에도 실제 memory_startup 응답 맨 위에 경고");
+  assert.match(desktopBrief, /Current platform: `claude-desktop/,
+    "실제 브리핑도 정규화된 platform으로 조회·표시한다");
   assert.doesNotMatch(await startupText("codex-mcp-client"), /자동 수집되지 않고/, "다른 클라이언트 서버는 조용히");
   // memory_startup 직전 다시 확인: 그사이 폴더가 생겼으면 붙고 경고 없음
   write(`${slugOf(nowhere)}/sess-now.jsonl`, line("user", "u-now-1", "막 보낸 첫 메시지"));
