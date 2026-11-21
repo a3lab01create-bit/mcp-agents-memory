@@ -370,6 +370,20 @@ function envelopeTail(message: string): string | null {
 }
 
 /**
+ * 버즈 봉투의 이번 턴 블록(이벤트 머리글 포함, 이력 뒤). 봉투가 아니거나 이번 턴을 못 찾으면 null.
+ * buzzEmbeddingText 와 같은 경계(envelopeTail → turnAfterContext)를 쓴다 — 훅 회상이 버즈 메시지인지
+ * 가리고 사람 말 길이를 셀 때 쓴다(hooks.ts recallQuery).
+ */
+export function buzzTurnText(message: string): string | null {
+  try {
+    const tail = envelopeTail(message);
+    return tail === null ? null : turnAfterContext(tail);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 임베딩 입력용 텍스트. 정리된 버즈 턴(<context> 바로 뒤에 이번 턴 블록)이면 방 정보와
  * 이벤트 머리글(ID·종류·시각·npub/hex)을 빼고 사람 말만 남긴다. 저장 본문(message)은
  * 그대로다 — 방 정보는 태깅엔 도움이 되지만(프로젝트 slug) 임베딩에선 모든 행에 같은
