@@ -44,6 +44,8 @@ export interface RecallSettings {
   /** 버즈 메시지는 사람 말(멘션·링크·이미지 뺀 것)이 이보다 짧으면 건너뛴다. */
   minBuzzContentChars: number;
   minMemoryChars: number;
+  /** 붙일 후보 중 사용자 줄은 본문(이름 머리·멘션·링크 뺀 것)이 이보다 짧으면 뺀다 — "응 진행해 보자~" 같은 옛 승인. */
+  minUserMemoryChars: number;
   recentMinutes: number;
   snippetChars: number;
 }
@@ -53,8 +55,9 @@ export function recallSettings(): RecallSettings {
     minSimilarity: numEnv("MEMORY_RECALL_MIN_SIMILARITY", 0.5),
     limit: Math.max(1, Math.min(10, Math.floor(numEnv("MEMORY_RECALL_LIMIT", 3)))),
     minPromptChars: numEnv("MEMORY_RECALL_MIN_PROMPT_CHARS", 8),
-    minBuzzContentChars: numEnv("MEMORY_RECALL_MIN_BUZZ_CHARS", 25),
+    minBuzzContentChars: numEnv("MEMORY_RECALL_MIN_BUZZ_CHARS", 20),
     minMemoryChars: numEnv("MEMORY_RECALL_MIN_MEMORY_CHARS", 40),
+    minUserMemoryChars: numEnv("MEMORY_RECALL_MIN_USER_MEMORY_CHARS", 40),
     recentMinutes: numEnv("MEMORY_RECALL_RECENT_MINUTES", 30),
     snippetChars: Math.max(40, Math.floor(numEnv("MEMORY_RECALL_SNIPPET_CHARS", 280))),
   };
@@ -63,46 +66,115 @@ export function recallSettings(): RecallSettings {
 // jsonl_capture.parseEntry 와 같은 감싸개 + 붙여넣기 표시. 사람이 친 말만 남긴다.
 const WRAPPER_RE = /<(system-reminder|command-name|command-message|command-args|local-command-stdout|local-command-stderr|task-notification|user-prompt-submit-hook|session-start-hook|session-end-hook)>[\s\S]*?<\/\1>/g;
 
-/**
- * 버즈 이벤트 꼬리표 줄. buzzEmbeddingText 는 사람 말과 헷갈리지 않게 64자리 hex 가 있는 꼬리표만 지우는데,
- * 지금 DM 봉투의 Tags 줄(`["h","<uuid>"],["client-id",…],["ms","60"]`)엔 hex 가 없어 남는다(실측 11-21: DM 6건).
- * 검색어에서만 뺀다 — 저장 본문·저장 임베딩은 건드리지 않는다.
- */
-const BUZZ_META_LINE = /^(?:Tags: \[\[.*\]\]|Parsed: .*)$/;
+/** 이벤트 꼬리표 줄 — 사람 말 **뒤**에 붙는다(Tags 다음 Parsed, Parsed 는 없을 수 있다). */
+const TURN_TAIL_TAGS = /^Tags: \[\[.*\]\]$/;
+const TURN_TAIL_PARSED = /^Parsed: /;
+/** 복수 봉투의 이벤트 구분선. */
+const TURN_EVENT_BOUNDARY = /^--- Event (\d+) \(.*\) ---$/;
+/** 이벤트 머리글에서 `Content:` 줄을 찾는 줄 수 상한 (buzz_envelope EVENT_HEADER_LINES 와 같은 값). */
+const TURN_HEADER_LINES = 12;
+/** 이벤트 블록 앞에 올 수 있는 빈 안내 블록(`<new-message-arrived-…>` 여닫기, Note 줄). */
+const TURN_PREAMBLE_LINE = /^(?:<\/?[a-z-]+(?:\s[^>]*)?>|Note: A new message arrived while you were working\..*)?$/;
 
-/** 이벤트의 사람 말(`Content:` 줄부터)이 끝나는 줄: 꼬리표 · 한 줄짜리 여닫는 태그 · 복수 봉투 구분선. */
-const BUZZ_CONTENT_END = /^(?:Tags: \[\[|Parsed: |<\/?[a-z-]+(?:\s[^>]*)?>$|--- Event \d+ \(.*\) ---$)/;
-
-/** 이번 턴 블록에서 이벤트별 사람 말과, Parsed 꼬리표에 적힌 멘션 이름. */
-function buzzContents(turn: string): { contents: string[]; mentionNames: string[] } {
-  const contents: string[] = [];
-  const mentionNames: string[] = [];
-  let cur: string[] | null = null;
-  for (const raw of turn.split("\n")) {
-    const line = raw.replace(/\r$/, "");
-    if (line.startsWith("Content: ")) {
-      if (cur) contents.push(cur.join("\n"));
-      cur = [line.slice("Content: ".length)];
-      continue;
-    }
-    if (BUZZ_CONTENT_END.test(line.trim())) {
-      if (cur) { contents.push(cur.join("\n")); cur = null; }
-      const m = /^Parsed: .*?mentions=\[(.*)\]/.exec(line.trim());
-      if (m) for (const x of m[1].matchAll(/([^,[\]]+?) \([0-9a-f]{64}\)/g)) mentionNames.push(x[1].trim());
-      continue;
-    }
-    if (cur) cur.push(line);
-  }
-  if (cur) contents.push(cur.join("\n"));
-  return { contents, mentionNames };
+interface BuzzTurnEvent {
+  channel?: string;
+  from?: string;
+  content: string;
+  mentionNames: string[];
 }
 
-/** 길이를 셀 사람 말: 이미지·링크·멘션을 뺀다(멘션 이름엔 공백이 있어 Parsed 꼬리표의 이름으로 지운다). */
-function countableText(content: string, mentionNames: readonly string[]): string {
-  let t = content.replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/<?https?:\/\/\S+/g, " ");
+function prevNonBlankIsTail(lines: readonly string[], i: number): boolean {
+  for (let j = i - 1; j >= 0; j--) {
+    const t = lines[j].trim();
+    if (t) return TURN_TAIL_TAGS.test(t) || TURN_TAIL_PARSED.test(t);
+  }
+  return false;
+}
+
+/** 이벤트 하나: 머리글(Channel·From) + `Content:` 부터 끝까지에서 **아래 꼬리**(Parsed → Tags)만 뗀 사람 말. */
+function parseTurnEvent(chunk: readonly string[]): BuzzTurnEvent | null {
+  const ci = chunk.findIndex((line, i) => i < TURN_HEADER_LINES && line.startsWith("Content: "));
+  if (ci < 0) return null;
+  let channel: string | undefined;
+  let from: string | undefined;
+  for (const line of chunk.slice(0, ci)) {
+    const c = /^Channel: (.+?) \(#[0-9a-f-]{36}\)$/.exec(line);
+    if (c) channel = c[1];
+    const f = /^From: (.+?) \((?:npub|hex)/.exec(line);
+    if (f && !f[1].startsWith("npub1")) from = f[1]; // 구버전 봉투는 이름 없이 npub 만 있다
+  }
+  const rest = [chunk[ci].slice("Content: ".length), ...chunk.slice(ci + 1)];
+  while (rest.length > 1 && !rest[rest.length - 1].trim()) rest.pop();
+  const mentionNames: string[] = [];
+  if (rest.length > 1 && TURN_TAIL_PARSED.test(rest[rest.length - 1].trim())) {
+    const m = /mentions=\[(.*)\]/.exec(rest.pop()!.trim());
+    if (m) for (const x of m[1].matchAll(/([^,[\]]+?) \([0-9a-f]{64}\)/g)) mentionNames.push(x[1].trim());
+  }
+  if (rest.length > 1 && TURN_TAIL_TAGS.test(rest[rest.length - 1].trim())) rest.pop();
+  return { channel, from, content: rest.join("\n").trim(), mentionNames };
+}
+
+/**
+ * 이번 턴 블록(buzzTurnText) → 이벤트별 머리글·사람 말. 모양이 다르면 null.
+ * 사람 말의 끝은 **아래에서부터** 정한다(닫는 태그 → Parsed → Tags). 위에서부터 "끝처럼 보이는 줄"을 찾으면
+ * 사람 말 속 `<config>`·`<div>` 줄, `Tags: [[…]]`·`Parsed:` 로그, `Content:` 줄에서 잘린다
+ * (코디 #46 리뷰: 100자 XML 질문·103자 검사 보고가 14자로 세져 건너뛰어졌다).
+ * 복수 봉투의 구분선은 번호가 차례대로이고 바로 위가 꼬리표일 때만 인정한다.
+ */
+function parseBuzzTurn(turn: string): BuzzTurnEvent[] | null {
+  const lines = turn.replace(/\r/g, "").split("\n");
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  const openAt = lines.findIndex((line) => /^<buzz-events?(?:\s[^>]*)?>$/.test(line.trim()));
+  if (openAt < 0 || !lines.slice(0, openAt).every((line) => TURN_PREAMBLE_LINE.test(line.trim()))) return null;
+  const kind = /^<(buzz-events?)/.exec(lines[openAt].trim())![1];
+  if (lines[lines.length - 1].trim() !== `</${kind}>`) return null;
+  const body = lines.slice(openAt + 1, -1);
+  let chunks: string[][];
+  if (kind === "buzz-event") {
+    chunks = [body];
+  } else {
+    chunks = [];
+    let cur: string[] | null = null;
+    let next = 1;
+    for (let i = 0; i < body.length; i++) {
+      const b = TURN_EVENT_BOUNDARY.exec(body[i].trim());
+      if (b && Number(b[1]) === next && (cur === null || prevNonBlankIsTail(body, i))) {
+        if (cur) chunks.push(cur);
+        cur = [];
+        next++;
+        continue;
+      }
+      if (cur === null) {
+        if (body[i].trim()) return null; // 첫 구분선 전에 글자가 있으면 모르는 모양
+        continue;
+      }
+      cur.push(body[i]);
+    }
+    if (cur) chunks.push(cur);
+  }
+  const events: BuzzTurnEvent[] = [];
+  for (const chunk of chunks) {
+    const ev = parseTurnEvent(chunk);
+    if (!ev) return null;
+    events.push(ev);
+  }
+  return events.length ? events : null;
+}
+
+/**
+ * 멘션 지우기. 이름엔 공백이 있어("Kuu at Mortar") 꼬리표 이름이 있으면 그걸로, 없으면 버즈 이름 꼴
+ * (`@이름` 또는 `@이름 at 기계`)로 지운다.
+ */
+function stripMentions(text: string, mentionNames: readonly string[] = []): string {
+  let t = text;
   for (const n of mentionNames) t = t.split(`@${n}`).join(" ");
-  t = t.replace(/@\S+/g, " "); // 꼬리표가 없을 때의 마지막 방어(한 낱말만 지운다)
-  return t.replace(/\s+/g, " ").trim();
+  return t.replace(/@[^\s@]+(?: at [^\s@]+)?/g, " ");
+}
+
+/** 길이를 셀 사람 말: 이미지·링크·멘션을 뺀다. */
+function countableText(content: string, mentionNames: readonly string[] = []): string {
+  const t = content.replace(/!\[[^\]]*\]\([^)]*\)/g, " ").replace(/<?https?:\/\/\S+/g, " ");
+  return stripMentions(t, mentionNames).replace(/\s+/g, " ").trim();
 }
 
 export interface RecallQuery {
@@ -114,20 +186,25 @@ export interface RecallQuery {
 
 /**
  * 훅 입력 prompt → 검색어. 감싸개를 벗기고, 버즈 봉투면 이번 턴의 채널·보낸 사람·사람 말만 쓴다
- * (저장 임베딩과 같은 buzzEmbeddingText). 예전엔 `<context>` 만 벗겨서 남은 `<thread-context>`·
+ * (저장 임베딩 buzzEmbeddingText 와 같은 모양). 예전엔 `<context>` 만 벗겨서 남은 `<thread-context>`·
  * `<buzz-event>` 머리 때문에 버즈 메시지가 전부 "wrapper" 로 건너뛰어졌다(실측 11-21: 40/40).
+ * 이벤트 모양을 못 읽으면 buzzEmbeddingText 를 그대로 쓰고 길이로 거르지 않는다.
  */
 export function recallQuery(prompt: string): RecallQuery {
   const unwrapped = prompt.replace(WRAPPER_RE, " ").trimStart();
   const turn = buzzTurnText(unwrapped);
   if (turn !== null) {
-    const body = buzzEmbeddingText(unwrapped)
-      .split("\n")
-      .filter((line) => !BUZZ_META_LINE.test(line.trim()))
-      .join("\n");
-    const { contents, mentionNames } = buzzContents(turn);
-    const countable = contents.map((c) => countableText(c, mentionNames)).filter(Boolean).join(" ");
-    return { text: body.replace(/\s+/g, " ").trim(), buzzContentChars: [...countable].length };
+    const events = parseBuzzTurn(turn);
+    if (events === null) return { text: buzzEmbeddingText(unwrapped).replace(/\s+/g, " ").trim() };
+    const parts: string[] = [];
+    let channelDone = false;
+    for (const ev of events) {
+      if (ev.channel && !channelDone) { parts.push(ev.channel); channelDone = true; }
+      if (ev.from) parts.push(ev.from);
+      parts.push(ev.content);
+    }
+    const countable = events.map((ev) => countableText(ev.content, ev.mentionNames)).filter(Boolean).join(" ");
+    return { text: parts.join(" ").replace(/\s+/g, " ").trim(), buzzContentChars: [...countable].length };
   }
   return { text: buzzDisplayText(unwrapped).replace(/\s+/g, " ").trim() };
 }
@@ -141,7 +218,8 @@ export function cleanPromptForRecall(prompt: string): string {
  * 넣지 않을 말이면 이유, 넣을 말이면 null.
  * 버즈 짧은 말("@이름" 하나, "응 그래 그렇게 하자~")은 채널·보낸 사람 글자가 같은 짧은 옛 줄과 0.70 넘게
  * 붙는다 — 문턱을 올리면 쓸모 있는 줄이 먼저 빠져서(실측 11-21, 0.65: 쓸모 13→5 · 엉뚱 61→35)
- * 문턱 대신 사람 말 길이로 거른다(25자: 쓸모 13 유지 · 엉뚱 61→32, 같은 표본으로 정한 어림값).
+ * 문턱 대신 사람 말 길이로 거른다. 20자: 첫 표본(쿠우 판정)과 새 표본(코디 맹검) 모두 쓸모 있는 줄을
+ * 안 잃는다(25자는 맹검에서 쓸모 8 중 2를 잃었다). 표본 40개씩이라 어림값.
  */
 export function recallSkipReason(cleaned: string, s: RecallSettings, q?: RecallQuery): string | null {
   if (!cleaned) return "empty";
@@ -172,12 +250,25 @@ function snippet(message: string, max: number): string {
   return chars.length > max ? chars.slice(0, max).join("") + "…" : flat;
 }
 
-/** 후보 → 유사도 하한·같은 글 중복 제거 → 상위 limit 개. */
+/** 후보 줄 본문 길이: 버즈 수집 행의 `[이름]` 머리·멘션·링크·이미지를 뺀 글자 수. */
+export function memoryBodyChars(message: string): number {
+  const t = buzzDisplayText(message).replace(/^\[[^\]\n]{1,80}\]\s/, "");
+  return [...countableText(t)].length;
+}
+
+/**
+ * 후보 → 유사도 하한·짧은 사용자 줄 빼기·같은 글 중복 제거 → 상위 limit 개.
+ * 짧은 사용자 줄은 대개 다른 일에 대한 옛 승인("응 진행해 보자~")이라 따로 떼면 뜻이 없고, 지금 허락으로
+ * 오해될 수 있다. 맹검(코디, 새 표본 118줄)에서 "해로울 수 있음" 35줄 중 33줄이 사용자 줄이었고,
+ * 본문 40자 미만 사용자 줄을 빼면 두 판정 모두 쓸모 있는 줄은 그대로, 엉뚱·해로움은 줄었다
+ * (맹검 U 8→8 · X 33→16 · H 35→24, 쿠우 판정 U 13→13 · X 61→37 · H 5→1). 빠진 자리는 다음 후보가 채운다.
+ */
 export function pickRecallRows(candidates: RecallRow[], s: RecallSettings): RecallRow[] {
   const seen = new Set<string>();
   const out: RecallRow[] = [];
   for (const r of candidates) {
     if (!(r.similarity >= s.minSimilarity)) continue;
+    if (r.role === "user" && memoryBodyChars(r.message) < s.minUserMemoryChars) continue;
     const key = r.message.replace(/\s+/g, " ").trim();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -442,7 +533,8 @@ export function hookLogPath(): string {
  * 세션 id 그대로가 아니라 sha256 앞 12자리만 남긴다.
  */
 export function sessionHash(input: any): string | undefined {
-  const id = input?.session_id ?? input?.sessionId;
+  // 클로드·코덱스는 session_id, 안티그래비티(agy)는 conversationId (코디 #46 리뷰)
+  const id = input?.session_id ?? input?.sessionId ?? input?.conversationId;
   return typeof id === "string" && id ? createHash("sha256").update(id).digest("hex").slice(0, 12) : undefined;
 }
 

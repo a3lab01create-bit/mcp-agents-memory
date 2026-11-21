@@ -22,7 +22,7 @@ if (!dbUrl) {
 }
 
 const S: RecallSettings = {
-  minSimilarity: 0.5, limit: 3, minPromptChars: 8, minBuzzContentChars: 25, minMemoryChars: 40, recentMinutes: 30, snippetChars: 50,
+  minSimilarity: 0.5, limit: 3, minPromptChars: 8, minBuzzContentChars: 20, minMemoryChars: 40, minUserMemoryChars: 40, recentMinutes: 30, snippetChars: 50,
 };
 const DIM = 3072;
 const TAG = `recallcheck:${process.pid}:${Date.now()}`;
