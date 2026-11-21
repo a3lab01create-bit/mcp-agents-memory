@@ -193,11 +193,22 @@ function isOurMarker(p: string, st: fs.Stats): boolean {
   }
 }
 
-/** 판정을 남기고, 2주 넘은 우리 표시만 지운다. 실패해도 훅은 계속(다음 말에서 다시 볼 뿐). */
+/**
+ * 판정을 남기고, 2주 넘은 우리 표시만 지운다. 실패하면 throw — 부르는 쪽(commit)은 경고 출력을 그대로 두고
+ * 다음 말에서 다시 볼 뿐이다.
+ * 새로 만들 때만 쓴다(O_CREAT|O_EXCL): 그 자리에 이미 뭔가 있으면(심링크·FIFO·남의 파일) 열지도 덮어쓰지도
+ * 않는다. O_EXCL 은 심링크를 따라가지 않고, 검사와 쓰기 사이에 바뀌어도 쓰는 순간에 보장된다(코디 리뷰 #45-5).
+ */
 export function writeCaptureMarker(dir: string, sessionId: string, verdict: "ok" | "warned", nowMs = Date.now()): void {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const mine = captureMarkerPath(dir, sessionId);
-  fs.writeFileSync(mine, JSON.stringify({ tag: MARKER_TAG, verdict, at: new Date(nowMs).toISOString() }) + "\n", { mode: 0o600 });
+  const c = fs.constants;
+  const fd = fs.openSync(mine, c.O_WRONLY | c.O_CREAT | c.O_EXCL | (c.O_NOFOLLOW ?? 0) | (c.O_NONBLOCK ?? 0), 0o600);
+  try {
+    fs.writeSync(fd, JSON.stringify({ tag: MARKER_TAG, verdict, at: new Date(nowMs).toISOString() }) + "\n");
+  } finally {
+    fs.closeSync(fd);
+  }
   try {
     for (const name of fs.readdirSync(dir).slice(0, 2000)) {
       if (!MARKER_NAME_RE.test(name)) continue;

@@ -454,8 +454,9 @@ export async function runHookCli(sub: string | undefined, args: readonly string[
       ? await sessionStartContext(client)
       : await promptContext(input, client, deadlineMs - margin - (Date.now() - started));
     const out = formatHookOutput(client, event, context);
-    try { commit?.(); } catch { /* 표시를 못 남기면 다음 말에서 다시 확인할 뿐 */ }
-    logLine({ event: logEvent, client, outcome: context ? "injected" : "none", ms: Date.now() - started, source: input?.source, ...info });
+    let markerError: string | undefined;
+    try { commit?.(); } catch (e) { markerError = errText(e); /* 표시를 못 남기면 다음 말에서 다시 확인할 뿐 */ }
+    logLine({ event: logEvent, client, outcome: context ? "injected" : "none", ms: Date.now() - started, source: input?.source, ...info, ...(markerError ? { markerError } : {}) });
     finish(out);
   } catch (err) {
     logLine({ event: logEvent, client, outcome: err instanceof HookTimeout ? "timeout" : "error", ms: Date.now() - started, error: errText(err) });

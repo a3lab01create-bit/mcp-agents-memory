@@ -27,6 +27,10 @@ hook checks the result instead.
 - The verdict is written to
   `~/.local/state/mcp-agents-memory/capture-check/<session>.capture-check.json`
   (mode 600) just before the hook prints, so a timed-out warning is retried.
+  It is only ever created, never opened if something is already there
+  (`O_CREAT|O_EXCL`, no symlink following, non-blocking): a symlink, FIFO or
+  foreign file in its place is left alone, the warning still goes out, and
+  the log notes `markerError` (review by Codi).
   Later messages see the file and skip the database entirely. Pruning after
   two weeks removes only files with that name pattern and our own tag inside,
   never anything else in the folder (review by Codi). Short replies still skip

@@ -138,6 +138,24 @@ if (haveFifo) {
   console.log("(mkfifo 없음 — FIFO 검사 건너뜀)");
 }
 
+// 표시 쓰기는 새로 만들 때만 — 그 자리에 이미 있는 것(심링크·FIFO·파일)은 열지도 덮지도 않는다 (코디 리뷰 #45-5)
+const xdir = path.join(tmp, "excl-markers");
+fs.mkdirSync(xdir, { mode: 0o700 });
+const note = path.join(tmp, "operator-note-target.txt");
+fs.writeFileSync(note, "건드리면 안 되는 메모\n");
+fs.symlinkSync(note, captureMarkerPath(xdir, "sym"));
+assert.throws(() => writeCaptureMarker(xdir, "sym", "warned"), /EEXIST|ELOOP/, "심링크 자리엔 쓰지 않는다");
+assert.equal(fs.readFileSync(note, "utf8"), "건드리면 안 되는 메모\n", "심링크 너머 파일은 그대로");
+fs.writeFileSync(captureMarkerPath(xdir, "plain"), "남의 내용\n");
+assert.throws(() => writeCaptureMarker(xdir, "plain", "ok"), /EEXIST/);
+assert.equal(fs.readFileSync(captureMarkerPath(xdir, "plain"), "utf8"), "남의 내용\n", "있는 파일은 덮지 않는다");
+if (haveFifo) {
+  assert.equal(spawnSync("mkfifo", [captureMarkerPath(xdir, "fifo")]).status, 0);
+  const t0 = Date.now();
+  assert.throws(() => writeCaptureMarker(xdir, "fifo", "ok"), /EEXIST/);
+  assert.ok(Date.now() - t0 < 500, "FIFO 자리에서 막히지 않는다");
+}
+
 // ── 6. 프로세스 (DB 없이) ──
 const entry = path.resolve("build/index.js");
 assert.ok(fs.existsSync(entry), "build/index.js 가 없다 — 먼저 `npm run build`");
@@ -311,6 +329,30 @@ if (!dbUrl) {
   const lF = lastLog();
   assert.equal(lF.capture, "missing"); assert.equal(lF.recallError, "recall timeout", JSON.stringify(lF));
   assert.equal(JSON.parse(fs.readFileSync(captureMarkerPath(pdir, sF), "utf8")).verdict, "warned");
+
+  // 표시 자리에 심링크·FIFO 가 있어도: 경고는 나가고, 심링크 너머는 그대로, 막히지 않는다 (코디 리뷰 #45-5)
+  const sG = `db-symmarker-${sfx}`;
+  const tG = writeTranscript(sG, eligible(`G${sfx}`));
+  const noteG = path.join(tmp, `note-${sfx}.txt`);
+  fs.writeFileSync(noteG, "메모 원본\n");
+  fs.mkdirSync(pdir, { recursive: true });
+  fs.symlinkSync(noteG, captureMarkerPath(pdir, sG));
+  const rG = runHook("claude", { prompt: SHORT, transcript_path: tG }, { MEMORY_CONFIG_PATH: envFile });
+  assert.ok(ctx(rG.stdout).startsWith("⚠️ mcp-agents-memory 수집 확인"), rG.stdout);
+  assert.equal(fs.readFileSync(noteG, "utf8"), "메모 원본\n", "심링크 너머 파일을 덮으면 안 된다");
+  const lG = lastLog();
+  assert.equal(lG.capture, "missing"); assert.ok(/EEXIST|ELOOP/.test(lG.markerError ?? ""), JSON.stringify(lG));
+  if (haveFifo) {
+    const sH = `db-fifomarker-${sfx}`;
+    const tH = writeTranscript(sH, eligible(`H${sfx}`));
+    assert.equal(spawnSync("mkfifo", [captureMarkerPath(pdir, sH)]).status, 0);
+    const t0H = Date.now();
+    const rH = runHook("claude", { prompt: SHORT, transcript_path: tH }, { MEMORY_CONFIG_PATH: envFile, MEMORY_HOOK_PROMPT_DEADLINE_MS: "1500" });
+    const msH = Date.now() - t0H;
+    assert.equal(rH.status, 0);
+    assert.ok(ctx(rH.stdout).startsWith("⚠️ mcp-agents-memory 수집 확인"), `FIFO 표시 자리에도 경고는 나간다: ${JSON.stringify(rH.stdout)} (${msH}ms)`);
+    assert.ok(msH < 1400, `FIFO 표시 자리에서 막히면 안 된다 (${msH}ms)`);
+  }
 
   // recall 이 실패해도(임베딩 키 없음) 경고는 나간다
   const sD = `db-recallfail-${sfx}`;
