@@ -19,7 +19,13 @@ memories appeared in both places).
   without the compressed brief, and the start line becomes conditional: call
   `memory_startup` once only if no "mcp-agents-memory 시작 브리핑" text is at the
   top. That fallback covers sessions whose hooks the settings file cannot show
-  (`--settings`, project hooks, SDK sessions).
+  (`--settings`, project hooks, SDK sessions). The check counts only a command
+  in our exact generated form (0.9.37/0.9.38 `print-config` or the installer)
+  in a `SessionStart` group that also runs on a new session (no matcher, `*`,
+  or a `|`-list containing `startup`), and treats `disableAllHooks` in
+  `settings.json` or `settings.local.json` as no hook. Anything uncertain keeps
+  the full instructions (review by Codi: an unrelated `echo hook session-start`,
+  `disableAllHooks` and a `resume`-only matcher had dropped the brief).
 - Codex, the desktop app (`local-agent-mode…`) and Antigravity keep the full
   instructions: right after installation Codex hooks wait for `/hooks` trust,
   and the other two have not yet been checked end to end. `MEMORY_HOOKS_OFF=1`

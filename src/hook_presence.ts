@@ -17,27 +17,57 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-/** ~/.claude/settings.json(CLAUDE_CONFIG_DIR 존중)의 SessionStart 에 우리 claude 훅이 있나. */
+// 우리가 만든 명령만 인정한다 — 0.9.37 print-config(--client 없음), 0.9.38 print-config(--client claude),
+// 0.9.38 설치기(--client claude + 끝 표식). `echo hook session-start` 같은 남의 명령은 아니다(코디 리뷰 #44).
+const Q = "'(?:[^']|'\\\\'')*'";
+const OUR_CLAUDE_SESSION_START = new RegExp(
+  `^(?:MEMORY_CONFIG_PATH=${Q} )?${Q} ${Q} hook session-start(?: --client claude)? \\|\\| true` +
+  `(?: # mcp-agents-memory:claude:session-start)?$`,
+);
+
+/** 우리 claude 시작 훅 명령인가(생성 문법 그대로일 때만). */
+export function isOurClaudeSessionStartCommand(command: unknown): boolean {
+  return typeof command === "string" && OUR_CLAUDE_SESSION_START.test(command.trim());
+}
+
+/** 새 세션(startup)에서도 도는 묶음인가. matcher 가 없거나 비었거나 "*", 또는 |-목록에 startup 이 있을 때만. */
+function firesOnStartup(matcher: unknown): boolean {
+  if (matcher === undefined || matcher === null) return true;
+  if (typeof matcher !== "string") return false;
+  const m = matcher.trim();
+  if (m === "" || m === "*") return true;
+  // 정규식처럼 쓴 복잡한 matcher 는 확신할 수 없으니 아니라고 본다(보수적으로 기본 instructions 유지)
+  if (!/^[A-Za-z|]+$/.test(m)) return false;
+  return m.split("|").includes("startup");
+}
+
+function readJson(file: string): any {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return undefined; }
+}
+
+/**
+ * ~/.claude/settings.json(CLAUDE_CONFIG_DIR 존중)의 SessionStart 에, 새 세션에서 도는 우리 claude 훅이 있나.
+ * 확신할 수 없으면 false(= 기본 instructions 유지): 깨진 JSON, disableAllHooks(settings.json·settings.local.json),
+ * startup 에 안 걸리는 matcher, 우리 생성 문법이 아닌 명령.
+ */
 export function claudeSessionHookInstalled(
   opts: { home?: string; env?: NodeJS.ProcessEnv } = {},
 ): boolean {
   const env = opts.env ?? process.env;
   if (env.MEMORY_HOOKS_OFF === "1") return false;
   const dir = env.CLAUDE_CONFIG_DIR || path.join(opts.home ?? os.homedir(), ".claude");
-  let doc: any;
-  try {
-    doc = JSON.parse(fs.readFileSync(path.join(dir, "settings.json"), "utf8"));
-  } catch {
-    return false;
-  }
+  const doc = readJson(path.join(dir, "settings.json"));
+  if (!doc || typeof doc !== "object") return false;
+  const local = readJson(path.join(dir, "settings.local.json"));
+  if (doc.disableAllHooks === true || local?.disableAllHooks === true) return false;
   const groups = doc?.hooks?.SessionStart;
   if (!Array.isArray(groups)) return false;
   for (const group of groups) {
+    if (!firesOnStartup(group?.matcher)) continue;
     const handlers = Array.isArray(group?.hooks) ? group.hooks : [];
     for (const h of handlers) {
-      const cmd = typeof h?.command === "string" ? h.command : "";
-      // 0.9.37 print-config(--client 없음)과 0.9.38 설치기(--client claude) 둘 다. 다른 도구용은 제외.
-      if (/\bhook session-start\b/.test(cmd) && !/--client (codex|agy)\b/.test(cmd)) return true;
+      if (h?.type !== undefined && h.type !== "command") continue;
+      if (isOurClaudeSessionStartCommand(h?.command)) return true;
     }
   }
   return false;

@@ -9,7 +9,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { claudeSessionHookInstalled, hookedInstructionsFrom, HOOKED_STARTUP_LINE } from "../src/hook_presence.js";
+import { claudeSessionHookInstalled, hookedInstructionsFrom, HOOKED_STARTUP_LINE, isOurClaudeSessionStartCommand } from "../src/hook_presence.js";
 
 const DEFAULT_LINE = "세션 시작 시 `memory_startup`을 한 번 호출해";
 
@@ -34,6 +34,32 @@ assert.equal(claudeSessionHookInstalled({ home: without, env: { CLAUDE_CONFIG_DI
 fs.mkdirSync(path.join(tmp, "broken", ".claude"), { recursive: true });
 fs.writeFileSync(path.join(tmp, "broken", ".claude", "settings.json"), "{not json");
 assert.equal(claudeSessionHookInstalled({ home: path.join(tmp, "broken"), env: {} }), false, "깨진 JSON 이면 아님");
+
+// 코디 리뷰 #44: 우리 훅이 아니거나 새 세션에서 안 도는 경우는 "훅 없음"으로 본다
+const OURS = "MEMORY_CONFIG_PATH='/x/.env' '/usr/bin/node' '/x/index.js' hook session-start --client claude || true # mcp-agents-memory:claude:session-start";
+const mk = (name: string, doc: unknown, local?: unknown) => {
+  const d = path.join(tmp, name, ".claude");
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, "settings.json"), JSON.stringify(doc));
+  if (local !== undefined) fs.writeFileSync(path.join(d, "settings.local.json"), JSON.stringify(local));
+  return path.join(tmp, name);
+};
+const group = (cmd: string, extra: Record<string, unknown> = {}) => ({ hooks: { SessionStart: [{ ...extra, hooks: [{ type: "command", command: cmd }] }] } });
+assert.equal(claudeSessionHookInstalled({ home: mk("echo", group("echo hook session-start")), env: {} }), false, "남의 명령(echo …)은 아님");
+assert.equal(claudeSessionHookInstalled({ home: mk("disabled", { ...group(OURS), disableAllHooks: true }), env: {} }), false, "disableAllHooks 면 아님");
+assert.equal(claudeSessionHookInstalled({ home: mk("localdisabled", group(OURS), { disableAllHooks: true }), env: {} }), false,
+  "settings.local.json 의 disableAllHooks 도 본다");
+assert.equal(claudeSessionHookInstalled({ home: mk("resume", group(OURS, { matcher: "resume" })), env: {} }), false, "resume 전용이면 새 세션에서 안 돎");
+assert.equal(claudeSessionHookInstalled({ home: mk("regexm", group(OURS, { matcher: "^(start|resume)" })), env: {} }), false,
+  "정규식 matcher 는 확신할 수 없으니 기본 유지");
+assert.equal(claudeSessionHookInstalled({ home: mk("startupm", group(OURS, { matcher: "startup|resume" })), env: {} }), true, "startup 이 목록에 있으면 인정");
+assert.equal(claudeSessionHookInstalled({ home: mk("star", group(OURS, { matcher: "*" })), env: {} }), true);
+assert.equal(claudeSessionHookInstalled({ home: mk("http", { hooks: { SessionStart: [{ hooks: [{ type: "http", command: OURS }] }] } }), env: {} }), false,
+  "command 형식이 아니면 아님");
+assert.equal(isOurClaudeSessionStartCommand("MEMORY_CONFIG_PATH='/a b/.env' '/n' '/e/index.js' hook session-start || true"), true, "0.9.37 print-config");
+assert.equal(isOurClaudeSessionStartCommand("'/n' '/e/index.js' hook session-start --client claude || true"), true, "0.9.38 print-config(설정 경로 없음)");
+assert.equal(isOurClaudeSessionStartCommand("'/n' '/e/index.js' hook session-start --client codex || true"), false);
+assert.equal(isOurClaudeSessionStartCommand("mcp-agents-memory hook session-start"), false, "손으로 쓴 다른 꼴은 확신 못 함 → 기본");
 
 const sample = "Long-term memory MCP server.\n\n▶ 세션 시작 시 `memory_startup`을 한 번 호출해 최근 대화를 이어받으세요.\n\nTools: …";
 const hooked = hookedInstructionsFrom(sample);
@@ -96,6 +122,11 @@ assert.ok(c.instructions.includes(DEFAULT_LINE), "클로드 코드가 아니면 
 
 const d = await handshake(withHook, "local-agent-mode-mcp-agents-memory");
 assert.ok(d.instructions.includes(DEFAULT_LINE), "데스크톱 앱은 아직 실물 확인 전이라 기본 그대로");
+
+const f = await handshake(path.join(tmp, "echo"), "claude-code");
+assert.ok(f.instructions.includes(DEFAULT_LINE), "남의 명령만 있으면 기본 그대로(코디 재현 1)");
+const g = await handshake(path.join(tmp, "resume"), "claude-code");
+assert.ok(g.instructions.includes(DEFAULT_LINE), "resume 전용 훅이면 기본 그대로(코디 재현 3)");
 
 const e = await handshake(withHook, "claude-code", { MEMORY_HOOKS_OFF: "1" });
 assert.ok(e.instructions.includes(DEFAULT_LINE), "꺼짐 스위치면 기본 그대로");
