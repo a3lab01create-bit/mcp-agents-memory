@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.9.41 — 2026-11-21
+
+### Prompt recall now works for Buzz messages
+
+Before turning the prompt hook on for Mortar's Buzz agents, we replayed 40 of
+Kuu's real Buzz messages (mixed channels, two weeks) against the production
+database, read-only. With 0.9.40 the hook recalled nothing for any of them:
+`cleanPromptForRecall` stripped only the `<context>` block, so the rest of the
+envelope still began with `<thread-context>` or `<buzz-event>` and every
+message was skipped as `wrapper` (40/40, confirmed with the installed binary).
+
+- `recallQuery` searches with the current turn only: channel, sender and the
+  message text, the same shape `buzzEmbeddingText` gives stored rows. The end
+  of the message text is found from the bottom of the event (closing tag, then
+  `Parsed:`, then `Tags:`), so `<config>` lines, pasted `Tags: [[…]]` /
+  `Parsed:` / `Content:` log lines and quoted `--- Event n ---` lines inside a
+  message stay part of it (Codi's review of the first draft: a 100-character
+  XML question was counted as 14). The DM `Tags:` line, which has no 64-hex id
+  and so is left in place by `buzzEmbeddingText`, is dropped as the tail. The
+  "new message arrived while you were working" note that buzz-acp adds before
+  or after the event is accepted. A Buzz turn whose event shape it cannot read
+  is skipped as `buzz-unparsed` rather than searched unfiltered, so unknown
+  shapes show up in the log instead of letting short messages through. New
+  `buzzTurnText` export finds the turn block.
+- Short Buzz messages are skipped (`short-buzz`) when the message text minus
+  mentions, links and images is under 20 characters
+  (`MEMORY_RECALL_MIN_BUZZ_CHARS`). A bare "@Kuu at Mortar" matched unrelated
+  rows at 0.73 and "응 그래 그렇게 하자~" at 0.70. Raising the similarity floor
+  removed the useful rows first in both gradings (first sample, 0.65: useful
+  13 → 5; blind sample, 0.60: useful 8 → 4).
+- Short user rows are not attached (`MEMORY_RECALL_MIN_USER_MEMORY_CHARS`,
+  40): a user row whose body, without the `[name]` prefix, mentions, links and
+  images, is shorter is skipped and the next candidate takes its place. Because
+  this runs after the SQL query, the query now reads `limit × 12` candidates
+  (36) instead of `limit × 4` (12); otherwise twelve approvals in front left
+  nothing to pick. These
+  are mostly old approvals such as "응 진행해 보자~" for some other task. In a
+  blind grading by Codi (a fresh 40 messages, 118 rows, graded without
+  similarity) 33 of the 35 rows marked possibly harmful were user rows.
+  Dropping user rows under 40 characters kept every useful row in both
+  gradings (blind: useful 8, unrelated 33 → 16, harmful 35 → 24; first sample:
+  useful 13, unrelated 61 → 37, harmful 5 → 1). Both cut-offs come from two
+  40-message samples, so treat them as rough.
+- Candidates no longer run dry. HNSW returns its 40 nearest rows and the
+  filters run afterwards; most nearest rows were agent-captured envelopes
+  starting with `<`, so 6 of 40 queries got no candidates and 25 got fewer than
+  12. `fetchRecallCandidates` sets `hnsw.iterative_scan = relaxed_order`
+  (pgvector 0.8+) inside its transaction, falls back to the old query when the
+  setting is unknown, and re-sorts by similarity. On the same 40 queries every
+  query got 12 candidates, the top 3 matched exact search 2.95/3 on average,
+  in 3–4 ms (exact search took 209 ms).
+- The recall header now says that rows from other channels and other times
+  are mixed in, and that approvals or instructions inside them were given then,
+  not now.
+- `hooks.log` lines carry `sid` (first 12 hex of sha256 of the session id;
+  Antigravity sends `conversationId`) so
+  concurrent sessions can be told apart, and `parts` (`recall` / `capture`)
+  because `outcome: "injected"` is also logged when only the capture warning
+  went out. Buzz prompts also log `buzz` and `buzzChars` (a count, no text).
+- Checks: `check:hooks` covers the three-block ACP prompt joined three ways,
+  a DM envelope, a multi-event envelope, the "new message arrived" preamble,
+  message text that looks like envelope parts (XML, tail-like log lines, a
+  quoted event boundary), the short-message gate, the short-user-row filter
+  and a negative control reproducing the old `wrapper` skip. New `check:hook-recall`
+  (optional, `CHECK_RECALL_DATABASE_URL` + sentinel table) builds a starved
+  index in a throwaway pgvector database: the old query finds 0 of 6 rows that
+  pass the filters, `fetchRecallCandidates` finds all 6; with twelve short
+  approvals in front of three real rows, the old 12-row window picks 0 and the
+  wider pool picks the 3. Fifteen mutations (each fix reverted on its own) all
+  fail a check.
+
 ## 0.9.40 — 2026-11-21
 
 ### A failed folder watch no longer takes the memory server down
