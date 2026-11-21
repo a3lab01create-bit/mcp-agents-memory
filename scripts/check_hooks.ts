@@ -14,9 +14,16 @@ import path from "node:path";
 import {
   HOOK_CONTEXT_MAX_CHARS,
   capContext,
+  clientMaxChars,
+  emptyHookOutput,
+  formatHookOutput,
+  hookPromptText,
+  parseHookClient,
   cleanPromptForRecall,
   formatRecall,
+  hookCommand,
   hookConfigSnippet,
+  stableNodePath,
   pickRecallRows,
   recallSkipReason,
   type RecallRow,
@@ -63,12 +70,12 @@ assert.ok(HOOK_CONTEXT_MAX_CHARS < 10_000);
 assert.equal(capContext("짧은 글"), "짧은 글");
 
 // ── 4. print-config 조각 ──
-const snippet = JSON.parse(hookConfigSnippet("/opt/my tools/it's/index.js", "/home/u/.config/mcp-agents-memory/.env"));
+const snippet = JSON.parse(hookConfigSnippet("/opt/my tools/it's/index.js", "/home/u/.config/mcp-agents-memory/.env", "/usr/bin/node"));
 const ss = snippet.hooks.SessionStart[0].hooks[0];
 const ups = snippet.hooks.UserPromptSubmit[0].hooks[0];
 assert.equal(ss.type, "command");
-assert.match(ss.command, /hook session-start \|\| true$/, "훅 코드 밖 실패(모듈 불러오기)도 exit 0 으로");
-assert.match(ups.command, /hook prompt \|\| true$/);
+assert.match(ss.command, /hook session-start --client claude \|\| true$/, "훅 코드 밖 실패(모듈 불러오기)도 exit 0 으로");
+assert.match(ups.command, /hook prompt --client claude \|\| true$/);
 assert.ok(ups.command.startsWith("MEMORY_CONFIG_PATH='/home/u/.config/mcp-agents-memory/.env' "),
   "프로젝트 .env 가 다른 DB 를 가리켜도 같은 설정을 쓰게 경로를 박는다");
 assert.ok(ups.command.includes(`'/opt/my tools/it'\\''s/index.js'`), "공백·작은따옴표 경로도 셸에서 안 깨진다");
@@ -77,6 +84,54 @@ assert.ok(!JSON.parse(hookConfigSnippet("/x/index.js", null)).hooks.UserPromptSu
 const relCmd = JSON.parse(hookConfigSnippet("rel/index.js", "./c.env")).hooks.UserPromptSubmit[0].hooks[0].command;
 assert.ok(relCmd.includes(`MEMORY_CONFIG_PATH='${path.resolve("c.env")}'`) && relCmd.includes(`'${path.resolve("rel/index.js")}'`),
   "상대경로는 print-config 시점 기준 절대경로로 박는다 (코디 리뷰 #41-1)");
+
+// ── 4b. 안 바뀌는 node 경로 (맥북 쿠우 지적: brew 버전 경로는 node 를 올리면 사라진다) ──
+{
+  const fake = fs.mkdtempSync(path.join(os.tmpdir(), "mam-node-"));
+  const cellarNode = path.join(fake, "Cellar", "node", "26.0.0", "bin", "node");
+  fs.mkdirSync(path.dirname(cellarNode), { recursive: true });
+  fs.writeFileSync(cellarNode, "");
+  fs.mkdirSync(path.join(fake, "opt"), { recursive: true });
+  fs.symlinkSync(path.join(fake, "Cellar", "node", "26.0.0"), path.join(fake, "opt", "node"));
+  assert.equal(stableNodePath(cellarNode), path.join(fake, "opt", "node", "bin", "node"),
+    "brew Cellar 경로는 같은 파일을 가리키는 opt 링크로 바꾼다");
+  fs.rmSync(path.join(fake, "opt", "node"));
+  fs.mkdirSync(path.join(fake, "Cellar", "node", "27.0.0", "bin"), { recursive: true });
+  fs.writeFileSync(path.join(fake, "Cellar", "node", "27.0.0", "bin", "node"), "");
+  fs.symlinkSync(path.join(fake, "Cellar", "node", "27.0.0"), path.join(fake, "opt", "node"));
+  assert.equal(stableNodePath(cellarNode), cellarNode, "링크가 다른 파일을 가리키면 바꾸지 않는다");
+  assert.equal(stableNodePath("/home/u/.nvm/versions/node/v24.15.0/bin/node"), "/home/u/.nvm/versions/node/v24.15.0/bin/node",
+    "brew 가 아니면 그대로");
+  fs.rmSync(fake, { recursive: true, force: true });
+  const codexCmd = hookCommand("codex", "prompt", { entry: "/x/index.js", configPath: "/c/.env", node: "/usr/bin/node" });
+  assert.equal(codexCmd, "MEMORY_CONFIG_PATH='/c/.env' '/usr/bin/node' '/x/index.js' hook prompt --client codex || true");
+}
+
+// ── 4c. 도구별 어댑터 (claude · codex · agy) ──
+assert.equal(parseHookClient([]), "claude", "--client 없으면 claude (0.9.37 설정 호환)");
+assert.equal(parseHookClient(["--client", "agy"]), "agy");
+assert.equal(parseHookClient(["--client", "codex"]), "codex");
+assert.equal(parseHookClient(["--client", "grok"]), null, "모르는 도구");
+assert.equal(parseHookClient(["--client"]), null);
+assert.deepEqual(hookPromptText("claude", { prompt: "질문" }), { text: "질문" });
+assert.deepEqual(hookPromptText("codex", { prompt: "질문" }), { text: "질문" });
+assert.deepEqual(hookPromptText("agy", { lastUserInput: "질문", invocationNum: 0 }), { text: "질문" });
+assert.deepEqual(hookPromptText("agy", { lastUserInput: "질문" }), { text: "질문" }, "invocationNum 없는 옛 빌드도 받는다");
+assert.deepEqual(hookPromptText("agy", { lastUserInput: "질문", invocationNum: 2 }), { text: "", skip: "later-invocation" },
+  "agy PreInvocation 은 도구 호출마다 돈다 → 턴의 첫 호출만");
+assert.deepEqual(JSON.parse(formatHookOutput("claude", "session-start", "맥락")),
+  { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: "맥락" } });
+assert.deepEqual(JSON.parse(formatHookOutput("codex", "prompt", "맥락")),
+  { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: "맥락" } });
+assert.deepEqual(JSON.parse(formatHookOutput("agy", "prompt", "맥락")),
+  { injectSteps: [{ systemMessage: { systemMessage: "맥락" } }] });
+assert.equal(formatHookOutput("claude", "prompt", ""), "");
+assert.equal(formatHookOutput("codex", "prompt", ""), "");
+assert.equal(formatHookOutput("agy", "prompt", ""), "{}");
+assert.equal(emptyHookOutput("agy"), "{}");
+assert.equal(clientMaxChars("claude"), HOOK_CONTEXT_MAX_CHARS);
+assert.equal(clientMaxChars("agy"), HOOK_CONTEXT_MAX_CHARS);
+assert.equal(clientMaxChars("codex"), 3000, "코덱스 기본 한도(~2,500토큰) 안으로");
 
 // ── 5. 프로세스 계약 (빌드된 서버로) ──
 const entry = path.resolve("build/index.js");
@@ -188,6 +243,31 @@ assert.equal(guarded.status, 0, "`|| true` 가 있으면 exit 0");
 assert.equal(guarded.stdout, "");
 const unguarded = spawnSync("sh", ["-c", missingCmd.replace(/ \|\| true$/, "")], { input: promptIn, encoding: "utf8", cwd: tmp, env: minimalEnv({}) });
 assert.notEqual(unguarded.status, 0, "음성대조: `|| true` 를 빼면 실패가 그대로 드러난다");
+
+// 도구별 프로세스 계약: agy 는 넣을 게 없으면 {} · codex 는 빈 문자열
+function runClient(client: string, sub: string, stdin: string, env: Record<string, string>) {
+  return spawnSync(process.execPath, [entry, "hook", sub, "--client", client], {
+    input: stdin, encoding: "utf8", timeout: 20_000, cwd: tmp,
+    env: { PATH: process.env.PATH ?? "", HOME: tmp, MEMORY_HOOK_LOG: logFile, ...env },
+  });
+}
+const agyIn = JSON.stringify({ hookEventName: "PreInvocation", lastUserInput: SECRET_PROMPT, invocationNum: 0 });
+for (const [label, client, sub, stdin, env, want] of [
+  ["agy DB 죽음", "agy", "prompt", agyIn, { MEMORY_CONFIG_PATH: deadEnv }, "{}"],
+  ["agy 세션 시작 DB 죽음", "agy", "session-start", "{}", { MEMORY_CONFIG_PATH: deadEnv }, "{}"],
+  ["agy 꺼짐", "agy", "prompt", agyIn, { MEMORY_CONFIG_PATH: deadEnv, MEMORY_HOOKS_OFF: "1" }, "{}"],
+  ["agy 같은 턴 두 번째 호출", "agy", "prompt",
+    JSON.stringify({ lastUserInput: SECRET_PROMPT, invocationNum: 1 }), { MEMORY_CONFIG_PATH: deadEnv }, "{}"],
+  ["codex DB 죽음", "codex", "prompt", promptIn, { MEMORY_CONFIG_PATH: deadEnv }, ""],
+  ["모르는 도구", "grok", "prompt", promptIn, { MEMORY_CONFIG_PATH: deadEnv }, ""],
+] as const) {
+  const r = runClient(client, sub, stdin, env);
+  assert.equal(r.status, 0, `${label}: exit 0`);
+  assert.equal(r.stdout, want, `${label}: stdout ${JSON.stringify(want)}`);
+}
+const agyHang = runClient("agy", "prompt", agyIn, { MEMORY_CONFIG_PATH: hangEnv, MEMORY_HOOK_PROMPT_DEADLINE_MS: "400" });
+assert.equal(agyHang.status, 0);
+assert.equal(agyHang.stdout, "{}", "시간이 넘어도 agy 에는 {} 를 준다");
 
 const log = fs.readFileSync(logFile, "utf8");
 const outcomes = log.trim().split("\n").map((l) => JSON.parse(l).outcome);

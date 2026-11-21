@@ -48,6 +48,7 @@ type Settings = Partial<Record<ManagedKey, string>>;
 
 const out = process.stdout;
 let pipedAnswers: string[] | null = null;
+let setupHasWritten = false;
 
 async function readAllStdin(): Promise<string> {
   const chunks: Buffer[] = [];
@@ -69,7 +70,9 @@ function nextPiped(): string {
 }
 
 function abort(): never {
-  out.write("\nSetup cancelled. Nothing was written.\n");
+  out.write(setupHasWritten
+    ? "\nSetup interrupted. Saved settings and completed database/hook changes remain; remaining hook installation was cancelled.\n"
+    : "\nSetup cancelled. Nothing was written.\n");
   process.exit(130);
 }
 
@@ -397,6 +400,7 @@ export async function runSetupWizard(): Promise<void> {
 
   // Write
   writeConfig(CONFIG_PATH, settings);
+  setupHasWritten = true;
   applyToProcessEnv(settings);
   out.write(`\nSaved ${CONFIG_PATH} (permissions 600)\n`);
 
@@ -426,4 +430,12 @@ export async function runSetupWizard(): Promise<void> {
   out.write("  claude mcp add --scope user mcp-agents-memory -- mcp-agents-memory\n");
   out.write("  codex mcp add mcp-agents-memory -- mcp-agents-memory\n");
   out.write("More clients: README → Client setup\n\n");
+  if (process.stdin.isTTY) {
+    const { promptHookInstall } = await import("./hook_install.js");
+    await promptHookInstall(ask, s => out.write(s), {
+      entry: path.resolve(process.argv[1]), configPath: CONFIG_PATH,
+    });
+  } else {
+    out.write("Optional memory hooks: mcp-agents-memory hook install (interactive), or hook install --help\n");
+  }
 }

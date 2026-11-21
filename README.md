@@ -251,9 +251,59 @@ args = []
 
 > Install globally with `npm i -g mcp-agents-memory`, or point `command` at a local `build/index.js`.
 
-### Claude Code hooks (optional)
+### Optional hook installation
 
-Two hooks make Claude Code use the memory without the model having to call a tool:
+After configuring memory with `mcp-agents-memory setup`, run:
+
+```bash
+mcp-agents-memory hook install
+# Explicit non-interactive example (does not grant Codex hook trust):
+mcp-agents-memory hook install --client codex --yes
+# Inspect planned changes without writing:
+mcp-agents-memory hook install --client claude --dry-run
+```
+
+Interactive setup offers the same step after its database checks. Each detected CLI is opt-in
+(default **no**). Piped setup keeps its existing answer format and only prints the install command.
+Installing the npm package alone never edits client settings.
+
+- **Claude:** merges into `~/.claude/settings.json` (`CLAUDE_CONFIG_DIR` is respected).
+- **Codex:** merges into `$CODEX_HOME/hooks.json`, default `~/.codex/hooks.json`. The result is
+  **trust pending**: review the definition with `/hooks` in Codex before it runs.
+- **Antigravity:** merges the memory group into `~/.gemini/config/hooks.json`.
+- **Grok:** adds a marked MCP tool-use guidance block to `~/.grok/AGENTS.md` (`GROK_HOME` is respected).
+  This is **not automatic context injection**; connect the memory MCP server separately. Grok can
+  also load Claude hooks, so inspect its compatibility settings before registering duplicate hooks.
+
+Use `--claude-home`, `--codex-home`, `--agy-home`, or `--grok-home` to select another settings directory;
+`--agy-home` means the directory containing `hooks.json`. Multiple `--client` flags are supported.
+Hooks pin the resolved memory configuration file. Set `MEMORY_CONFIG_PATH` explicitly when needed.
+Use a global installation or persistent checkout, not an `npx` cache, for durable hook commands.
+
+Reinstalling updates only the memory-owned handlers. Other settings and hooks are retained; the
+installer refuses malformed JSON or a symlink settings file. Before replacing an existing file,
+it saves its exact bytes with mode `600` under `${XDG_STATE_HOME:-~/.local/state}/mcp-agents-memory/hook-backups/`
+and keeps the latest two copies per target. The install result prints the backup path. To undo an
+installation, restore that backup, or remove the handlers marked `mcp-agents-memory:<client>:<event>`
+(the Grok block has begin/end markers).
+
+A configured file is not proof of injection. Open a new client session and check the hook log;
+Codex additionally requires trust. Installation never bypasses a client's trust controls.
+
+### Memory hooks — Claude Code · Codex · Antigravity (optional)
+
+Two hooks make the client use the memory without the model having to call a tool. The same engine serves
+every client; `--client claude|codex|agy` (default `claude`) only changes where the message is read from
+and the JSON that is printed:
+
+| Client | Start brief event | Per-message event | Output |
+|---|---|---|---|
+| Claude Code (`claude`) | `SessionStart` | `UserPromptSubmit` | `hookSpecificOutput.additionalContext`, up to 9,500 chars |
+| Codex CLI (`codex`) | `SessionStart` | `UserPromptSubmit` | same JSON, capped at 3,000 chars (`MEMORY_HOOK_CODEX_MAX_CHARS`) — Codex shows only a preview above ~2,500 tokens |
+| Antigravity (`agy`) | `SessionStart` | `PreInvocation` (first model call of a turn only) | `{"injectSteps":[{"systemMessage":{...}}]}`, `{}` when there is nothing to add |
+
+Grok (1.0.89) has the same event names but does not inject hook output into the model context, so it gets
+MCP tool-use guidance instead (see "Optional hook installation" above).
 
 - `hook session-start` (SessionStart) puts the full start brief at the top of each session. The MCP
   `instructions` field is cut by the client at about 2,000 characters; hook output may be up to 10,000.
@@ -262,7 +312,8 @@ Two hooks make Claude Code use the memory without the model having to call a too
   replies ("ok") and machine messages, ignores the last 30 minutes (the current conversation), and needs
   `OPENAI_API_KEY` for the embedding.
 
-Print the block to merge into `~/.claude/settings.json` (the command never edits the file):
+Use `mcp-agents-memory hook install` (above) to merge the hooks for each client, or print the Claude block
+to merge by hand (the command never edits the file):
 
 ```bash
 mcp-agents-memory hook print-config

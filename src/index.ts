@@ -249,7 +249,10 @@ Usage:
                                     stored are skipped by their external_uuid, so re-running is safe. Rows keep the line's
                                     own timestamp as created_at and this machine's hostname as device_name — run it on the
                                     machine that holds the files. --dry-run only counts parsable lines.
-  mcp-agents-memory hook <session-start | prompt | print-config>
+  mcp-agents-memory hook install [--client claude|codex|agy|grok] [--yes] [--dry-run]
+                                    Optional user-level hook setup. See hook install --help for settings homes.
+
+  mcp-agents-memory hook <session-start | prompt | print-config> [--client claude|codex|agy]
                                     Claude Code hooks. session-start puts the full start brief at the top of a session
                                     (the MCP instructions field is cut at ~2KB; hook output gets up to 10,000 chars).
                                     prompt adds up to 3 similar past records each time you send a message (needs
@@ -259,6 +262,10 @@ Usage:
                                     text). print-config prints the "hooks" block to merge into ~/.claude/settings.json
                                     — it never edits the file. Off switch: MEMORY_HOOKS_OFF=1. Tuning:
                                     MEMORY_RECALL_MIN_SIMILARITY (0.5), MEMORY_RECALL_LIMIT (3).
+                                    --client picks the tool's input/output shape (default claude): codex uses the same
+                                    JSON as Claude Code with a 3,000-char cap (MEMORY_HOOK_CODEX_MAX_CHARS); agy
+                                    (Antigravity) reads lastUserInput, answers with injectSteps, and its prompt hook is
+                                    registered on PreInvocation and only acts on the first model call of a turn.
   mcp-agents-memory retag-ptag [--count | --dry-run | --rollback] [--only stale|untagged | --venue buzz:<channel>] [--untagged-days N]
                                [--before ISO] [--max N] [--minutes N] [--concurrency N] [--sample] [--seed S]
                                [--log PATH] [--allow-fallback] [--hold-new <registry tag>[,...]] [--since ISO (with --rollback)]
@@ -455,9 +462,14 @@ async function cli() {
   }
 
   if (cmd === "hook") {
+    if (process.argv[3] === "install") {
+      const { runHookInstallCli } = await import("./hook_install.js");
+      await runHookInstallCli(process.argv.slice(4));
+      return;
+    }
     // Claude Code 훅 — 시작 브리핑 / 말할 때 기억 넣기. 늘 exit 0, stdout 은 JSON 한 덩어리 또는 빈 문자열.
     const { runHookCli } = await import("./hooks.js");
-    await runHookCli(process.argv[3]);
+    await runHookCli(process.argv[3], process.argv.slice(4));
     return;
   }
 

@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.9.38 — 2026-11-21
+
+### Memory hooks for Codex and Antigravity, and an opt-in installer
+
+The 0.9.37 Claude Code hooks now serve three clients from one engine:
+`hook <session-start | prompt> --client claude|codex|agy` (no `--client` means
+`claude`, so 0.9.37 settings keep working).
+
+- **Codex CLI** (0.171.0): the same `SessionStart` / `UserPromptSubmit`
+  `additionalContext` JSON as Claude Code. Codex replaces context above about
+  2,500 tokens with a file and a preview, so Codex output is capped at 3,000
+  characters (`MEMORY_HOOK_CODEX_MAX_CHARS`) and the start brief is built in the
+  budgeted inject format. Verified against a real Codex run whose model request
+  carried both the brief and the recalled records as developer context. Codex
+  only runs user hooks after the user trusts them in `/hooks`; the installer
+  never grants that trust.
+- **Antigravity** (`agy` 1.5.13): reads `lastUserInput`, prints
+  `{"injectSteps":[{"systemMessage":{"systemMessage":…}}]}`, and `{}` when there
+  is nothing to add or the hook gives up. Antigravity has no prompt-submit
+  event, so the per-message hook is registered on `PreInvocation` and acts only
+  on the first model call of a turn (`invocationNum` 0). A real `agy -p` run
+  showed hook commands run through a shell and both injected messages reached
+  the model.
+- **Grok** (1.0.89) fires `SessionStart` / `UserPromptSubmit` but discards hook
+  output, so it is not given hooks; the installer adds MCP tool-use guidance to
+  `~/.grok/AGENTS.md` instead. Grok also loads Claude hook settings, which the
+  installer warns about.
+
+New `mcp-agents-memory hook install [--client …] [--yes] [--dry-run]`, also
+offered at the end of interactive `setup` (default no; piped setup only prints
+the command). It detects the installed clients, asks per client, and merges only
+the memory-owned handlers into `~/.claude/settings.json`,
+`$CODEX_HOME/hooks.json` (default `~/.codex`), `~/.gemini/config/hooks.json`
+or `~/.grok/AGENTS.md`, keeping every other setting and hook. It recognises the
+0.9.37 `print-config` commands and replaces them instead of adding duplicates,
+refuses malformed JSON and symlinked settings files, keeps the exact previous
+bytes (mode 600, latest two per file) under
+`~/.local/state/mcp-agents-memory/hook-backups/`, refuses an `npx` cache as the
+hook entry, and reports `configured`, `trust-pending` (Codex), `unsupported`
+(Grok) or `planned` (`--dry-run`). Installing the npm package never edits client
+settings. Installer by Codi (#42).
+
+Hook commands now pin a node path that survives upgrades: a Homebrew versioned
+path (`…/Cellar/node/26.0.0/bin/node`, which disappears on `brew upgrade` and
+silently stopped the hooks) is replaced by `<prefix>/opt/node/bin/node` or
+`<prefix>/bin/node` when that link resolves to the same file.
+
+End to end, the installer's own output was loaded into a real Claude Code
+`-p` session and a real `agy -p` session: both injected the start brief and the
+per-message records, and the model read both. Reinstalling changed nothing.
+
 ## 0.9.37 — 2026-11-20
 
 ### Claude Code hooks: full start brief and recall on every message
