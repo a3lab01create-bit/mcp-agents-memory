@@ -15,8 +15,10 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import {
   captureCandidates,
+  captureMarkerPath,
   decideCapture,
   formatCaptureCheckWarning,
   hasCaptureMarker,
@@ -75,13 +77,18 @@ assert.equal(manyC[49].externalUuid, "claude-code:sid:m79");
 assert.deepEqual(decideCapture([], new Set(), S), { verdict: "undecided", eligible: 0, found: 0, reason: "no-eligible" });
 assert.deepEqual(decideCapture(cands, new Set(["claude-code:sid:a1"]), S), { verdict: "ok", eligible: 2, found: 1 },
   "하나라도 있으면 됨 (수집기는 같은 내용을 한 번만 넣는다)");
-assert.deepEqual(decideCapture(cands, new Set(), S), { verdict: "missing", eligible: 2, found: 0 });
 const dup = captureCandidates([user("d1", "응", 5 * 60_000), user("d2", "응", 4 * 60_000)].join("\n"), "sid", NOW, S, true);
-assert.deepEqual(decideCapture(dup, new Set(), S), { verdict: "undecided", eligible: 2, found: 0, reason: "too-few" },
+assert.deepEqual(decideCapture(dup, new Set(), S), { verdict: "undecided", eligible: 2, found: 0, dedup: 0, reason: "too-few" },
   "내용이 같은 줄뿐이면 판정하지 않는다");
+assert.deepEqual(decideCapture(cands, new Set(), S), { verdict: "missing", eligible: 2, found: 0, dedup: 0, missing: 2 });
+assert.deepEqual(decideCapture(cands, new Set(), S, new Set(cands.map((c) => c.key))),
+  { verdict: "undecided", eligible: 2, found: 0, dedup: 2, reason: "dedup" },
+  "같은 세션에 같은 내용이 이미 있으면 정상 중복 제거 — 경고 안 함 (코디 리뷰 #45-1)");
+assert.deepEqual(decideCapture(cands, new Set(), S, new Set([cands[0].key])),
+  { verdict: "undecided", eligible: 2, found: 0, dedup: 1, reason: "dedup" }, "남은 줄이 1개면 판정 안 함");
 
 // ── 4. 경고 글 ──
-const warn = formatCaptureCheckWarning({ verdict: "missing", eligible: 2, found: 0 }, S, "/h/.claude/projects/-p/sid.jsonl");
+const warn = formatCaptureCheckWarning({ verdict: "missing", eligible: 3, found: 0, dedup: 1, missing: 2 }, S, "/h/.claude/projects/-p/sid.jsonl");
 assert.ok(warn.includes("2줄") && warn.includes("60초") && warn.includes("backfill-claude \"/h/.claude/projects/-p/sid.jsonl\""), warn);
 assert.ok(warn.includes("사용자에게") && warn.includes("한 번"), "모델이 사용자에게 한 번 알리게");
 
@@ -91,15 +98,27 @@ const mdir = path.join(tmp, "markers");
 assert.equal(hasCaptureMarker(mdir, "s1"), false);
 writeCaptureMarker(mdir, "s1", "ok", NOW);
 assert.equal(hasCaptureMarker(mdir, "s1"), true);
-assert.equal(fs.statSync(path.join(mdir, "s1")).mode & 0o777, 0o600);
+assert.equal(fs.statSync(captureMarkerPath(mdir, "s1")).mode & 0o777, 0o600);
 assert.equal(fs.statSync(mdir).mode & 0o777, 0o700);
-assert.equal(JSON.parse(fs.readFileSync(path.join(mdir, "s1"), "utf8")).verdict, "ok");
-const oldM = path.join(mdir, "old-session");
-fs.writeFileSync(oldM, "{}\n");
+assert.equal(JSON.parse(fs.readFileSync(captureMarkerPath(mdir, "s1"), "utf8")).verdict, "ok");
 const old = (NOW - 15 * 24 * 60 * 60_000) / 1000;
-fs.utimesSync(oldM, old, old);
+const oldOurs = captureMarkerPath(mdir, "old-session");
+writeCaptureMarker(mdir, "old-session", "ok", NOW - 15 * 24 * 60 * 60_000);
+fs.utimesSync(oldOurs, old, old);
+// 우리 것이 아닌 오래된 파일들 — 절대 지우면 안 된다 (코디 리뷰 #45-4)
+const foreign = [
+  ["operator-note.txt", "사람이 둔 메모\n"],
+  ["lookalike.capture-check.json", "{\"verdict\":\"ok\"}\n"],          // 이름은 같은 꼴, 우리 tag 없음
+  ["old-session", "{}\n"],                                                  // 0.9.40 이전 꼴 이름
+].map(([name, body]) => {
+  const p = path.join(mdir, name);
+  fs.writeFileSync(p, body);
+  fs.utimesSync(p, old, old);
+  return p;
+});
 writeCaptureMarker(mdir, "s2", "warned", NOW);
-assert.equal(fs.existsSync(oldM), false, "2주 넘은 표시는 지운다");
+assert.equal(fs.existsSync(oldOurs), false, "2주 넘은 우리 표시는 지운다");
+for (const p of foreign) assert.equal(fs.existsSync(p), true, `우리 것이 아닌 파일은 남긴다: ${path.basename(p)}`);
 assert.equal(hasCaptureMarker(mdir, "s1"), true, "최근 표시는 남긴다");
 
 const tf = path.join(tmp, "t.jsonl");
@@ -108,6 +127,16 @@ assert.deepEqual(readTranscriptTail(tf, 1000), { text: "0123456789\nabcdefghij\n
 assert.deepEqual(readTranscriptTail(tf, 5), { text: "ghij\n", fromStart: false });
 assert.equal(readTranscriptTail(path.join(tmp, "none.jsonl"), 10), null);
 assert.equal(readTranscriptTail(tmp, 10), null, "폴더는 null");
+const fifo = path.join(tmp, "fifo-session.jsonl");
+const mk = spawnSync("mkfifo", [fifo]);
+const haveFifo = mk.status === 0;
+if (haveFifo) {
+  const t0 = Date.now();
+  assert.equal(readTranscriptTail(fifo, 10), null, "FIFO 는 null");
+  assert.ok(Date.now() - t0 < 500, "FIFO 에서 막히지 않는다 (코디 리뷰 #45-3)");
+} else {
+  console.log("(mkfifo 없음 — FIFO 검사 건너뜀)");
+}
 
 // ── 6. 프로세스 (DB 없이) ──
 const entry = path.resolve("build/index.js");
@@ -184,6 +213,13 @@ const eligible = (p: string) => [user(`${p}-u1`, `첫 질문 ${SECRET}`, 5 * 60_
   runHook("claude", { prompt: SHORT, transcript_path: "rel/x.jsonl" }, { MEMORY_CONFIG_PATH: deadEnv });
   assert.equal(lastLog().capture, "no-transcript");
 }
+if (haveFifo) { // FIFO 를 transcript_path 로 줘도 막히지 않고 바로 끝난다
+  const t0 = Date.now();
+  const r = runHook("claude", { prompt: SHORT, transcript_path: fifo }, { MEMORY_CONFIG_PATH: deadEnv, MEMORY_HOOK_PROMPT_DEADLINE_MS: "1500" });
+  assert.equal(r.status, 0); assert.equal(r.stdout, "");
+  assert.ok(Date.now() - t0 < 1400, `FIFO 로 막히면 안 된다 (${Date.now() - t0}ms)`);
+  assert.equal(lastLog().capture, "unreadable");
+}
 assert.ok(!fs.readFileSync(logFile, "utf8").includes("비밀"), "로그에 대화 내용이 남으면 안 된다");
 
 // ── 7. 프로세스 (DB 있음, 선택) ──
@@ -215,7 +251,7 @@ if (!dbUrl) {
   assert.equal(rA.status, 0);
   assert.ok(ctx(rA.stdout).startsWith("⚠️ mcp-agents-memory 수집 확인") && ctx(rA.stdout).includes("2줄"), rA.stdout);
   assert.equal(lastLog().capture, "missing");
-  assert.equal(JSON.parse(fs.readFileSync(path.join(pdir, sA), "utf8")).verdict, "warned");
+  assert.equal(JSON.parse(fs.readFileSync(captureMarkerPath(pdir, sA), "utf8")).verdict, "warned");
   // 같은 세션 다음 말 → 다시 경고하지 않는다
   const rA2 = runHook("claude", { prompt: SHORT, transcript_path: tA }, { MEMORY_CONFIG_PATH: envFile });
   assert.equal(rA2.stdout, ""); assert.equal(lastLog().capture, "done");
@@ -231,7 +267,7 @@ if (!dbUrl) {
   assert.equal(rB.stdout, "", "들어간 세션은 경고하지 않는다");
   const lB = lastLog();
   assert.equal(lB.capture, "ok", JSON.stringify(lB)); assert.equal(lB.found, 2);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(pdir, sB), "utf8")).verdict, "ok");
+  assert.equal(JSON.parse(fs.readFileSync(captureMarkerPath(pdir, sB), "utf8")).verdict, "ok");
 
   // 내용이 같은 줄뿐 → 판정 안 함 · 표시 없음
   const sC = `db-dup-${sfx}`;
@@ -240,6 +276,41 @@ if (!dbUrl) {
   assert.equal(rC.stdout, "");
   assert.equal(lastLog().reason, "too-few");
   assert.equal(hasCaptureMarker(pdir, sC), false);
+
+  // 정상 중복 제거 (코디 리뷰 #45-1 재현): 40분 전 질문·답이 저장돼 있고, 3분 전에 같은 내용이
+  // 다른 uuid 로 다시 쓰였다 → 수집기는 뒤의 두 줄을 넣지 않는 게 정상 → 경고하면 안 된다
+  const sE = `db-dedup-${sfx}`;
+  const tE = writeTranscript(sE, [
+    user(`E1${sfx}`, `같은 질문 ${sfx}`, 40 * 60_000), assistant(`E2${sfx}`, `같은 답 ${sfx}`, 39.9 * 60_000),
+    user(`E3${sfx}`, `같은 질문 ${sfx}`, 3 * 60_000), assistant(`E4${sfx}`, `같은 답 ${sfx}`, 2.9 * 60_000),
+  ]);
+  const bfE = spawnSync(process.execPath, [entry, "backfill-claude", tE], { encoding: "utf8", timeout: 60_000, cwd: tmp, env: baseEnv });
+  assert.equal(bfE.status, 0, `backfill-claude: ${bfE.stderr.slice(-400)}`);
+  const nE = await client.query(`SELECT count(*)::int AS n FROM memory WHERE external_uuid LIKE $1`, [`claude-code:${sE}:%`]);
+  assert.equal(nE.rows[0].n, 2, "실제 수집 코드는 같은 내용을 한 번만 넣는다 (양성대조)");
+  const rE = runHook("claude", { prompt: SHORT, transcript_path: tE }, { MEMORY_CONFIG_PATH: envFile });
+  assert.equal(rE.stdout, "", "정상 중복 제거를 누락으로 보면 안 된다");
+  const lE = lastLog();
+  assert.equal(lE.capture, "undecided", JSON.stringify(lE)); assert.equal(lE.reason, "dedup"); assert.equal(lE.dedup, 2);
+  assert.equal(hasCaptureMarker(pdir, sE), false);
+
+  // 느린 recall (코디 리뷰 #45-2 재현): 응답 없는 임베딩 서버 → 끝난 수집 경고는 deadline 안에 나가야 한다
+  const hang = net.createServer(() => { /* 받고 대답 안 함 */ });
+  await new Promise<void>((res) => hang.listen(0, "127.0.0.1", () => res()));
+  const hangPort = (hang.address() as net.AddressInfo).port;
+  const slowEnv = path.join(tmp, "slow.env");
+  fs.writeFileSync(slowEnv, `DATABASE_URL=${dbUrl}\nOPENAI_API_KEY=sk-test-not-real\nOPENAI_BASE_URL=http://127.0.0.1:${hangPort}/v1\n`);
+  const sF = `db-slowrecall-${sfx}`;
+  const tF = writeTranscript(sF, eligible(`F${sfx}`));
+  const t0 = Date.now();
+  const rF = runHook("claude", { prompt: "지난번 배송비 바꾼 거 기억나? 그때 얼마로 했지", transcript_path: tF },
+    { MEMORY_CONFIG_PATH: slowEnv, MEMORY_HOOK_PROMPT_DEADLINE_MS: "1200" });
+  const msF = Date.now() - t0;
+  hang.close();
+  assert.ok(ctx(rF.stdout).startsWith("⚠️ mcp-agents-memory 수집 확인"), `느린 recall 에도 경고는 나간다: ${JSON.stringify(rF.stdout)} (${msF}ms)`);
+  const lF = lastLog();
+  assert.equal(lF.capture, "missing"); assert.equal(lF.recallError, "recall timeout", JSON.stringify(lF));
+  assert.equal(JSON.parse(fs.readFileSync(captureMarkerPath(pdir, sF), "utf8")).verdict, "warned");
 
   // recall 이 실패해도(임베딩 키 없음) 경고는 나간다
   const sD = `db-recallfail-${sfx}`;

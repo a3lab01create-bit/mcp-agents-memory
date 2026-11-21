@@ -14,24 +14,34 @@ hook checks the result instead.
   store that are 60 s to 30 min old (resumed sessions may contain old parts
   that earlier capture gaps missed), and looks up their `external_uuid`s
   (`claude-code:<session>:<line uuid>`).
-- One hit means the session is fine. No hit among at least two lines with
-  different text means it is not, and the hook adds a warning, placed before
-  the recall text so the length cap never cuts it, asking the model to tell
-  the user once and naming the `backfill-claude` command for that file. One
-  line, unreadable files, a missing path or database errors decide nothing;
-  the next message tries again.
-- The verdict is written to `~/.local/state/mcp-agents-memory/capture-check/<session>`
-  (mode 600, older than two weeks removed) just before the hook prints, so a
-  timed-out warning is retried. Later messages see the file and skip the
-  database entirely. Short replies still skip the database unless a check is
-  pending.
-- Recall and the check run side by side and settle separately: a failed
-  recall (no embedding key) still lets the warning through.
+- One hit means the session is fine. With no hit, lines whose role and text
+  are already stored for the same session are set aside: the capture stores
+  each text once per session, so a question re-recorded under a new uuid is
+  expected to be absent (review by Codi). If at least two lines with different
+  text remain, the session is not being saved, and the hook adds a warning,
+  placed before the recall text so the length cap never cuts it, asking the
+  model to tell the user once and naming the `backfill-claude` command for
+  that file. One line, only re-recorded text, unreadable or non-regular files
+  (opened without blocking, so a FIFO cannot stall the hook), a missing path
+  or database errors decide nothing; the next message tries again.
+- The verdict is written to
+  `~/.local/state/mcp-agents-memory/capture-check/<session>.capture-check.json`
+  (mode 600) just before the hook prints, so a timed-out warning is retried.
+  Later messages see the file and skip the database entirely. Pruning after
+  two weeks removes only files with that name pattern and our own tag inside,
+  never anything else in the folder (review by Codi). Short replies still skip
+  the database unless a check is pending.
+- Recall and the check run side by side, each with its own time budget just
+  under the hook deadline, and settle separately: a failed or slow recall
+  (no embedding key, an embedding server that does not answer) still lets a
+  finished warning through (review by Codi).
 - Codex and Antigravity are not checked. `MEMORY_CAPTURE_CHECK=0` turns it off.
 - `check:hook-capture`: line selection, verdicts, marker files, the process
   contract without a database, and, with `CHECK_CAPTURE_DATABASE_URL` pointing
-  at a throwaway database, the warning, the once-per-session marker, and a
-  positive control filled by the real `backfill-claude` code.
+  at a throwaway database (the `__disposable_test_db__` sentinel table is
+  required), the warning, the once-per-session marker, re-recorded text, a
+  slow recall, and positive controls filled by the real `backfill-claude`
+  code. Reverting each review fix makes the check fail.
 - Found on first real use: on Mortar every memory server had stopped at 08:22
   that day, most likely when the per-user inotify watch limit ran out and a
   watcher without an error handler took each process down, so no Claude

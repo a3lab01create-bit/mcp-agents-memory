@@ -216,12 +216,27 @@ function errText(err: unknown): string {
   return (err instanceof Error ? err.message : String(err)).slice(0, 200);
 }
 
+/** 시간 넘김 표시 — 로그에서 outcome "timeout" 으로 남긴다. */
+class HookTimeout extends Error {}
+
+/** p 가 ms 안에 안 끝나면 HookTimeout 으로 끝낸다(p 자체는 계속 돌지만 결과는 버린다). */
+function withBudget<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new HookTimeout(`${label} timeout`)), Math.max(0, ms));
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
 /**
  * UserPromptSubmit: 비슷한 지난 기록(recall) + 수집 확인(클로드만, 세션마다 한 번)을 같이 돌린다.
- * 서로 따로 끝낸다 — 한쪽이 실패해도 다른 쪽 글은 나간다. 수집 경고를 앞에 둬서 길이 상한에 안 잘린다.
+ * 서로 따로 끝낸다 — 한쪽이 실패하거나 늦어도 다른 쪽 글은 나간다(각자 budgetMs 안에서만 기다린다,
+ * 코디 리뷰 #45-2). 수집 경고를 앞에 둬서 길이 상한에 안 잘린다.
  */
-async function promptContext(input: any, client: HookClient): Promise<HookContextResult> {
-  const [recall, capture] = await Promise.allSettled([recallContext(input, client), captureCheckContext(input, client)]);
+async function promptContext(input: any, client: HookClient, budgetMs: number): Promise<HookContextResult> {
+  const [recall, capture] = await Promise.allSettled([
+    withBudget(recallContext(input, client), budgetMs, "recall"),
+    withBudget(captureCheckContext(input, client), budgetMs, "capture"),
+  ]);
   const warning = capture.status === "fulfilled" ? capture.value.context : "";
   if (recall.status === "rejected" && !warning) throw recall.reason;
   const recallText = recall.status === "fulfilled" ? recall.value.context : "";
@@ -433,15 +448,17 @@ export async function runHookCli(sub: string | undefined, args: readonly string[
     const rawIn = await readStdin();
     let input: any = {};
     try { input = rawIn.trim() ? JSON.parse(rawIn) : {}; } catch { input = {}; }
+    // 각 작업은 전체 deadline 보다 조금 먼저 끊어서, 끝난 쪽 결과를 내보낼 시간을 남긴다
+    const margin = Math.min(300, Math.floor(deadlineMs / 4));
     const { context, info, commit } = event === "session-start"
       ? await sessionStartContext(client)
-      : await promptContext(input, client);
+      : await promptContext(input, client, deadlineMs - margin - (Date.now() - started));
     const out = formatHookOutput(client, event, context);
     try { commit?.(); } catch { /* 표시를 못 남기면 다음 말에서 다시 확인할 뿐 */ }
     logLine({ event: logEvent, client, outcome: context ? "injected" : "none", ms: Date.now() - started, source: input?.source, ...info });
     finish(out);
   } catch (err) {
-    logLine({ event: logEvent, client, outcome: "error", ms: Date.now() - started, error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200) });
+    logLine({ event: logEvent, client, outcome: err instanceof HookTimeout ? "timeout" : "error", ms: Date.now() - started, error: errText(err) });
     exitQuiet(client);
   }
 }

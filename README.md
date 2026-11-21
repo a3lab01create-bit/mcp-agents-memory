@@ -314,10 +314,11 @@ MCP tool-use guidance instead (see "Optional hook installation" above).
 - Claude Code only: once per session, `hook prompt` also checks that the conversation is being saved. It
   reads the session file the hook is given (`transcript_path`), takes the lines the capture would store that
   are older than 60 s and newer than 30 min, and looks their ids up in the database. If at least one is
-  there, the session is marked as fine; if none of at least two different lines is there, it adds a warning
-  asking the model to tell you once, with the `backfill-claude` command for that session. The verdict is
-  kept as a small file per session in `~/.local/state/mcp-agents-memory/capture-check/` (removed after two
-  weeks), so later messages skip the check without touching the database. This replaces the warning
+  there, the session is marked as fine. If none is, lines whose text is already stored for the session are
+  set aside (the capture stores each text once per session); if at least two different lines remain, it adds
+  a warning asking the model to tell you once, with the `backfill-claude` command for that session. The
+  verdict is kept as a small `<session>.capture-check.json` file in `~/.local/state/mcp-agents-memory/capture-check/`
+  (our own files removed after two weeks), so later messages skip the check without touching the database. This replaces the warning
   `memory_startup` shows, which hooked Claude Code sessions no longer call.
 
 Use `mcp-agents-memory hook install` (above) to merge the hooks for each client, or print the Claude block
