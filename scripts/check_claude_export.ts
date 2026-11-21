@@ -95,17 +95,40 @@ const fixture = [
   assert.deepEqual(parseClaudeExport([]).rows, []);
 }
 
-// ── describeDbTarget: 비밀번호를 안 찍는다 ──
+// ── describeDbTarget: 실제 연결 규칙(db.connect · pg 해석기)과 같게 · 비밀번호를 안 찍는다 ──
 {
   const SECRET = "s3cr3t-pass";
-  const t1 = describeDbTarget({ DATABASE_URL: `postgres://user:${SECRET}@db.example:6543/memdb?sslmode=require` });
-  assert.equal(t1, "db.example:6543/memdb");
-  assert.equal(describeDbTarget({ DATABASE_URL: `postgres://user:${SECRET}@localhost/memdb` }), "localhost:5432/memdb");
-  assert.equal(describeDbTarget({ DB_HOST: "h", DB_PASS: SECRET, DB_NAME: "n" }), "h:5432/n");
-  assert.equal(describeDbTarget({ DB_HOST: "h", DB_PORT: "1", DB_NAME: "n", SSH_HOST: "jump" }), "h:1/n (SSH 터널: jump)");
-  assert.equal(describeDbTarget({ DATABASE_URL: `not a url ${SECRET}` }), "DATABASE_URL (주소를 읽지 못함)");
-  assert.equal(describeDbTarget({}), "설정 없음");
-  for (const s of [t1, describeDbTarget({ DATABASE_URL: `not a url ${SECRET}` })]) assert.ok(!s.includes(SECRET));
+  const KEYS = ["DATABASE_URL", "DB_HOST", "DB_PORT", "DB_USER", "DB_PASS", "DB_NAME", "DB_SSL",
+    "SSH_ENABLED", "SSH_HOST", "SSH_PORT", "PGHOST", "PGPORT", "PGDATABASE", "PGUSER"];
+  const saved = Object.fromEntries(KEYS.map((k) => [k, process.env[k]]));
+  const withEnv = (vars: Record<string, string>) => {
+    for (const k of KEYS) delete process.env[k];
+    Object.assign(process.env, vars);
+    try { return describeDbTarget(); } finally { for (const k of KEYS) delete process.env[k]; }
+  };
+  try {
+    const cases: Array<[Record<string, string>, string, string]> = [
+      [{ DATABASE_URL: `postgres://user:${SECRET}@db.example:6543/memdb?sslmode=require` }, "db.example:6543/memdb", "URL 기본"],
+      [{ DATABASE_URL: `postgres://user:${SECRET}@localhost/memdb` }, "localhost:5432/memdb", "포트 없으면 5432"],
+      // 코디 재현: URL 앞부분과 query 가 다르면 pg 는 query 쪽에 붙는다
+      [{ DATABASE_URL: `postgres://user:${SECRET}@front-host:1111/frontdb?host=real-host&port=2222` }, "real-host:2222/frontdb", "query host/port 우선"],
+      [{ DATABASE_URL: `postgres:///sockdb?host=/var/run/postgresql` }, "/var/run/postgresql:5432/sockdb", "유닉스 소켓"],
+      [{ DATABASE_URL: "postgres:///x", PGHOST: "pg-env-host", PGPORT: "7777" }, "pg-env-host:7777/x", "빈 칸은 PG* 환경변수"],
+      [{ DB_HOST: "h", DB_PASS: SECRET, DB_NAME: "n", DB_USER: "u" }, "h:5432/n", "옛 DB_* 설정"],
+      // 코디 재현: SSH_ENABLED=true 면 DATABASE_URL 을 안 쓰고 DB_HOST 로 터널
+      [{ SSH_ENABLED: "true", SSH_HOST: "jump", DATABASE_URL: `postgres://user:${SECRET}@url-host:1/urldb`, DB_HOST: "behind", DB_PORT: "5433", DB_NAME: "realdb", DB_PASS: SECRET },
+        "behind:5433/realdb (SSH 터널: jump:22)", "SSH 는 DB_HOST 쪽"],
+      [{ SSH_ENABLED: "false", SSH_HOST: "jump", DATABASE_URL: `postgres://user:${SECRET}@url-host:1/urldb` }, "url-host:1/urldb", "SSH 꺼져 있으면 URL"],
+      [{}, "설정 없음", "설정 없음"],
+    ];
+    for (const [vars, want, why] of cases) {
+      const got = withEnv(vars);
+      assert.equal(got, want, why);
+      assert.ok(!got.includes(SECRET), `비밀번호가 찍히면 안 된다: ${why}`);
+    }
+  } finally {
+    for (const k of KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  }
 }
 
 // ── 2. 프로세스 (DB 없이) ──
@@ -197,6 +220,23 @@ if (!dbUrl) {
     }
     assert.equal(new Date(rows[0].created_at).toISOString(), "2026-11-20T22:57:10.000Z", "메시지 시각으로 저장");
     assert.equal(rows[1].message, "찾아봤어. 첫 문단.\n둘째 문단.");
+
+    // 코디 재현: URL 앞부분은 엉뚱한 호스트·포트, query 가 진짜 일회용 DB → 찍힌 주소가 실제로 쓴 DB 와 같아야 한다
+    const real = new URL(dbUrl);
+    const decoy = new URL(dbUrl);
+    decoy.hostname = "decoy-host.invalid"; decoy.port = "9";
+    decoy.searchParams.set("host", real.hostname); decoy.searchParams.set("port", real.port || "5432");
+    const decoyEnv = path.join(tmp, "decoy.env");
+    fs.writeFileSync(decoyEnv, `DATABASE_URL=${decoy.toString()}\n`);
+    await client.query(`DELETE FROM memory WHERE external_uuid = 'claude-export:conv-b:b2'`);
+    const r3 = run([fixtureFile], decoyEnv);
+    assert.equal(r3.status, 0, r3.stderr);
+    assert.match(r3.stderr, new RegExp(`DB = ${real.hostname.replace(/\./g, "\\.")}:${real.port || "5432"}${real.pathname}\\b`),
+      `찍힌 주소가 실제 연결과 같아야 한다: ${r3.stderr.split("\n").find((l) => l.includes("DB =")) ?? ""}`);
+    assert.ok(!r3.stderr.includes("decoy-host"), "URL 앞부분의 엉뚱한 호스트를 찍으면 안 된다");
+    assert.ok(!r3.stderr.includes(decodeURIComponent(real.password)) || !real.password, "비밀번호가 찍히면 안 된다");
+    const o3 = JSON.parse(r3.stdout.trim());
+    assert.equal(o3.inserted, 1, "빠진 한 줄만 다시 넣는다"); assert.equal(o3.dedup, 3);
     await client.query(`DELETE FROM memory WHERE external_uuid LIKE 'claude-export:conv-%'`);
   } finally {
     await client.end();

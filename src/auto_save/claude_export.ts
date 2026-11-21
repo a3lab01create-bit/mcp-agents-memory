@@ -20,6 +20,9 @@
  * - 내보내기에는 지금 계정에 남아 있는 대화만 들어온다. 지운 대화는 없다(11-22: 11-16 결과물의 대화가 빠져 있었다).
  */
 import fs from "node:fs";
+// @ts-ignore — pg 가 연결할 때 쓰는 해석기 그대로(패키지 공개 경로 pg/lib/*). 타입 선언이 없다.
+import ConnectionParameters from "pg/lib/connection-parameters.js";
+import { buildPoolConfig } from "../db.js";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
 
@@ -103,19 +106,36 @@ export function parseClaudeExport(data: unknown): ClaudeExportParse {
   return out;
 }
 
-/** 이 명령이 쓸 DB — 비밀번호 없이 호스트·포트·이름만. 넣기 전에 사람이 눈으로 확인하게 찍는다. */
-export function describeDbTarget(env: NodeJS.ProcessEnv = process.env): string {
-  const tunnel = env.SSH_HOST ? ` (SSH 터널: ${env.SSH_HOST})` : "";
-  if (env.DATABASE_URL) {
-    try {
-      const u = new URL(env.DATABASE_URL);
-      return `${u.hostname}:${u.port || "5432"}${u.pathname}${tunnel}`;
-    } catch {
-      return `DATABASE_URL (주소를 읽지 못함)${tunnel}`;
+/**
+ * 이 명령이 실제로 쓸 DB — 비밀번호 없이 호스트·포트·이름만. 넣기 전에 사람이 눈으로 확인하게 찍는다.
+ *
+ * db.connect() 와 같은 규칙으로 고른다(코디 #47 리뷰: URL 앞부분만 읽으면 `?host=…&port=…` 로 실제 연결되는
+ * 곳과 다른 주소가 찍혔고, SSH_ENABLED=true 인데 DATABASE_URL 을 찍었다).
+ * - SSH_ENABLED=true → DATABASE_URL 은 안 쓰고 DB_HOST·DB_PORT·DB_NAME 으로 터널을 판다.
+ * - 그 밖 → buildPoolConfig() 가 만든 설정을 pg 의 연결 해석기(ConnectionParameters)에 그대로 넣는다.
+ *   URL 의 query host/port, 빠진 칸의 PGHOST·PGPORT·PGDATABASE, 기본값까지 pg 가 연결할 때와 같다.
+ * 읽기만 하고 process.env 를 바꾸지 않는다.
+ */
+export function describeDbTarget(): string {
+  const env = process.env;
+  try {
+    if (env.SSH_ENABLED === "true") {
+      const p = new ConnectionParameters({
+        host: env.DB_HOST || "localhost", port: parseInt(env.DB_PORT || "5432"), user: env.DB_USER, database: env.DB_NAME,
+      });
+      return `${p.host}:${p.port}/${p.database} (SSH 터널: ${env.SSH_HOST ?? "?"}:${env.SSH_PORT || "22"})`;
     }
+    let config: unknown;
+    try {
+      config = buildPoolConfig().config;
+    } catch {
+      return "설정 없음";
+    }
+    const p = new ConnectionParameters(config);
+    return `${p.host}:${p.port}/${p.database}`;
+  } catch {
+    return "연결 설정을 읽지 못함";
   }
-  if (env.DB_HOST) return `${env.DB_HOST}:${env.DB_PORT || "5432"}/${env.DB_NAME ?? "?"}${tunnel}`;
-  return "설정 없음";
 }
 
 export interface ClaudeExportImportResult {

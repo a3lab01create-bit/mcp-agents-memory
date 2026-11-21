@@ -24,8 +24,12 @@ chose to save through a tool reached the database: 7 in five weeks, all without
   `agent_model` `unknown` for replies, `created_at` = the message's own time.
   `external_uuid` `claude-export:<conversation>:<message>` makes re-runs safe.
 - Before writing, the command prints the target database as host:port/name
-  (never the password). `--dry-run` only parses and counts and does not open
-  the database.
+  (never the password), resolved the way the connection is actually made: with
+  `SSH_ENABLED=true` it is `DB_HOST` behind the tunnel, otherwise pg's own
+  parser reads the config, so `?host=…&port=…` in the URL and `PG*` defaults
+  count (Codi's review: the first draft printed the URL's front host while the
+  rows went to the query host). `--dry-run` only parses and counts and does not
+  open the database.
 - An export only holds conversations still in the account. A real export's
   artifacts (`frames-000.zip`) came from 2026-11-16 chats that were no longer in
   `conversations.json`.
