@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased (0.9.40 candidate)
+
+### Hooked Claude Code sessions warn when the conversation is not being saved
+
+0.9.39 stopped hooked Claude Code sessions from calling `memory_startup` at the
+start, so they no longer saw its "this session is not being captured" warning.
+Only the server knows its capture state, and the hook runs outside it, so the
+hook checks the result instead.
+
+- Once per session, `hook prompt --client claude` reads the end of the session
+  file (`transcript_path`), keeps the lines `jsonl_capture.parseEntry` would
+  store that are 60 s to 30 min old (resumed sessions may contain old parts
+  that earlier capture gaps missed), and looks up their `external_uuid`s
+  (`claude-code:<session>:<line uuid>`).
+- One hit means the session is fine. No hit among at least two lines with
+  different text means it is not, and the hook adds a warning, placed before
+  the recall text so the length cap never cuts it, asking the model to tell
+  the user once and naming the `backfill-claude` command for that file. One
+  line, unreadable files, a missing path or database errors decide nothing;
+  the next message tries again.
+- The verdict is written to `~/.local/state/mcp-agents-memory/capture-check/<session>`
+  (mode 600, older than two weeks removed) just before the hook prints, so a
+  timed-out warning is retried. Later messages see the file and skip the
+  database entirely. Short replies still skip the database unless a check is
+  pending.
+- Recall and the check run side by side and settle separately: a failed
+  recall (no embedding key) still lets the warning through.
+- Codex and Antigravity are not checked. `MEMORY_CAPTURE_CHECK=0` turns it off.
+- `check:hook-capture`: line selection, verdicts, marker files, the process
+  contract without a database, and, with `CHECK_CAPTURE_DATABASE_URL` pointing
+  at a throwaway database, the warning, the once-per-session marker, and a
+  positive control filled by the real `backfill-claude` code.
+- Found on first real use: on Mortar every memory server had stopped at 08:22
+  that day, most likely when the per-user inotify watch limit ran out and a
+  watcher without an error handler took each process down, so no Claude
+  conversation there had been saved since.
+
 ## 0.9.39 — 2026-11-21
 
 ### The start brief no longer arrives two or three times in Claude Code

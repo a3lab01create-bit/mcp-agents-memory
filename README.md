@@ -311,6 +311,14 @@ MCP tool-use guidance instead (see "Optional hook installation" above).
   three of them, marked as automatic search results that may be unrelated. It skips slash commands, short
   replies ("ok") and machine messages, ignores the last 30 minutes (the current conversation), and needs
   `OPENAI_API_KEY` for the embedding.
+- Claude Code only: once per session, `hook prompt` also checks that the conversation is being saved. It
+  reads the session file the hook is given (`transcript_path`), takes the lines the capture would store that
+  are older than 60 s and newer than 30 min, and looks their ids up in the database. If at least one is
+  there, the session is marked as fine; if none of at least two different lines is there, it adds a warning
+  asking the model to tell you once, with the `backfill-claude` command for that session. The verdict is
+  kept as a small file per session in `~/.local/state/mcp-agents-memory/capture-check/` (removed after two
+  weeks), so later messages skip the check without touching the database. This replaces the warning
+  `memory_startup` shows, which hooked Claude Code sessions no longer call.
 
 Use `mcp-agents-memory hook install` (above) to merge the hooks for each client, or print the Claude block
 to merge by hand (the command never edits the file):
@@ -334,6 +342,8 @@ attachments, which the capture skips, so it is not saved back into memory.
 | `MEMORY_RECALL_RECENT_MINUTES` | `30` | records newer than this are ignored |
 | `MEMORY_RECALL_MIN_PROMPT_CHARS` / `MEMORY_RECALL_MIN_MEMORY_CHARS` | `8` / `40` | shorter messages / records are skipped |
 | `MEMORY_HOOK_PROMPT_DEADLINE_MS` / `MEMORY_HOOK_SESSION_DEADLINE_MS` | `3500` / `6000` | give-up time |
+| `MEMORY_CAPTURE_CHECK` | — | `0` turns the capture check off |
+| `MEMORY_CAPTURE_CHECK_GRACE_SEC` / `MEMORY_CAPTURE_CHECK_WINDOW_MIN` | `60` / `30` | lines younger / older than this are not checked |
 
 ---
 
