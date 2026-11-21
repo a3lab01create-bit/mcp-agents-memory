@@ -23,6 +23,7 @@ import * as os from "node:os";
 import * as crypto from "node:crypto";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
+import { guardWatcher } from "./watch_guard.js";
 
 const CLIENT_PLATFORM = "gemini-cli-mcp-client";
 const DEVICE_NAME = os.hostname();
@@ -422,7 +423,10 @@ function armDirWatchers(): void {
         if (filename && !filename.endsWith(".json") && !filename.endsWith(".jsonl")) return;
         scheduleFlush();
       });
-      _watchers.push(w);
+      _watchers.push(guardWatcher(w, "Gemini", () => {
+        const i = _watchers.indexOf(w);
+        if (i >= 0) _watchers.splice(i, 1);
+      }));
     } catch (err) {
       console.error(`⚠️ [Gemini] fs.watch ${dir} failed:`, err);
     }

@@ -25,6 +25,7 @@ import { createHash } from "node:crypto";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
 import { buzzTurnVenue } from "./venue.js";
+import { guardWatcher } from "./watch_guard.js";
 
 const DEVICE_NAME = os.hostname();
 // 2026-10-31: CODEX_HOME 을 존중한다. 버즈 코디는 codex-home 을 쓰고(launcher 가 env 로 지정),
@@ -668,12 +669,13 @@ function armDirWatcher(): void {
   if (!_state || !_state.rootExists) return;
   if (_watcher) return;
   try {
-    _watcher = fs.watch(SESSIONS_ROOT, { recursive: true }, (_evt, filename) => {
+    const w = fs.watch(SESSIONS_ROOT, { recursive: true }, (_evt, filename) => {
       if (!filename) return;
       const base = path.basename(filename);
       if (!base.startsWith("rollout-") || !base.endsWith(".jsonl")) return;
       scheduleFlush();
     });
+    _watcher = guardWatcher(w, "Codex", () => { if (_watcher === w) _watcher = null; });
     console.error(`📝 [Codex] dir watcher armed (recursive)`);
   } catch (err) {
     console.error("⚠️ [Codex] fs.watch failed — polling only:", err);

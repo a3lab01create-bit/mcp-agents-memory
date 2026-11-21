@@ -1,6 +1,31 @@
 # Changelog
 
-## Unreleased (0.9.40 candidate)
+## 0.9.40 — 2026-11-21
+
+### A failed folder watch no longer takes the memory server down
+
+On 2026-11-21 at 08:22 every memory server on Mortar exited at once, and since
+Claude Code does not restart a dead stdio server, no Claude conversation there
+was saved for hours (found by the capture check below on its first real run).
+Each server watches the Grok, Codex and Antigravity session folders
+recursively; on Linux that costs inotify watches for every folder (about 6,800
+per server on Mortar, against a per-user limit of 65,536). When the limit was
+full and a new session folder appeared, Node could not add the watch and
+emitted `error` on the watcher. Four of the five capture watchers had no
+`error` listener, so Node threw and the process died. Reproduced in a
+container under a separate uid: without a listener the process exits 1 with
+"Unhandled 'error' event" (ENOSPC); with one it keeps running.
+
+- New `guardWatcher` (`src/auto_save/watch_guard.ts`) adds an `error` listener
+  that closes only that watcher and reports it once. The Grok, Codex,
+  Antigravity and Gemini captures use it; each already polls every 3 s beside
+  its watcher, so capture continues. The Claude capture already had a listener.
+- `check:watch-guard`: the helper (with a negative control showing that a bare
+  watcher throws), and the real built server with all three recursive
+  watchers armed, then an unreadable folder created under each root (EACCES
+  takes the same `error` path as ENOSPC). The server must stay up and log the
+  closed watchers; with the previous capture modules it dies.
+- Not changed yet: how many watches each server uses.
 
 ### Hooked Claude Code sessions warn when the conversation is not being saved
 
@@ -46,10 +71,7 @@ hook checks the result instead.
   required), the warning, the once-per-session marker, re-recorded text, a
   slow recall, and positive controls filled by the real `backfill-claude`
   code. Reverting each review fix makes the check fail.
-- Found on first real use: on Mortar every memory server had stopped at 08:22
-  that day, most likely when the per-user inotify watch limit ran out and a
-  watcher without an error handler took each process down, so no Claude
-  conversation there had been saved since.
+- Found on first real use: the Mortar outage described above.
 
 ## 0.9.39 — 2026-11-21
 

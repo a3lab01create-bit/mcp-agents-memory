@@ -21,6 +21,7 @@ import * as os from "node:os";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
 import { buzzTurnVenue } from "./venue.js";
+import { guardWatcher } from "./watch_guard.js";
 
 const DEVICE_NAME = os.hostname();
 const GEMINI_ROOT = path.join(os.homedir(), ".gemini");
@@ -353,7 +354,10 @@ function armDirWatcher(): void {
         if (path.basename(filename) !== CHAT_FILE) return;
         scheduleFlush();
       });
-      _watchers.push(w);
+      _watchers.push(guardWatcher(w, "Antigravity", () => {
+        const i = _watchers.indexOf(w);
+        if (i >= 0) _watchers.splice(i, 1);
+      }));
     } catch (err) {
       console.error(`⚠️ [Antigravity] fs.watch failed for ${dir} — polling only:`, err);
     }
