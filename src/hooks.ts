@@ -75,6 +75,12 @@ const TURN_EVENT_BOUNDARY = /^--- Event (\d+) \(.*\) ---$/;
 const TURN_HEADER_LINES = 12;
 /** 이벤트 블록 앞에 올 수 있는 빈 안내 블록(`<new-message-arrived-…>` 여닫기, Note 줄). */
 const TURN_PREAMBLE_LINE = /^(?:<\/?[a-z-]+(?:\s[^>]*)?>|Note: A new message arrived while you were working\..*)?$/;
+/**
+ * 닫는 이벤트 태그 **뒤**에 올 수 있는 줄: 빈 줄 · 작업 중 새 메시지 안내(Note) · 버즈 이벤트가 아닌 한 줄 태그.
+ * 실측: `</buzz-event>` 다음 빈 줄, 그다음 `Note: A new message arrived while you were working. Continue …`
+ * (transcript 251건). 이걸 모르면 모양 불명으로 빠져 짧은 말 거르기를 우회했다(코디 #46 재검토).
+ */
+const TURN_TRAILER_LINE = /^(?:<\/?(?!buzz-events?\b)[a-z-]+(?:\s[^>]*)?>|Note: A new message arrived while you were working\..*)?$/;
 
 interface BuzzTurnEvent {
   channel?: string;
@@ -127,6 +133,9 @@ function parseBuzzTurn(turn: string): BuzzTurnEvent[] | null {
   const openAt = lines.findIndex((line) => /^<buzz-events?(?:\s[^>]*)?>$/.test(line.trim()));
   if (openAt < 0 || !lines.slice(0, openAt).every((line) => TURN_PREAMBLE_LINE.test(line.trim()))) return null;
   const kind = /^<(buzz-events?)/.exec(lines[openAt].trim())![1];
+  while (lines.length > openAt + 1 && lines[lines.length - 1].trim() !== `</${kind}>` && TURN_TRAILER_LINE.test(lines[lines.length - 1].trim())) {
+    lines.pop();
+  }
   if (lines[lines.length - 1].trim() !== `</${kind}>`) return null;
   const body = lines.slice(openAt + 1, -1);
   let chunks: string[][];
@@ -182,20 +191,23 @@ export interface RecallQuery {
   text: string;
   /** 버즈 봉투에서 이번 턴을 찾았으면 사람 말 글자 수(멘션·링크·이미지 뺀 것). 버즈가 아니면 없다. */
   buzzContentChars?: number;
+  /** 버즈 봉투인데 이벤트 모양을 못 읽었다 → 회상을 건너뛴다(짧은 말 거르기를 우회하지 않게). */
+  buzzUnparsed?: boolean;
 }
 
 /**
  * 훅 입력 prompt → 검색어. 감싸개를 벗기고, 버즈 봉투면 이번 턴의 채널·보낸 사람·사람 말만 쓴다
  * (저장 임베딩 buzzEmbeddingText 와 같은 모양). 예전엔 `<context>` 만 벗겨서 남은 `<thread-context>`·
  * `<buzz-event>` 머리 때문에 버즈 메시지가 전부 "wrapper" 로 건너뛰어졌다(실측 11-21: 40/40).
- * 이벤트 모양을 못 읽으면 buzzEmbeddingText 를 그대로 쓰고 길이로 거르지 않는다.
+ * 이벤트 모양을 못 읽으면 buzzUnparsed 로 표시한다 — 길이를 못 재는 글을 거르지 않고 넣으면 짧은 승인도
+ * 검색되므로(코디 #46 재검토) 넣지 않고, 로그 "buzz-unparsed" 로 모르는 모양을 찾아 고친다.
  */
 export function recallQuery(prompt: string): RecallQuery {
   const unwrapped = prompt.replace(WRAPPER_RE, " ").trimStart();
   const turn = buzzTurnText(unwrapped);
   if (turn !== null) {
     const events = parseBuzzTurn(turn);
-    if (events === null) return { text: buzzEmbeddingText(unwrapped).replace(/\s+/g, " ").trim() };
+    if (events === null) return { text: buzzEmbeddingText(unwrapped).replace(/\s+/g, " ").trim(), buzzUnparsed: true };
     const parts: string[] = [];
     let channelDone = false;
     for (const ev of events) {
@@ -226,6 +238,7 @@ export function recallSkipReason(cleaned: string, s: RecallSettings, q?: RecallQ
   if (cleaned.startsWith("/")) return "slash-command";
   if (cleaned.startsWith("<")) return "wrapper";  // 작업 알림·다른 세션 메시지 같은 기계 글
   if ([...cleaned].length < s.minPromptChars) return "short";
+  if (q?.buzzUnparsed) return "buzz-unparsed";
   if (q?.buzzContentChars !== undefined && q.buzzContentChars < s.minBuzzContentChars) return "short-buzz";
   return null;
 }
@@ -420,6 +433,14 @@ async function promptContext(input: any, client: HookClient, budgetMs: number): 
   };
 }
 
+/**
+ * SQL 로 읽을 후보 수. 예전엔 limit×4(=12). 짧은 사용자 줄 빼기가 JS 에서 돌아서 limit×12(=36)로 넓힌다 —
+ * 반복 검색이라 더 읽는 비용은 작다(11-21 실측 12개 3~4ms). 상한이 있으니 앞 36개가 전부 승인 줄이면 여전히 0개다.
+ */
+export function recallCandidatePool(s: RecallSettings): number {
+  return s.limit * 12;
+}
+
 /** pg.Client · pg.PoolClient 둘 다 (검사는 일회용 DB 의 pg.Client 를 넘긴다). */
 export interface RecallDbClient {
   query(text: string, params?: unknown[]): Promise<{ rows: any[] }>;
@@ -433,6 +454,8 @@ export interface RecallDbClient {
  * 상위 3 이 정확 검색과 평균 2.95/3 일치, 3~4ms — 정확 검색은 209ms).
  * 0.8 미만이면 설정이 실패하거나 무시된다 → 저장점으로 되돌리고 예전처럼 돈다(scan "plain").
  * relaxed_order 는 순서가 조금 섞일 수 있어 유사도로 다시 정렬한다.
+ * 몇 개를 읽을지는 recallCandidatePool — 짧은 사용자 줄 빼기(pickRecallRows)가 SQL 뒤에 돌아서,
+ * 넉넉히 읽지 않으면 앞쪽이 다 승인 줄일 때 뒤의 쓸 만한 줄을 못 채운다(코디 #46 재검토).
  */
 export async function fetchRecallCandidates(
   c: RecallDbClient,
@@ -464,7 +487,7 @@ export async function fetchRecallCandidates(
           AND left(ltrim(m.message), 1) <> '<'
         ORDER BY m.embedding <=> $2::halfvec
         LIMIT $5`,
-      [userId, vecSql, Math.floor(s.recentMinutes), Math.floor(s.minMemoryChars), s.limit * 4],
+      [userId, vecSql, Math.floor(s.recentMinutes), Math.floor(s.minMemoryChars), recallCandidatePool(s)],
     );
     if (scan === "iterative") {
       // 설정 이름을 모르는 pgvector 는 자리표시자로 받아 두고 라이브러리를 읽을 때 버린다 → 실제 값으로 확인
@@ -494,7 +517,7 @@ async function recallContext(input: any, client: HookClient): Promise<{ context:
   if (clientSkip) return { context: "", info: { skipped: clientSkip } };
   const q = recallQuery(raw);
   // 글자 수만 남긴다(말 내용은 로그에 안 남김)
-  const buzzInfo = q.buzzContentChars !== undefined ? { buzz: true, buzzChars: q.buzzContentChars } : {};
+  const buzzInfo = q.buzzContentChars !== undefined ? { buzz: true, buzzChars: q.buzzContentChars } : q.buzzUnparsed ? { buzz: true } : {};
   const skip = recallSkipReason(q.text, s, q);
   if (skip) return { context: "", info: { skipped: skip, ...buzzInfo } };
 

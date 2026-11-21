@@ -130,8 +130,19 @@ assert.equal(recallQuery("메타 수집기 요청 제한 어떻게 됐어?").buz
   assert.equal(aq.text, `mcp-agents-memory Isaac ${LONG}`);
   assert.equal(aq.buzzContentChars, [..."몰타르 훅은 버즈 메시지에도 회상이 붙어야 하는 거 맞지?"].length, "안내 블록이 앞에 있어도 이벤트를 읽는다");
   // 모르는 턴 모양(자유 서술 블록)은 예전처럼 buzzEmbeddingText 를 쓰고 길이로 거르지 않는다
+  // 닫는 태그 뒤 작업 중 새 메시지 안내(실측 transcript 251건 모양) — 이벤트를 읽고 짧은 말은 거른다 (코디 #46 재검토)
+  const NOTE = "Note: A new message arrived while you were working. Continue your in-progress work and incorporate the new message if it's relevant; if it's unrelated, you may briefly acknowledge it and carry on.";
+  const nq = recallQuery([ctx, `${event("@Kuu at Mortar 응 그래~")}\n\n${NOTE}`].join("\n"));
+  assert.equal(nq.buzzUnparsed, undefined, "Note 꼬리가 있어도 이벤트 모양을 읽는다");
+  assert.equal(recallSkipReason(nq.text, S, nq), "short-buzz", "Note 꼬리로 짧은 말 거르기를 우회하지 않는다");
+  const nl = recallQuery([ctx, `${event(LONG)}\n\n${NOTE}\n`].join("\n"));
+  assert.equal(nl.text, `mcp-agents-memory Isaac ${LONG}`, "Note 는 검색어에 안 들어간다");
+  // 모르는 턴 모양(자유 서술 블록, 닫는 태그 뒤 모르는 글)은 넣지 않는다 — 길이를 못 재면 짧은 승인도 검색되므로
   const free = recallQuery(`${ctx}\n<what-you-were-working-on>\n코디 리뷰 기다리는 중이었다\n</what-you-were-working-on>`);
-  assert.equal(free.buzzContentChars, undefined);
+  assert.equal(free.buzzUnparsed, true);
+  assert.equal(recallSkipReason(free.text, S, free), "buzz-unparsed");
+  const junkTail = recallQuery([ctx, `${event(LONG)}\n모르는 꼬리 글`].join("\n"));
+  assert.equal(recallSkipReason(junkTail.text, S, junkTail), "buzz-unparsed");
 }
 
 // ── 1c. 로그의 세션 표식 ──

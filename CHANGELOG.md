@@ -18,9 +18,12 @@ message was skipped as `wrapper` (40/40, confirmed with the installed binary).
   `Parsed:` / `Content:` log lines and quoted `--- Event n ---` lines inside a
   message stay part of it (Codi's review of the first draft: a 100-character
   XML question was counted as 14). The DM `Tags:` line, which has no 64-hex id
-  and so is left in place by `buzzEmbeddingText`, is dropped as the tail. An
-  event shape it cannot read falls back to `buzzEmbeddingText` without the
-  length gate. New `buzzTurnText` export finds the turn block.
+  and so is left in place by `buzzEmbeddingText`, is dropped as the tail. The
+  "new message arrived while you were working" note that buzz-acp adds before
+  or after the event is accepted. A Buzz turn whose event shape it cannot read
+  is skipped as `buzz-unparsed` rather than searched unfiltered, so unknown
+  shapes show up in the log instead of letting short messages through. New
+  `buzzTurnText` export finds the turn block.
 - Short Buzz messages are skipped (`short-buzz`) when the message text minus
   mentions, links and images is under 20 characters
   (`MEMORY_RECALL_MIN_BUZZ_CHARS`). A bare "@Kuu at Mortar" matched unrelated
@@ -29,7 +32,10 @@ message was skipped as `wrapper` (40/40, confirmed with the installed binary).
   13 → 5; blind sample, 0.60: useful 8 → 4).
 - Short user rows are not attached (`MEMORY_RECALL_MIN_USER_MEMORY_CHARS`,
   40): a user row whose body, without the `[name]` prefix, mentions, links and
-  images, is shorter is skipped and the next candidate takes its place. These
+  images, is shorter is skipped and the next candidate takes its place. Because
+  this runs after the SQL query, the query now reads `limit × 12` candidates
+  (36) instead of `limit × 4` (12); otherwise twelve approvals in front left
+  nothing to pick. These
   are mostly old approvals such as "응 진행해 보자~" for some other task. In a
   blind grading by Codi (a fresh 40 messages, 118 rows, graded without
   similarity) 33 of the 35 rows marked possibly harmful were user rows.
@@ -60,8 +66,10 @@ message was skipped as `wrapper` (40/40, confirmed with the installed binary).
   and a negative control reproducing the old `wrapper` skip. New `check:hook-recall`
   (optional, `CHECK_RECALL_DATABASE_URL` + sentinel table) builds a starved
   index in a throwaway pgvector database: the old query finds 0 of 6 rows that
-  pass the filters, `fetchRecallCandidates` finds all 6. Twelve mutations (each
-  fix reverted on its own) all fail a check.
+  pass the filters, `fetchRecallCandidates` finds all 6; with twelve short
+  approvals in front of three real rows, the old 12-row window picks 0 and the
+  wider pool picks the 3. Fifteen mutations (each fix reverted on its own) all
+  fail a check.
 
 ## 0.9.40 — 2026-11-21
 

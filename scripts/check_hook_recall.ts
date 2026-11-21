@@ -13,7 +13,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fetchRecallCandidates, type RecallSettings } from "../src/hooks.js";
+import { fetchRecallCandidates, pickRecallRows, type RecallSettings } from "../src/hooks.js";
 
 const dbUrl = process.env.CHECK_RECALL_DATABASE_URL;
 if (!dbUrl) {
@@ -54,6 +54,10 @@ try {
   const pgv = (await client.query(`SELECT extversion FROM pg_extension WHERE extname = 'vector'`)).rows[0]?.extversion;
   await client.query(`INSERT INTO users (user_name) SELECT 'recallcheck' WHERE NOT EXISTS (SELECT 1 FROM users)`);
   const userId = Number((await client.query(`SELECT user_id FROM users ORDER BY user_id LIMIT 1`)).rows[0].user_id);
+  // 지난 실행이 남긴 줄을 지우고 VACUUM — 지운 줄이 HNSW 그래프에 남아 있으면 새로 넣은 합성 줄에 닿지 못해
+  // 결과가 실행마다 달라진다(같은 코드로 첫 실행 6/6 → 다음 실행 1/6 을 봤다)
+  await client.query(`DELETE FROM memory WHERE external_uuid LIKE 'recallcheck:%'`);
+  await client.query("VACUUM memory");
 
   // 가장 가까운 20줄: `<context>` 로 시작 (코사인 0.995) → 훅 쿼리가 거른다
   // 남는 6줄: 사람 말 (코사인 0.970 … 0.965) — 21~26번째로 가깝다. ef_search 를 10 으로 낮춰
@@ -111,8 +115,29 @@ try {
   // 트랜잭션이 깨끗이 끝났다 (SET LOCAL 이 연결에 안 남는다)
   assert.equal((await client.query(`SELECT current_setting('hnsw.iterative_scan', true) AS v`)).rows[0].v === "relaxed_order", false,
     "반복 검색 설정은 그 트랜잭션에서만");
-  console.log(`hook recall db checks passed (pgvector ${pgv}, old ${old.rows.length} → new ${got.rows.length}, scan ${got.scan})`);
+  // ── 2. 짧은 사용자 줄 빼기가 SQL 뒤에 돌아도 뒤의 쓸 만한 줄을 채운다 (코디 #46 재검토 재현) ──
+  // 가장 가까운 12줄: 본문이 짧은 옛 승인(사용자 줄) · 그다음 3줄: 긴 기록. 예전 후보 폭(limit×4=12)이면 0개.
+  await client.query(`DELETE FROM memory WHERE external_uuid LIKE $1`, [`${TAG}:%`]);
+  await client.query("VACUUM memory"); // 지운 줄을 HNSW 그래프에서도 걷어낸다
+  const valid: number[] = [];
+  for (let i = 0; i < 12; i++) {
+    await client.query(ins, [userId, "user", `[Isaac] @Kuu at Mortar @Merr at MacPro2013 응 진행해 보자~ ${i}`, vec(0.995, 300 + i), `${TAG}:approve:${i}`]);
+    if (i % 4 === 1 && valid.length < 3) {
+      const k = valid.length;
+      const r = await client.query(ins, [userId, k === 0 ? "user" : "assistant", `[Isaac] @Kuu at Mortar 수집기 요청 제한은 IP 기준이라 폰 IP 로 바꾸면 통과했어 — 기록 ${k}`, vec(0.97 - k * 0.001, 400 + k), `${TAG}:valid:${k}`]);
+      valid.push(Number(r.rows[0].id));
+    }
+  }
+  await client.query("ANALYZE memory");
+  const pool = await fetchRecallCandidates(client, userId, q, S);
+  const oldPick = pickRecallRows(pool.rows.slice(0, S.limit * 4), S);
+  assert.equal(oldPick.length, 0, `음성대조: 앞 12개만 보면 승인 줄만 있어 0개 (got ${oldPick.map((r) => r.id)})`);
+  const picked2 = pickRecallRows(pool.rows, S);
+  assert.deepEqual(picked2.map((r) => r.id).sort((a, b) => a - b), [...valid].sort((a, b) => a - b),
+    `넓힌 후보에서 긴 기록 3줄을 채운다 (후보 ${pool.rows.length}, scan ${pool.scan})`);
+  console.log(`hook recall db checks passed (pgvector ${pgv}, old ${old.rows.length} → new ${got.rows.length}, scan ${got.scan}; approvals-first pool ${pool.rows.length} → picked ${picked2.length}, old window 0)`);
 } finally {
   await client.query(`DELETE FROM memory WHERE external_uuid LIKE $1`, [`${TAG}:%`]).catch(() => {});
+  await client.query("VACUUM memory").catch(() => {});
   await client.end();
 }
