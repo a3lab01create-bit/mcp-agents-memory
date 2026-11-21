@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.9.40 — 2026-11-21
+
+### A failed folder watch no longer takes the memory server down
+
+On 2026-11-21 at 08:22 every memory server on Mortar exited at once, and since
+Claude Code does not restart a dead stdio server, no Claude conversation there
+was saved for hours (found by the capture check below on its first real run).
+Each server watches the Grok, Codex and Antigravity session folders
+recursively; on Linux that costs inotify watches for every folder (about 6,800
+per server on Mortar, against a per-user limit of 65,536). When the limit was
+full and a new session folder appeared, Node could not add the watch and
+emitted `error` on the watcher. Four of the five capture watchers had no
+`error` listener, so Node threw and the process died. Reproduced in a
+container under a separate uid: without a listener the process exits 1 with
+"Unhandled 'error' event" (ENOSPC); with one it keeps running.
+
+- New `guardWatcher` (`src/auto_save/watch_guard.ts`) adds an `error` listener
+  that closes only that watcher and reports it once. The Grok, Codex,
+  Antigravity and Gemini captures use it; each already polls every 3 s beside
+  its watcher, so capture continues. The Claude capture already had a listener.
+- `check:watch-guard`: the helper (with a negative control showing that a bare
+  watcher throws), and the real built server with all three recursive
+  watchers armed, then an unreadable folder created under each root (EACCES
+  takes the same `error` path as ENOSPC). The server must stay up and log the
+  closed watchers; with the previous capture modules it dies.
+- Not changed yet: how many watches each server uses.
+
+### Hooked Claude Code sessions warn when the conversation is not being saved
+
+0.9.39 stopped hooked Claude Code sessions from calling `memory_startup` at the
+start, so they no longer saw its "this session is not being captured" warning.
+Only the server knows its capture state, and the hook runs outside it, so the
+hook checks the result instead.
+
+- Once per session, `hook prompt --client claude` reads the end of the session
+  file (`transcript_path`), keeps the lines `jsonl_capture.parseEntry` would
+  store that are 60 s to 30 min old (resumed sessions may contain old parts
+  that earlier capture gaps missed), and looks up their `external_uuid`s
+  (`claude-code:<session>:<line uuid>`).
+- One hit means the session is fine. With no hit, lines whose role and text
+  are already stored for the same session are set aside: the capture stores
+  each text once per session, so a question re-recorded under a new uuid is
+  expected to be absent (review by Codi). If at least two lines with different
+  text remain, the session is not being saved, and the hook adds a warning,
+  placed before the recall text so the length cap never cuts it, asking the
+  model to tell the user once and naming the `backfill-claude` command for
+  that file. One line, only re-recorded text, unreadable or non-regular files
+  (opened without blocking, so a FIFO cannot stall the hook), a missing path
+  or database errors decide nothing; the next message tries again.
+- The verdict is written to
+  `~/.local/state/mcp-agents-memory/capture-check/<session>.capture-check.json`
+  (mode 600) just before the hook prints, so a timed-out warning is retried.
+  It is only ever created, never opened if something is already there
+  (`O_CREAT|O_EXCL`, no symlink following, non-blocking): a symlink, FIFO or
+  foreign file in its place is left alone, the warning still goes out, and
+  the log notes `markerError` (review by Codi).
+  Later messages see the file and skip the database entirely. Pruning after
+  two weeks removes only files with that name pattern and our own tag inside,
+  never anything else in the folder (review by Codi). Short replies still skip
+  the database unless a check is pending.
+- Recall and the check run side by side, each with its own time budget just
+  under the hook deadline, and settle separately: a failed or slow recall
+  (no embedding key, an embedding server that does not answer) still lets a
+  finished warning through (review by Codi).
+- Codex and Antigravity are not checked. `MEMORY_CAPTURE_CHECK=0` turns it off.
+- `check:hook-capture`: line selection, verdicts, marker files, the process
+  contract without a database, and, with `CHECK_CAPTURE_DATABASE_URL` pointing
+  at a throwaway database (the `__disposable_test_db__` sentinel table is
+  required), the warning, the once-per-session marker, re-recorded text, a
+  slow recall, and positive controls filled by the real `backfill-claude`
+  code. Reverting each review fix makes the check fail.
+- Found on first real use: the Mortar outage described above.
+
 ## 0.9.39 — 2026-11-21
 
 ### The start brief no longer arrives two or three times in Claude Code

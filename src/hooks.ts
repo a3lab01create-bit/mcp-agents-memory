@@ -4,6 +4,7 @@
  * - session-start (SessionStart): 시작 브리핑 전문을 대화 맨 앞에 넣는다. MCP instructions 칸은
  *   클라이언트가 ~2KB 에서 자르지만, 훅 출력은 10,000자까지 들어간다(Claude Code 문서).
  * - prompt (UserPromptSubmit): 사용자가 말할 때마다 비슷한 지난 기록 몇 줄을 찾아 맥락으로 넣는다.
+ *   클로드는 세션마다 한 번, 앞선 대화가 DB 에 들어갔는지도 확인한다(hook_capture_check.ts) — 안 들어갔으면 경고.
  *
  * 계약 (훅이 사용자의 말을 막거나 대화를 더럽히면 안 된다):
  * - 어떤 경우에도 exit 0. UserPromptSubmit 에서 exit 2 는 사용자의 말을 막는다.
@@ -24,6 +25,7 @@ import { collectBrief, formatBriefMarkdown } from "./briefing.js";
 import { embedMessage, vectorToHalfvecSql } from "./cold_path/embedder.js";
 import { buzzDisplayText } from "./auto_save/buzz_envelope.js";
 import { getDefaultUserId } from "./users.js";
+import { captureCheckContext } from "./hook_capture_check.js";
 
 /** Claude Code 가 훅 문자열 하나에 받는 최대치는 10,000자. 넘으면 2,000자 미리보기만 간다 → 여유를 둔다. */
 export const HOOK_CONTEXT_MAX_CHARS = 9500;
@@ -188,7 +190,7 @@ function clientPlatform(client: HookClient): string | null {
   return hookPlatform();
 }
 
-async function sessionStartContext(client: HookClient): Promise<{ context: string; info: Record<string, unknown> }> {
+async function sessionStartContext(client: HookClient): Promise<HookContextResult> {
   await db.connect();
   const max = clientMaxChars(client);
   const brief = await collectBrief({ currentPlatform: clientPlatform(client) });
@@ -203,7 +205,52 @@ async function sessionStartContext(client: HookClient): Promise<{ context: strin
   return { context, info: { mode, chars: context.length } };
 }
 
-async function promptContext(input: any, client: HookClient): Promise<{ context: string; info: Record<string, unknown> }> {
+interface HookContextResult {
+  context: string;
+  info: Record<string, unknown>;
+  /** 출력을 내보내기 직전에 부른다 (수집 확인 판정 남기기). */
+  commit?: () => void;
+}
+
+function errText(err: unknown): string {
+  return (err instanceof Error ? err.message : String(err)).slice(0, 200);
+}
+
+/** 시간 넘김 표시 — 로그에서 outcome "timeout" 으로 남긴다. */
+class HookTimeout extends Error {}
+
+/** p 가 ms 안에 안 끝나면 HookTimeout 으로 끝낸다(p 자체는 계속 돌지만 결과는 버린다). */
+function withBudget<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new HookTimeout(`${label} timeout`)), Math.max(0, ms));
+    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
+/**
+ * UserPromptSubmit: 비슷한 지난 기록(recall) + 수집 확인(클로드만, 세션마다 한 번)을 같이 돌린다.
+ * 서로 따로 끝낸다 — 한쪽이 실패하거나 늦어도 다른 쪽 글은 나간다(각자 budgetMs 안에서만 기다린다,
+ * 코디 리뷰 #45-2). 수집 경고를 앞에 둬서 길이 상한에 안 잘린다.
+ */
+async function promptContext(input: any, client: HookClient, budgetMs: number): Promise<HookContextResult> {
+  const [recall, capture] = await Promise.allSettled([
+    withBudget(recallContext(input, client), budgetMs, "recall"),
+    withBudget(captureCheckContext(input, client), budgetMs, "capture"),
+  ]);
+  const warning = capture.status === "fulfilled" ? capture.value.context : "";
+  if (recall.status === "rejected" && !warning) throw recall.reason;
+  const recallText = recall.status === "fulfilled" ? recall.value.context : "";
+  return {
+    context: capContext([warning, recallText].filter(Boolean).join("\n\n"), clientMaxChars(client)),
+    info: {
+      ...(recall.status === "fulfilled" ? recall.value.info : { recallError: errText(recall.reason) }),
+      ...(capture.status === "fulfilled" ? capture.value.info : { capture: "error", captureError: errText(capture.reason) }),
+    },
+    commit: capture.status === "fulfilled" ? capture.value.commit : undefined,
+  };
+}
+
+async function recallContext(input: any, client: HookClient): Promise<{ context: string; info: Record<string, unknown> }> {
   const s = recallSettings();
   const { text: raw, skip: clientSkip } = hookPromptText(client, input);
   if (clientSkip) return { context: "", info: { skipped: clientSkip } };
@@ -401,14 +448,18 @@ export async function runHookCli(sub: string | undefined, args: readonly string[
     const rawIn = await readStdin();
     let input: any = {};
     try { input = rawIn.trim() ? JSON.parse(rawIn) : {}; } catch { input = {}; }
-    const { context, info } = event === "session-start"
+    // 각 작업은 전체 deadline 보다 조금 먼저 끊어서, 끝난 쪽 결과를 내보낼 시간을 남긴다
+    const margin = Math.min(300, Math.floor(deadlineMs / 4));
+    const { context, info, commit } = event === "session-start"
       ? await sessionStartContext(client)
-      : await promptContext(input, client);
+      : await promptContext(input, client, deadlineMs - margin - (Date.now() - started));
     const out = formatHookOutput(client, event, context);
-    logLine({ event: logEvent, client, outcome: context ? "injected" : "none", ms: Date.now() - started, source: input?.source, ...info });
+    let markerError: string | undefined;
+    try { commit?.(); } catch (e) { markerError = errText(e); /* 표시를 못 남기면 다음 말에서 다시 확인할 뿐 */ }
+    logLine({ event: logEvent, client, outcome: context ? "injected" : "none", ms: Date.now() - started, source: input?.source, ...info, ...(markerError ? { markerError } : {}) });
     finish(out);
   } catch (err) {
-    logLine({ event: logEvent, client, outcome: "error", ms: Date.now() - started, error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200) });
+    logLine({ event: logEvent, client, outcome: err instanceof HookTimeout ? "timeout" : "error", ms: Date.now() - started, error: errText(err) });
     exitQuiet(client);
   }
 }

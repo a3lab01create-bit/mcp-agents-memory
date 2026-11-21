@@ -33,6 +33,7 @@ import * as os from "node:os";
 import { insertRawMemory } from "../hot_path.js";
 import { getDefaultUserId } from "../users.js";
 import { buzzTurnVenue } from "./venue.js";
+import { guardWatcher } from "./watch_guard.js";
 
 const DEVICE_NAME = os.hostname();
 const SESSIONS_ROOT = path.join(os.homedir(), ".grok", "sessions");
@@ -347,11 +348,12 @@ function armDirWatcher(): void {
   if (!_state || !_state.rootExists) return;
   if (_watcher) return;
   try {
-    _watcher = fs.watch(SESSIONS_ROOT, { recursive: true }, (_evt, filename) => {
+    const w = fs.watch(SESSIONS_ROOT, { recursive: true }, (_evt, filename) => {
       if (!filename) return;
       if (path.basename(filename) !== CHAT_FILE) return;
       scheduleFlush();
     });
+    _watcher = guardWatcher(w, "Grok", () => { if (_watcher === w) _watcher = null; });
     console.error(`📝 [Grok] dir watcher armed (recursive)`);
   } catch (err) {
     console.error("⚠️ [Grok] fs.watch failed — polling only:", err);
