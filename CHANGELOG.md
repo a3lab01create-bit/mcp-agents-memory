@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+### Import Claude app conversations from a data export
+
+Claude app chats (claude.ai web, the desktop app's chat tab, mobile) leave no
+transcript on the machine, so live capture never sees them. Only rows the model
+chose to save through a tool reached the database: 7 in five weeks, all without
+`external_uuid`, five of them pinned notes (checked 2026-11-22).
+
+- New `import-claude-export [--dry-run] <conversations.json> [...]` stores each
+  message of an export's `conversations.json` (unzip `conversations-000.zip`
+  first; a `.zip` path is refused with that hint).
+- Text comes from the `text` parts of `content` only, joined with one newline
+  like the Claude Code capture. Thinking, tool use, tool results and images are
+  dropped. The flat `text` field is not used: it puts the placeholder "This
+  block is not supported on your current device yet." where tool blocks were
+  (3 of 26 messages in a real export). It is the fallback only when `content`
+  is missing, with the placeholder removed.
+- Rows: `agent_platform` `claude-export` (a collection path, like `buzz`; the
+  export does not say whether a chat was on web, desktop or mobile), `venue`
+  `terminal` (migration 029: one person, one-to-one), `device_name` NULL,
+  `agent_model` `unknown` for replies, `created_at` = the message's own time.
+  `external_uuid` `claude-export:<conversation>:<message>` makes re-runs safe.
+- Before writing, the command prints the target database as host:port/name
+  (never the password), resolved the way the connection is actually made: with
+  `SSH_ENABLED=true` it is `DB_HOST` behind the tunnel, otherwise pg's own
+  parser reads the config, so `?host=…&port=…` in the URL and `PG*` defaults
+  count (Codi's review: the first draft printed the URL's front host while the
+  rows went to the query host). `--dry-run` only parses and counts and does not
+  open the database.
+- An export only holds conversations still in the account. A real export's
+  artifacts (`frames-000.zip`) came from 2026-11-16 chats that were no longer in
+  `conversations.json`.
+- `npm run check:claude-export`: synthetic fixture (real export shape, no real
+  conversations), process checks without a database, and an optional
+  disposable-database run (`CHECK_EXPORT_DATABASE_URL`, sentinel table
+  required) that imports twice and expects the second run to skip everything.
+
 ## 0.9.41 — 2026-11-21
 
 ### Prompt recall now works for Buzz messages
