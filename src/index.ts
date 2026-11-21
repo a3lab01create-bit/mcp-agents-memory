@@ -251,6 +251,14 @@ Usage:
                                     stored are skipped by their external_uuid, so re-running is safe. Rows keep the line's
                                     own timestamp as created_at and this machine's hostname as device_name — run it on the
                                     machine that holds the files. --dry-run only counts parsable lines.
+  mcp-agents-memory import-claude-export [--dry-run] <conversations.json> [...]
+                                    Store Claude app conversations (claude.ai web, desktop chat, mobile) from a data export
+                                    (Settings → Privacy → Export data; unzip conversations-000.zip first). Only text is kept —
+                                    thinking and tool blocks are dropped, as in the live Claude Code capture. Rows get
+                                    agent_platform "claude-export", venue "terminal", no device_name, and the message's own
+                                    time as created_at; external_uuid claude-export:<conversation>:<message> makes re-runs
+                                    safe. The export only holds conversations still in the account (deleted chats are gone).
+                                    Prints the target database before writing. --dry-run only parses and counts.
   mcp-agents-memory hook install [--client claude|codex|agy|grok] [--yes] [--dry-run]
                                     Optional user-level hook setup. See hook install --help for settings homes.
 
@@ -488,6 +496,44 @@ async function cli() {
     }
     if (!dryRun) await db.close();
     if (failed > 0) console.error(`❌ backfill-claude: ${failed} line(s) failed to insert — see errors above; re-run after fixing (stored lines are skipped).`);
+    process.exit(failed > 0 ? 1 : 0);
+  }
+
+  if (cmd === "import-claude-export") {
+    // 클로드 앱 내보내기(conversations.json) 넣기 — 메시지마다 external_uuid 로 중복 건너뜀
+    const args = process.argv.slice(3);
+    const dryRun = args.includes("--dry-run");
+    const files = args.filter((a) => a !== "--dry-run");
+    const isFile = (f: string) => { try { return fs.statSync(f).isFile(); } catch { return false; } };
+    const zips = files.filter((f) => f.toLowerCase().endsWith(".zip"));
+    const bad = files.filter((f) => !f.toLowerCase().endsWith(".json") || !isFile(f));
+    if (files.length === 0 || zips.length > 0 || bad.length > 0) {
+      console.error(files.length === 0
+        ? "❌ import-claude-export: conversations.json 경로를 하나 이상 주세요."
+        : zips.length > 0
+          ? `❌ import-claude-export: 압축을 먼저 풀고 안의 conversations.json 을 주세요: ${zips.join(", ")}`
+          : `❌ import-claude-export: 없는 파일이거나 .json 파일이 아닙니다: ${bad.join(", ")}`);
+      process.exit(1);
+    }
+    const { importClaudeExportFile, describeDbTarget } = await import("./auto_save/claude_export.js");
+    if (!dryRun) {
+      // 넣기 전에 어느 DB 인지 먼저 보인다 (비밀번호는 안 찍는다)
+      console.error(`📝 import-claude-export: DB = ${describeDbTarget()}`);
+      await db.connect();
+    }
+    let failed = 0;
+    for (const f of files) {
+      try {
+        const r = await importClaudeExportFile(path.resolve(f), { dryRun });
+        failed += r.failed;
+        console.log(JSON.stringify({ dryRun, ...r }));
+      } catch (err) {
+        failed++;
+        console.error(`❌ import-claude-export: ${f}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (!dryRun) await db.close();
+    if (failed > 0) console.error(`❌ import-claude-export: ${failed} failure(s) — see errors above; re-run after fixing (stored messages are skipped).`);
     process.exit(failed > 0 ? 1 : 0);
   }
 
