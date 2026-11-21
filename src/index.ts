@@ -4,6 +4,8 @@
 import { db } from "./db.js";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { InitializeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { claudeSessionHookInstalled, hookedInstructionsFrom } from "./hook_presence.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerTools } from "./tools.js";
 import { startColdPathWorker, stopColdPathWorker, drainColdPath } from "./cold_path/worker.js";
@@ -294,6 +296,32 @@ Required settings:
   XAI_API_KEY=...                                                  (Cold Path tagger/librarian — grok-4-1-fast-non-reasoning default)`);
 }
 
+/**
+ * 클로드 코드에 우리 SessionStart 훅이 깔려 있으면 instructions 에서 압축 브리핑과 "memory_startup 호출" 안내를 뺀다
+ * (훅이 전문을 넣으므로 겹침 — src/hook_presence.ts). clientInfo 는 initialize 요청에서야 알 수 있어서
+ * initialize 처리기를 감싸고, 원래 처리기(_oninitialize: clientInfo 기록·응답 생성)에 그대로 넘긴다.
+ * 비공개 SDK 구현에 기대므로 메서드가 없거나 무엇이든 실패하면 기본 instructions 그대로 둔다.
+ */
+function applyHookAwareInstructions(server: McpServer, hooked: string | null): void {
+  const inner = server.server as any;
+  if (!hooked || typeof inner?._oninitialize !== "function" || typeof inner?.setRequestHandler !== "function") return;
+  try {
+    inner.setRequestHandler(InitializeRequestSchema, async (request: any) => {
+      try {
+        if (request?.params?.clientInfo?.name === "claude-code" && claudeSessionHookInstalled()) {
+          inner._instructions = hooked;
+          console.error("📝 [instructions] SessionStart 훅이 있는 클로드 코드 — 압축 브리핑 없이 보냄");
+        }
+      } catch {
+        // 판단 실패 → 기본 instructions 유지
+      }
+      return inner._oninitialize(request);
+    });
+  } catch (err) {
+    console.error("⚠️ [instructions] initialize 감싸기 실패 — 기본 instructions 유지:", err instanceof Error ? err.message : err);
+  }
+}
+
 async function runMcpServer() {
   // OpenCode capture는 instructions의 자동 저장 목록을 좌우하므로 buildInstructions보다 먼저 arm.
   // (opencode.db 없는 기기는 existsSync 한 번으로 즉시 no-op)
@@ -315,6 +343,8 @@ async function runMcpServer() {
     console.error("🚀 Memory server starting connection...");
     return originalConnect(transport);
   };
+
+  applyHookAwareInstructions(server, hookedInstructionsFrom(staticInstructions()));
 
   registerTools(server);
 

@@ -199,7 +199,7 @@ async function sessionStartContext(client: HookClient): Promise<{ context: strin
     md = formatBriefMarkdown(brief, { mode: "inject", maxChars: Math.max(0, max - 200) });
     mode = "inject";
   }
-  const context = capContext(`mcp-agents-memory 시작 브리핑 (지난 대화 기록에서 자동으로 모은 것)\n\n${md}`, max);
+  const context = capContext(`mcp-agents-memory 시작 브리핑 (지난 대화 기록에서 자동으로 모은 것)\n이 글은 memory_startup 도구가 돌려주는 것과 같은 브리핑을 이번 세션 시작 때 만든 것이다. 같은 내용을 위해 memory_startup 을 다시 부를 필요는 없다.\n\n${md}`, max);
   return { context, info: { mode, chars: context.length } };
 }
 
