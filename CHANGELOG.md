@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.9.39 — 2026-11-21
+
+### The start brief no longer arrives two or three times in Claude Code
+
+With the SessionStart hook installed, a Claude Code session received the full
+brief from the hook, a second, compressed copy in the MCP `instructions` field,
+and an instruction to call `memory_startup` at session start, which would bring
+a third copy (reported by a Claude Code session on the Mac Studio: four pinned
+memories appeared in both places).
+
+- The hook's brief now says it is the same brief `memory_startup` returns, made
+  at session start, so the model need not call the tool for it. This applies to
+  every hook client.
+- When the connecting client reports itself as exactly `claude-code` and the
+  user's Claude settings (`~/.claude/settings.json`, `CLAUDE_CONFIG_DIR`
+  respected) contain our SessionStart hook, the server sends instructions
+  without the compressed brief, and the start line becomes conditional: call
+  `memory_startup` once only if no "mcp-agents-memory 시작 브리핑" text is at the
+  top. That fallback covers sessions whose hooks the settings file cannot show
+  (`--settings`, project hooks, SDK sessions). The check counts only a command
+  in our exact generated form (0.9.37/0.9.38 `print-config` or the installer)
+  in a `SessionStart` group that also runs on a new session (no matcher, `*`,
+  or a `|`-list containing `startup`), and treats `disableAllHooks` in
+  `settings.json` or `settings.local.json` as no hook. Anything uncertain keeps
+  the full instructions (review by Codi: an unrelated `echo hook session-start`,
+  `disableAllHooks` and a `resume`-only matcher had dropped the brief).
+- Codex, the desktop app (`local-agent-mode…`) and Antigravity keep the full
+  instructions: right after installation Codex hooks wait for `/hooks` trust,
+  and the other two have not yet been checked end to end. `MEMORY_HOOKS_OFF=1`
+  also keeps the full instructions.
+
+The client name is only known in the `initialize` request, so the server wraps
+the SDK's initialize handler and hands the request to the original
+`_oninitialize`, which still records the client info. If that internal method
+is missing or anything fails, the default instructions are used.
+`check:instructions-dedup` starts the built server with a fake home and checks
+all five cases plus `tools/list` after the handshake, so an SDK upgrade that
+breaks the wrapper is caught.
+
 ## 0.9.38 — 2026-11-21
 
 ### Memory hooks for Codex and Antigravity, and an opt-in installer
