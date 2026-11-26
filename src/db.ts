@@ -211,16 +211,34 @@ export class DatabaseManager {
     const conn = new SshClient();
     let dead = false;
     await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => {
+      let settled = false;
+      const detach = () => {
         conn.removeListener('ready', onReady);
+        conn.removeListener('error', onError);
+        conn.removeListener('close', onClose);
+      };
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        detach();
         conn.on('error', () => { /* 실패한 연결의 뒤늦은 오류 — 받을 곳이 없으면 프로세스가 죽는다 */ });
-        conn.end();
+        try { conn.end(); } catch { /* 이미 닫힘 */ }
         reject(hostKeyRejected
           ? new Error(`SSH host key does not match SSH_HOST_FINGERPRINT — refusing to connect to ${process.env.SSH_HOST}`)
           : err);
       };
-      const onReady = () => { conn.removeListener('error', onError); resolve(); };
-      conn.once('error', onError);
+      const onError = (err: Error) => fail(err);
+      // ready 전에 서버가 정상 종료하면(인증 중 끊김 등) 'error' 없이 'close' 만 온다 — 여기서 끝내야
+      // 기다림이 영영 안 끝나 다음 요청도 막히는 일이 없다(코디 #48 리뷰)
+      const onClose = () => fail(new Error('SSH connection closed before it was ready'));
+      const onReady = () => {
+        if (settled) return;
+        settled = true;
+        detach();
+        resolve();
+      };
+      conn.on('error', onError);
+      conn.once('close', onClose);
       conn.once('ready', onReady);
       try {
         conn.connect({
@@ -236,10 +254,7 @@ export class DatabaseManager {
             : {}),
         } as any);
       } catch (err) {
-        conn.removeListener('ready', onReady);
-        conn.removeListener('error', onError);
-        conn.on('error', () => { /* 위와 같은 이유 */ });
-        reject(err);
+        fail(err instanceof Error ? err : new Error(String(err)));
       }
     });
 

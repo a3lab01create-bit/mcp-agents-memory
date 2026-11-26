@@ -26,14 +26,18 @@ Claude Desktop keeps the server running for hours.
   server's host key. ssh2 accepts any host key when no verifier is given, so
   until now the server's identity was never checked. A mismatch refuses the
   connection with a clear error; an unset value prints a warning once.
+- If the server closes the connection before it is ready (for example during
+  authentication), the wait now ends with "SSH connection closed before it was
+  ready" and the next call tries again. Before, the wait never ended and every
+  later call waited on it (Codi's review; the same on 0.9.41).
 - Both pools log idle-client errors instead of crashing, and clients handed out
   by `getClient()` get an error listener, so a connection dying mid-use no
   longer kills the process.
 - `npm run check:ssh-tunnel` (needs `CHECK_TUNNEL_DATABASE_URL`): an in-process
   SSH server and a freezable relay. The previous code fails five cases (clean
   close, the incident's order, a checked-out client, a silent stall, a wrong
-  fingerprint); this one passes those and a database-side disconnect of idle
-  connections.
+  fingerprint); this one passes those, a database-side disconnect of idle
+  connections, and a server that closes during authentication.
 
 ### Import Claude app conversations from a data export
 

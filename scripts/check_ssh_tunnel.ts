@@ -13,6 +13,7 @@
  *     풀린 뒤 다시 붙는다.
  *  4. 서버 지문(SSH_HOST_FINGERPRINT): 틀리면 붙지 않고, 맞으면 붙는다.
  *  5. DB 쪽이 놀던 연결을 끊어도(Postgres 재시작 등) 프로세스가 산다.
+ *  6. SSH 인증 도중 서버가 정상 종료해도 연결 대기가 끝나고, 다음 요청이 새로 붙는다.
  *
  * SKIP_SLOW=1 이면 30초 기다리는 1번을 짧게(5초) 돌린다 — 그때는 옛 코드의 죽음을 재현하지 못한다.
  */
@@ -52,12 +53,14 @@ fs.writeFileSync(keyFile, clientKey.private, { mode: 0o600 });
 
 // ── 가짜 몰타르 SSH 서버: 이 열쇠만 받고, direct-tcpip 를 DB 로만 넘긴다 ──
 let authCount = 0;
+let endDuringAuth = 0;
 const sshClients = new Set<any>();
 const sshServer = new Server({ hostKeys: [hostKey.private] }, (client: any) => {
   sshClients.add(client);
   client.on("close", () => sshClients.delete(client));
   client.on("error", () => {});
   client.on("authentication", (ctx: any) => {
+    if (endDuringAuth > 0) { endDuringAuth--; client.end(); return; } // 인증 중 서버가 정상 종료
     if (ctx.method === "publickey" && ctx.key.algo === "ssh-ed25519" && Buffer.compare(ctx.key.data, clientPubBlob) === 0) {
       if (ctx.signature) authCount++;
       return ctx.accept();
@@ -241,6 +244,22 @@ try {
     const q2 = await d.cmd("query", 20_000);
     report("5 db-side terminate idle", q1 === "ok 1" && killed >= 1 && aliveAfter && q2 === "ok 1",
       `first=${q1} terminated=${killed} aliveAfter=${aliveAfter} after=${q2} ${aliveAfter ? "" : "stderr=" + d.stderr.split("\n").filter((l) => /Error/.test(l)).slice(0, 1).join("")}`);
+    await d.stop();
+  }
+
+  // ── 6. 인증 도중 서버가 정상 종료(코디 #48 재현) → 첫 query 가 끝없이 매달리지 않고, 다음 query 는 새로 시도 ──
+  {
+    const d = new Driver(writeEnv({ SSH_HOST_FINGERPRINT: FINGERPRINT }));
+    assert.equal(await d.next(), "ready");
+    endDuringAuth = 1;
+    const t0 = Date.now();
+    const q1 = await d.cmd("query", 30_000);
+    const waitMs = Date.now() - t0;
+    const q2 = await d.cmd("query", 20_000);
+    const alive = d.exit === undefined;
+    report("6 server ends during auth", q1.startsWith("err") && q2 === "ok 1" && alive,
+      `first=${q1.slice(0, 70)} (${waitMs}ms) retry=${q2} alive=${alive}`);
+    endDuringAuth = 0;
     await d.stop();
   }
 
