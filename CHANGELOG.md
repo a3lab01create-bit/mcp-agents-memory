@@ -1,6 +1,39 @@
 # Changelog
 
-## Unreleased
+## 0.9.42 — 2026-11-27
+
+### SSH tunnel no longer kills the server when the connection drops
+
+On 2026-11-26 the memory server in the MacBook's Claude Desktop died with
+"Error: Connection closed". Its log showed the SSH tunnel to Mortar opening
+fine, then minutes later `Error: Not connected` thrown from tunnel-ssh's
+`forwardOut`. tunnel-ssh 5.2.0 swallows SSH errors after the tunnel is ready
+and keeps its local listener open, so the next new database connection (the pg
+pool drops idle ones after 30 s) hit a dead SSH session and threw outside any
+handler. Claude Code ends the server with the session, so it rarely showed;
+Claude Desktop keeps the server running for hours.
+
+- tunnel-ssh is gone. `src/db.ts` forwards with ssh2 directly: a local listener
+  calls `forwardOut` with its callback, and a failure (including the
+  synchronous "Not connected") closes only that connection.
+- When SSH closes or errors, the tunnel and pool are dropped and the next
+  database call reopens them. Events from an older tunnel are ignored.
+- SSH keepalive every 15 s, 3 missed replies allowed
+  (`SSH_KEEPALIVE_INTERVAL_MS`, `SSH_KEEPALIVE_COUNT_MAX`), so a quiet tunnel
+  isn't dropped by a home router and a dead one is noticed within about a
+  minute. A query sent during a silent stall waits until then, then fails.
+- `SSH_HOST_FINGERPRINT` (one or more `SHA256:…`, comma-separated) pins the
+  server's host key. ssh2 accepts any host key when no verifier is given, so
+  until now the server's identity was never checked. A mismatch refuses the
+  connection with a clear error; an unset value prints a warning once.
+- Both pools log idle-client errors instead of crashing, and clients handed out
+  by `getClient()` get an error listener, so a connection dying mid-use no
+  longer kills the process.
+- `npm run check:ssh-tunnel` (needs `CHECK_TUNNEL_DATABASE_URL`): an in-process
+  SSH server and a freezable relay. The previous code fails five cases (clean
+  close, the incident's order, a checked-out client, a silent stall, a wrong
+  fingerprint); this one passes those and a database-side disconnect of idle
+  connections.
 
 ### Import Claude app conversations from a data export
 

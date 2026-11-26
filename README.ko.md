@@ -198,6 +198,7 @@ DB_NAME=...
 # SSH tunnel (옵션)
 SSH_ENABLED=true
 SSH_HOST=...
+SSH_HOST_FINGERPRINT=SHA256:...   # 서버 호스트 키 지문(ssh-keygen -lf). 다르면 안 붙음, 비우면 확인 안 함(경고)
 
 # 모델
 EMBEDDING_MODEL=text-embedding-3-large
